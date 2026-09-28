@@ -1,3 +1,6 @@
+#include <stdio.h>
+#include <time.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -12,6 +15,27 @@
 static bool display_on = true;
 static uint32_t last_activity;
 static uint32_t last_tap = 0;
+
+static lv_obj_t *time_label;
+static lv_obj_t *date_label;
+
+static void update_clock_cb(lv_timer_t *timer)
+{
+    time_t now;
+    struct tm timeinfo;
+
+    time(&now);
+    localtime_r(&now, &timeinfo);
+
+    char time_buffer[16];
+    char date_buffer[32];
+
+    strftime(time_buffer, sizeof(time_buffer), "%H:%M:%S", &timeinfo);
+    strftime(date_buffer, sizeof(date_buffer), "%d/%m/%Y", &timeinfo);
+
+    lv_label_set_text(time_label, time_buffer);
+    lv_label_set_text(date_label, date_buffer);
+}
 
 static void touch_event_cb(lv_event_t *event)
 {
@@ -44,6 +68,7 @@ static void display_timeout_cb(lv_timer_t *timer)
         lv_tick_elaps(last_activity) >= DISPLAY_TIMEOUT_MS
     ) {
         bsp_display_brightness_set(0);
+
         display_on = false;
         last_tap = 0;
     }
@@ -60,7 +85,7 @@ void app_main(void)
 
     lv_obj_set_style_bg_color(
         screen,
-        lv_color_hex(0x87CEEB),
+        lv_color_hex(0x000000),
         LV_PART_MAIN
     );
 
@@ -73,16 +98,59 @@ void app_main(void)
         NULL
     );
 
-    lv_obj_t *label = lv_label_create(screen);
+    // Hora
+    time_label = lv_label_create(screen);
 
-    lv_label_set_text(
-        label,
-        "Hello World!\nTesting Smartwatch :)"
+    lv_obj_set_style_text_color(
+        time_label,
+        lv_color_hex(0xFFFFFF),
+        LV_PART_MAIN
     );
 
-    lv_obj_center(label);
+    lv_obj_set_style_text_font(
+        time_label,
+        &lv_font_montserrat_26,
+        LV_PART_MAIN
+    );
+
+    lv_obj_align(
+        time_label,
+        LV_ALIGN_CENTER,
+        0,
+        -35
+    );
+
+    // Fecha
+    date_label = lv_label_create(screen);
+
+    lv_obj_set_style_text_color(
+        date_label,
+        lv_color_hex(0xAAAAAA),
+        LV_PART_MAIN
+    );
+
+    lv_obj_set_style_text_font(
+        date_label,
+        &lv_font_montserrat_26,
+        LV_PART_MAIN
+    );
+
+    lv_obj_align(
+        date_label,
+        LV_ALIGN_CENTER,
+        0,
+        35
+    );
+
+    update_clock_cb(NULL);
 
     last_activity = lv_tick_get();
+
+    lv_timer_create(
+        update_clock_cb,
+        1000,
+        NULL
+    );
 
     lv_timer_create(
         display_timeout_cb,
