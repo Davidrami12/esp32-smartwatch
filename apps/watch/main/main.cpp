@@ -22,7 +22,6 @@
 #define XPOWERS_CHIP_AXP2101
 #include "XPowersLib.h"
 
-#define DISPLAY_TIMEOUT_MS 10000
 #define DOUBLE_TAP_MS 500
 #define WIFI_CONNECTED_BIT BIT0
 
@@ -56,6 +55,8 @@ static lv_obj_t *battery_icon_tip;
 
 static lv_obj_t *brightness_label;
 static lv_obj_t *brightness_slider;
+
+static uint32_t display_timeout_ms = 10000;
 
 static XPowersPMU PMU;
 static i2c_master_dev_handle_t pmu_dev_handle = NULL;
@@ -606,6 +607,57 @@ static void brightness_slider_cb(
         lv_tick_get();
 }
 
+/* ---------------- SCREEN TIMEOUT ---------------- */
+
+static void screen_timeout_dropdown_cb(
+    lv_event_t *event
+)
+{
+    if (
+        lv_event_get_code(event) !=
+        LV_EVENT_VALUE_CHANGED
+    ) {
+        return;
+    }
+
+    lv_obj_t *dropdown =
+        static_cast<lv_obj_t *>(
+            lv_event_get_target(event)
+        );
+
+    uint32_t selected =
+        lv_dropdown_get_selected(dropdown);
+
+    switch (selected) {
+        case 0:
+            display_timeout_ms = 5000;
+            break;
+
+        case 1:
+            display_timeout_ms = 10000;
+            break;
+
+        case 2:
+            display_timeout_ms = 30000;
+            break;
+
+        case 3:
+            display_timeout_ms = 60000;
+            break;
+
+        case 4:
+            display_timeout_ms = 0;
+            break;
+
+        default:
+            display_timeout_ms = 10000;
+            break;
+    }
+
+    last_activity =
+        lv_tick_get();
+}
+
 /* ---------------- DISPLAY ---------------- */
 
 static void touch_event_cb(
@@ -648,11 +700,17 @@ static void display_timeout_cb(
     lv_timer_t *timer
 )
 {
+    (void)timer;
+
+    if (display_timeout_ms == 0) {
+        return;
+    }
+
     if (
         display_on &&
         lv_tick_elaps(
             last_activity
-        ) >= DISPLAY_TIMEOUT_MS
+        ) >= display_timeout_ms
     ) {
         bsp_display_brightness_set(0);
 
@@ -732,6 +790,12 @@ extern "C" void app_main(void)
 
         return;
     }
+
+    /* Give LVGL task time to finish display initialization */
+
+    vTaskDelay(
+        pdMS_TO_TICKS(100)
+    );
 
     bsp_display_lock(0);
 
@@ -1222,6 +1286,67 @@ extern "C" void app_main(void)
     lv_obj_add_event_cb(
         brightness_slider,
         brightness_slider_cb,
+        LV_EVENT_VALUE_CHANGED,
+        NULL
+    );
+
+    /* ---------------- SCREEN TIMEOUT TITLE ---------------- */
+
+    lv_obj_t *screen_timeout_title =
+        lv_label_create(settings_screen);
+
+    lv_label_set_text(
+        screen_timeout_title,
+        "Screen timeout"
+    );
+
+    lv_obj_set_style_text_color(
+        screen_timeout_title,
+        lv_color_hex(0xFFFFFF),
+        LV_PART_MAIN
+    );
+
+    lv_obj_align(
+        screen_timeout_title,
+        LV_ALIGN_CENTER,
+        0,
+        80
+    );
+
+    /* ---------------- SCREEN TIMEOUT DROPDOWN ---------------- */
+
+    lv_obj_t *screen_timeout_dropdown =
+        lv_dropdown_create(settings_screen);
+
+    lv_dropdown_set_options(
+        screen_timeout_dropdown,
+        "5 seconds\n"
+        "10 seconds\n"
+        "30 seconds\n"
+        "60 seconds\n"
+        "Never"
+    );
+
+    lv_dropdown_set_selected(
+        screen_timeout_dropdown,
+        1
+    );
+
+    lv_obj_set_width(
+        screen_timeout_dropdown,
+        180
+    );
+
+    lv_obj_align(
+        screen_timeout_dropdown,
+        LV_ALIGN_CENTER,
+        0,
+        125
+    );
+
+    lv_obj_add_event_cb(
+        screen_timeout_dropdown,
+        screen_timeout_dropdown_cb,
         LV_EVENT_VALUE_CHANGED,
         NULL
     );
