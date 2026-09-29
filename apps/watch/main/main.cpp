@@ -460,6 +460,12 @@ static void update_battery_cb(
             0
         );
 
+        lv_obj_set_style_text_color(
+            battery_label,
+            lv_color_hex(0xAAAAAA),
+            LV_PART_MAIN
+        );
+
         return;
     }
 
@@ -494,6 +500,8 @@ static void update_battery_cb(
         battery_buffer
     );
 
+    /* Calculate battery fill */
+
     int fill_width =
         (46 * battery_percent) / 100;
 
@@ -502,16 +510,51 @@ static void update_battery_cb(
         fill_width
     );
 
+    /* Select battery color */
+
+    lv_color_t battery_color;
+
+    if (charging) {
+        battery_color =
+            lv_color_hex(0x00C853);
+    }
+    else if (battery_percent <= 20) {
+        battery_color =
+            lv_color_hex(0xF44336);
+    }
+    else if (battery_percent <= 50) {
+        battery_color =
+            lv_color_hex(0xFF9800);
+    }
+    else if (battery_percent <= 70) {
+        battery_color =
+            lv_color_hex(0xFFD600);
+    }
+    else {
+        battery_color =
+            lv_color_hex(0x00C853);
+    }
+
+    /* Apply battery color */
+
+    lv_obj_set_style_bg_color(
+        battery_icon_level,
+        battery_color,
+        LV_PART_MAIN
+    );
+
+    lv_obj_set_style_text_color(
+        battery_label,
+        battery_color,
+        LV_PART_MAIN
+    );
+
+    /* Update charging status */
+
     if (charging) {
         lv_label_set_text(
             charging_label,
             "Charging"
-        );
-    }
-    else {
-        lv_label_set_text(
-            charging_label,
-            "On battery"
         );
     }
 
