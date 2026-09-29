@@ -16,10 +16,8 @@
 #include "bsp/esp-bsp.h"
 #include "bsp/display.h"
 
-#define DISPLAY_BRIGHTNESS 60
 #define DISPLAY_TIMEOUT_MS 10000
 #define DOUBLE_TAP_MS 500
-
 #define WIFI_CONNECTED_BIT BIT0
 
 static EventGroupHandle_t wifi_event_group;
@@ -28,9 +26,12 @@ static bool display_on = true;
 static uint32_t last_activity;
 static uint32_t last_tap = 0;
 
+static uint8_t current_brightness = 60;
+
 static lv_obj_t *time_label;
 static lv_obj_t *date_label;
-
+static lv_obj_t *brightness_label;
+static lv_obj_t *brightness_slider;
 
 /* ---------------- WIFI ---------------- */
 
@@ -41,21 +42,22 @@ static void wifi_event_handler(
     void *event_data
 )
 {
-    if (event_base == WIFI_EVENT &&
-        event_id == WIFI_EVENT_STA_START) {
-
+    if (
+        event_base == WIFI_EVENT &&
+        event_id == WIFI_EVENT_STA_START
+    ) {
         esp_wifi_connect();
     }
-
-    else if (event_base == WIFI_EVENT &&
-             event_id == WIFI_EVENT_STA_DISCONNECTED) {
-
+    else if (
+        event_base == WIFI_EVENT &&
+        event_id == WIFI_EVENT_STA_DISCONNECTED
+    ) {
         esp_wifi_connect();
     }
-
-    else if (event_base == IP_EVENT &&
-             event_id == IP_EVENT_STA_GOT_IP) {
-
+    else if (
+        event_base == IP_EVENT &&
+        event_id == IP_EVENT_STA_GOT_IP
+    ) {
         xEventGroupSetBits(
             wifi_event_group,
             WIFI_CONNECTED_BIT
@@ -63,31 +65,34 @@ static void wifi_event_handler(
     }
 }
 
-
 static void wifi_init(void)
 {
     wifi_event_group = xEventGroupCreate();
 
-    esp_netif_init();
-    esp_event_loop_create_default();
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    esp_event_handler_register(
-        WIFI_EVENT,
-        ESP_EVENT_ANY_ID,
-        wifi_event_handler,
-        NULL
+    ESP_ERROR_CHECK(
+        esp_event_handler_register(
+            WIFI_EVENT,
+            ESP_EVENT_ANY_ID,
+            wifi_event_handler,
+            NULL
+        )
     );
 
-    esp_event_handler_register(
-        IP_EVENT,
-        IP_EVENT_STA_GOT_IP,
-        wifi_event_handler,
-        NULL
+    ESP_ERROR_CHECK(
+        esp_event_handler_register(
+            IP_EVENT,
+            IP_EVENT_STA_GOT_IP,
+            wifi_event_handler,
+            NULL
+        )
     );
 
     wifi_config_t wifi_config = {
@@ -97,9 +102,20 @@ static void wifi_init(void)
         },
     };
 
-    esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
-    esp_wifi_start();
+    ESP_ERROR_CHECK(
+        esp_wifi_set_mode(WIFI_MODE_STA)
+    );
+
+    ESP_ERROR_CHECK(
+        esp_wifi_set_config(
+            WIFI_IF_STA,
+            &wifi_config
+        )
+    );
+
+    ESP_ERROR_CHECK(
+        esp_wifi_start()
+    );
 
     xEventGroupWaitBits(
         wifi_event_group,
@@ -110,19 +126,23 @@ static void wifi_init(void)
     );
 }
 
-
 /* ---------------- TIME ---------------- */
 
 static void sync_time(void)
 {
     esp_sntp_config_t config =
-        ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+        ESP_NETIF_SNTP_DEFAULT_CONFIG(
+            "pool.ntp.org"
+        );
 
-    ESP_ERROR_CHECK(esp_netif_sntp_init(&config));
-
-    esp_err_t ret = esp_netif_sntp_sync_wait(
-        pdMS_TO_TICKS(10000)
+    ESP_ERROR_CHECK(
+        esp_netif_sntp_init(&config)
     );
+
+    esp_err_t ret =
+        esp_netif_sntp_sync_wait(
+            pdMS_TO_TICKS(10000)
+        );
 
     if (ret != ESP_OK) {
         printf("NTP sync failed\n");
@@ -136,7 +156,6 @@ static void sync_time(void)
 
     tzset();
 }
-
 
 static void update_clock_cb(lv_timer_t *timer)
 {
@@ -174,12 +193,49 @@ static void update_clock_cb(lv_timer_t *timer)
     );
 }
 
+/* ---------------- BRIGHTNESS ---------------- */
+
+static void brightness_slider_cb(
+    lv_event_t *event
+)
+{
+    lv_obj_t *slider =
+        lv_event_get_target(event);
+
+    current_brightness =
+        lv_slider_get_value(slider);
+
+    bsp_display_brightness_set(
+        current_brightness
+    );
+
+    char buffer[16];
+
+    snprintf(
+        buffer,
+        sizeof(buffer),
+        "%d%%",
+        current_brightness
+    );
+
+    lv_label_set_text(
+        brightness_label,
+        buffer
+    );
+
+    last_activity = lv_tick_get();
+}
 
 /* ---------------- DISPLAY ---------------- */
 
-static void touch_event_cb(lv_event_t *event)
+static void touch_event_cb(
+    lv_event_t *event
+)
 {
-    if (lv_event_get_code(event) != LV_EVENT_PRESSED) {
+    if (
+        lv_event_get_code(event) !=
+        LV_EVENT_PRESSED
+    ) {
         return;
     }
 
@@ -190,37 +246,38 @@ static void touch_event_cb(lv_event_t *event)
         return;
     }
 
-    if (now - last_tap <= DOUBLE_TAP_MS) {
-
+    if (
+        now - last_tap <=
+        DOUBLE_TAP_MS
+    ) {
         bsp_display_brightness_set(
-            DISPLAY_BRIGHTNESS
+            current_brightness
         );
 
         display_on = true;
         last_activity = now;
         last_tap = 0;
-
-    } else {
-
+    }
+    else {
         last_tap = now;
     }
 }
 
-
-static void display_timeout_cb(lv_timer_t *timer)
+static void display_timeout_cb(
+    lv_timer_t *timer
+)
 {
     if (
         display_on &&
-        lv_tick_elaps(last_activity) >= DISPLAY_TIMEOUT_MS
+        lv_tick_elaps(last_activity) >=
+        DISPLAY_TIMEOUT_MS
     ) {
-
         bsp_display_brightness_set(0);
 
         display_on = false;
         last_tap = 0;
     }
 }
-
 
 /* ---------------- MAIN ---------------- */
 
@@ -232,22 +289,45 @@ void app_main(void)
         ret == ESP_ERR_NVS_NO_FREE_PAGES ||
         ret == ESP_ERR_NVS_NEW_VERSION_FOUND
     ) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
+        ESP_ERROR_CHECK(
+            nvs_flash_erase()
+        );
+
         ret = nvs_flash_init();
     }
 
     ESP_ERROR_CHECK(ret);
 
-    bsp_display_start();
+    /* Initialize display */
+    lv_display_t *display =
+        bsp_display_start();
 
-    bsp_display_brightness_set(
-        DISPLAY_BRIGHTNESS
+    if (display == NULL) {
+        printf("Failed to initialize display\n");
+        return;
+    }
+
+    /*
+     * Brightness commands access the display panel.
+     * Protect the operation while LVGL is running.
+     */
+    bsp_display_lock(0);
+
+    ESP_ERROR_CHECK(
+        bsp_display_brightness_set(
+            current_brightness
+        )
     );
 
+    bsp_display_unlock();
+
+    /* Initialize Wi-Fi */
     wifi_init();
 
+    /* Synchronize time */
     sync_time();
 
+    /* Create LVGL UI */
     bsp_display_lock(0);
 
     lv_obj_t *screen =
@@ -271,6 +351,8 @@ void app_main(void)
         NULL
     );
 
+    /* ---------------- TIME ---------------- */
+
     time_label =
         lv_label_create(screen);
 
@@ -290,8 +372,10 @@ void app_main(void)
         time_label,
         LV_ALIGN_CENTER,
         0,
-        -35
+        -85
     );
+
+    /* ---------------- DATE ---------------- */
 
     date_label =
         lv_label_create(screen);
@@ -312,8 +396,101 @@ void app_main(void)
         date_label,
         LV_ALIGN_CENTER,
         0,
-        35
+        -40
     );
+
+    /* ---------------- BRIGHTNESS TITLE ---------------- */
+
+    lv_obj_t *brightness_title =
+        lv_label_create(screen);
+
+    lv_label_set_text(
+        brightness_title,
+        "Brightness control"
+    );
+
+    lv_obj_set_style_text_color(
+        brightness_title,
+        lv_color_hex(0xFFFFFF),
+        LV_PART_MAIN
+    );
+
+    lv_obj_align(
+        brightness_title,
+        LV_ALIGN_CENTER,
+        0,
+        20
+    );
+
+    /* ---------------- BRIGHTNESS VALUE ---------------- */
+
+    brightness_label =
+        lv_label_create(screen);
+
+    char brightness_buffer[16];
+
+    snprintf(
+        brightness_buffer,
+        sizeof(brightness_buffer),
+        "%d%%",
+        current_brightness
+    );
+
+    lv_label_set_text(
+        brightness_label,
+        brightness_buffer
+    );
+
+    lv_obj_set_style_text_color(
+        brightness_label,
+        lv_color_hex(0xFFFFFF),
+        LV_PART_MAIN
+    );
+
+    lv_obj_align(
+        brightness_label,
+        LV_ALIGN_CENTER,
+        0,
+        55
+    );
+
+    /* ---------------- BRIGHTNESS SLIDER ---------------- */
+
+    brightness_slider =
+        lv_slider_create(screen);
+
+    lv_slider_set_range(
+        brightness_slider,
+        10,
+        100
+    );
+
+    lv_slider_set_value(
+        brightness_slider,
+        current_brightness,
+        LV_ANIM_OFF
+    );
+
+    lv_obj_set_width(
+        brightness_slider,
+        220
+    );
+
+    lv_obj_align(
+        brightness_slider,
+        LV_ALIGN_CENTER,
+        0,
+        95
+    );
+
+    lv_obj_add_event_cb(
+        brightness_slider,
+        brightness_slider_cb,
+        LV_EVENT_VALUE_CHANGED,
+        NULL
+    );
+
+    /* ---------------- TIMERS ---------------- */
 
     update_clock_cb(NULL);
 
