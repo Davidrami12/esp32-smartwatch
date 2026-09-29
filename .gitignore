@@ -147,3 +147,5 @@ apps/watch/build/
 apps/watch/managed_components/
 apps/watch/sdkconfig
 apps/watch/sdkconfig.old
+
+.vscode/
