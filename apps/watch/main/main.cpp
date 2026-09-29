@@ -61,6 +61,14 @@ static uint32_t display_timeout_ms = 10000;
 static XPowersPMU PMU;
 static i2c_master_dev_handle_t pmu_dev_handle = NULL;
 
+enum class WatchScreen {
+    Home,
+    Settings
+};
+
+static WatchScreen current_screen =
+    WatchScreen::Home;
+
 /* ---------------- AXP2101 ---------------- */
 
 static int pmu_register_read(
@@ -721,6 +729,39 @@ static void display_timeout_cb(
 
 /* ---------------- NAVIGATION ---------------- */
 
+static void navigate_to(
+    WatchScreen screen
+)
+{
+    if (screen == current_screen) {
+        return;
+    }
+
+    last_activity =
+        lv_tick_get();
+
+    if (screen == WatchScreen::Settings) {
+        lv_screen_load_anim(
+            settings_screen,
+            LV_SCR_LOAD_ANIM_MOVE_LEFT,
+            250,
+            0,
+            false
+        );
+    }
+    else {
+        lv_screen_load_anim(
+            home_screen,
+            LV_SCR_LOAD_ANIM_MOVE_RIGHT,
+            250,
+            0,
+            false
+        );
+    }
+
+    current_screen = screen;
+}
+
 static void open_settings_cb(
     lv_event_t *event
 )
@@ -732,10 +773,8 @@ static void open_settings_cb(
         return;
     }
 
-    last_activity = lv_tick_get();
-
-    lv_screen_load(
-        settings_screen
+    navigate_to(
+        WatchScreen::Settings
     );
 }
 
@@ -750,12 +789,52 @@ static void back_home_cb(
         return;
     }
 
-    last_activity = lv_tick_get();
-
-    lv_screen_load(
-        home_screen
+    navigate_to(
+        WatchScreen::Home
     );
 }
+
+static void navigation_gesture_cb(
+    lv_event_t *event
+)
+{
+    if (
+        lv_event_get_code(event) !=
+        LV_EVENT_GESTURE
+    ) {
+        return;
+    }
+
+    lv_indev_t *indev =
+        lv_indev_active();
+
+    if (indev == NULL) {
+        return;
+    }
+
+    lv_dir_t direction =
+        lv_indev_get_gesture_dir(
+            indev
+        );
+
+    if (
+        current_screen == WatchScreen::Home &&
+        direction == LV_DIR_LEFT
+    ) {
+        navigate_to(
+            WatchScreen::Settings
+        );
+    }
+    else if (
+        current_screen == WatchScreen::Settings &&
+        direction == LV_DIR_RIGHT
+    ) {
+        navigate_to(
+            WatchScreen::Home
+        );
+    }
+}
+
 
 /* ---------------- MAIN ---------------- */
 
@@ -849,8 +928,8 @@ extern "C" void app_main(void)
 
     lv_obj_add_event_cb(
         home_screen,
-        touch_event_cb,
-        LV_EVENT_PRESSED,
+        navigation_gesture_cb,
+        LV_EVENT_GESTURE,
         NULL
     );
 
@@ -1167,6 +1246,13 @@ extern "C" void app_main(void)
         settings_screen,
         touch_event_cb,
         LV_EVENT_PRESSED,
+        NULL
+    );
+
+    lv_obj_add_event_cb(
+        settings_screen,
+        navigation_gesture_cb,
+        LV_EVENT_GESTURE,
         NULL
     );
 
