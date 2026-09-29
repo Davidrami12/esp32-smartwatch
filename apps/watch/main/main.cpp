@@ -50,6 +50,10 @@ static lv_obj_t *wifi_status_label;
 static lv_obj_t *battery_label;
 static lv_obj_t *charging_label;
 
+static lv_obj_t *battery_icon_body;
+static lv_obj_t *battery_icon_level;
+static lv_obj_t *battery_icon_tip;
+
 static lv_obj_t *brightness_label;
 static lv_obj_t *brightness_slider;
 
@@ -438,15 +442,22 @@ static void update_battery_cb(
     lv_timer_t *timer
 )
 {
+    (void)timer;
+
     if (!PMU.isBatteryConnect()) {
         lv_label_set_text(
             battery_label,
-            "Battery: --%"
+            "--%"
         );
 
         lv_label_set_text(
             charging_label,
             "No battery"
+        );
+
+        lv_obj_set_width(
+            battery_icon_level,
+            0
         );
 
         return;
@@ -461,18 +472,34 @@ static void update_battery_cb(
     bool charging =
         PMU.isCharging();
 
-    char battery_buffer[32];
+    if (battery_percent < 0) {
+        battery_percent = 0;
+    }
+
+    if (battery_percent > 100) {
+        battery_percent = 100;
+    }
+
+    char battery_buffer[16];
 
     snprintf(
         battery_buffer,
         sizeof(battery_buffer),
-        "Battery: %d%%",
+        "%d%%",
         battery_percent
     );
 
     lv_label_set_text(
         battery_label,
         battery_buffer
+    );
+
+    int fill_width =
+        (46 * battery_percent) / 100;
+
+    lv_obj_set_width(
+        battery_icon_level,
+        fill_width
     );
 
     if (charging) {
@@ -793,12 +820,143 @@ extern "C" void app_main(void)
 
     /* ---------------- BATTERY ---------------- */
 
+    battery_icon_body =
+        lv_obj_create(home_screen);
+
+    lv_obj_remove_style_all(
+        battery_icon_body
+    );
+
+    lv_obj_set_size(
+        battery_icon_body,
+        56,
+        30
+    );
+
+    lv_obj_set_style_border_width(
+        battery_icon_body,
+        3,
+        LV_PART_MAIN
+    );
+
+    lv_obj_set_style_border_color(
+        battery_icon_body,
+        lv_color_hex(0xFFFFFF),
+        LV_PART_MAIN
+    );
+
+    lv_obj_set_style_radius(
+        battery_icon_body,
+        5,
+        LV_PART_MAIN
+    );
+
+    lv_obj_set_style_bg_opa(
+        battery_icon_body,
+        LV_OPA_TRANSP,
+        LV_PART_MAIN
+    );
+
+    lv_obj_align(
+        battery_icon_body,
+        LV_ALIGN_CENTER,
+        -45,
+        -10
+    );
+
+    /* Battery level */
+
+    battery_icon_level =
+        lv_obj_create(battery_icon_body);
+
+    lv_obj_remove_style_all(
+        battery_icon_level
+    );
+
+    lv_obj_set_height(
+        battery_icon_level,
+        20
+    );
+
+    lv_obj_set_width(
+        battery_icon_level,
+        0
+    );
+
+    lv_obj_set_style_bg_color(
+        battery_icon_level,
+        lv_color_hex(0xFFFFFF),
+        LV_PART_MAIN
+    );
+
+    lv_obj_set_style_bg_opa(
+        battery_icon_level,
+        LV_OPA_COVER,
+        LV_PART_MAIN
+    );
+
+    lv_obj_set_style_radius(
+        battery_icon_level,
+        2,
+        LV_PART_MAIN
+    );
+
+    lv_obj_align(
+        battery_icon_level,
+        LV_ALIGN_LEFT_MID,
+        5,
+        0
+    );
+
+    /* Battery tip */
+
+    battery_icon_tip =
+        lv_obj_create(home_screen);
+
+    lv_obj_remove_style_all(
+        battery_icon_tip
+    );
+
+    lv_obj_set_size(
+        battery_icon_tip,
+        5,
+        14
+    );
+
+    lv_obj_set_style_bg_color(
+        battery_icon_tip,
+        lv_color_hex(0xFFFFFF),
+        LV_PART_MAIN
+    );
+
+    lv_obj_set_style_bg_opa(
+        battery_icon_tip,
+        LV_OPA_COVER,
+        LV_PART_MAIN
+    );
+
+    lv_obj_set_style_radius(
+        battery_icon_tip,
+        2,
+        LV_PART_MAIN
+    );
+
+    lv_obj_align_to(
+        battery_icon_tip,
+        battery_icon_body,
+        LV_ALIGN_OUT_RIGHT_MID,
+        2,
+        0
+    );
+
+    /* Battery percentage */
+
     battery_label =
         lv_label_create(home_screen);
 
     lv_label_set_text(
         battery_label,
-        "Battery: --%"
+        "--%"
     );
 
     lv_obj_set_style_text_color(
@@ -816,9 +974,11 @@ extern "C" void app_main(void)
     lv_obj_align(
         battery_label,
         LV_ALIGN_CENTER,
-        0,
+        40,
         -10
     );
+
+    /* Charging status */
 
     charging_label =
         lv_label_create(home_screen);
