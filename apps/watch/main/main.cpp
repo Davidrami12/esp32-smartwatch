@@ -22,7 +22,6 @@
 #define XPOWERS_CHIP_AXP2101
 #include "XPowersLib.h"
 
-#define DISPLAY_TIMEOUT_MS 10000
 #define DOUBLE_TAP_MS 500
 #define WIFI_CONNECTED_BIT BIT0
 
@@ -50,11 +49,25 @@ static lv_obj_t *wifi_status_label;
 static lv_obj_t *battery_label;
 static lv_obj_t *charging_label;
 
+static lv_obj_t *battery_icon_body;
+static lv_obj_t *battery_icon_level;
+static lv_obj_t *battery_icon_tip;
+
 static lv_obj_t *brightness_label;
 static lv_obj_t *brightness_slider;
 
+static uint32_t display_timeout_ms = 10000;
+
 static XPowersPMU PMU;
 static i2c_master_dev_handle_t pmu_dev_handle = NULL;
+
+enum class WatchScreen {
+    Home,
+    Settings
+};
+
+static WatchScreen current_screen =
+    WatchScreen::Home;
 
 /* ---------------- AXP2101 ---------------- */
 
@@ -438,15 +451,28 @@ static void update_battery_cb(
     lv_timer_t *timer
 )
 {
+    (void)timer;
+
     if (!PMU.isBatteryConnect()) {
         lv_label_set_text(
             battery_label,
-            "Battery: --%"
+            "--%"
         );
 
         lv_label_set_text(
             charging_label,
             "No battery"
+        );
+
+        lv_obj_set_width(
+            battery_icon_level,
+            0
+        );
+
+        lv_obj_set_style_text_color(
+            battery_label,
+            lv_color_hex(0xAAAAAA),
+            LV_PART_MAIN
         );
 
         return;
@@ -461,12 +487,20 @@ static void update_battery_cb(
     bool charging =
         PMU.isCharging();
 
-    char battery_buffer[32];
+    if (battery_percent < 0) {
+        battery_percent = 0;
+    }
+
+    if (battery_percent > 100) {
+        battery_percent = 100;
+    }
+
+    char battery_buffer[16];
 
     snprintf(
         battery_buffer,
         sizeof(battery_buffer),
-        "Battery: %d%%",
+        "%d%%",
         battery_percent
     );
 
@@ -475,16 +509,61 @@ static void update_battery_cb(
         battery_buffer
     );
 
+    /* Calculate battery fill */
+
+    int fill_width =
+        (46 * battery_percent) / 100;
+
+    lv_obj_set_width(
+        battery_icon_level,
+        fill_width
+    );
+
+    /* Select battery color */
+
+    lv_color_t battery_color;
+
+    if (charging) {
+        battery_color =
+            lv_color_hex(0x00C853);
+    }
+    else if (battery_percent <= 20) {
+        battery_color =
+            lv_color_hex(0xF44336);
+    }
+    else if (battery_percent <= 50) {
+        battery_color =
+            lv_color_hex(0xFF9800);
+    }
+    else if (battery_percent <= 70) {
+        battery_color =
+            lv_color_hex(0xFFD600);
+    }
+    else {
+        battery_color =
+            lv_color_hex(0x00C853);
+    }
+
+    /* Apply battery color */
+
+    lv_obj_set_style_bg_color(
+        battery_icon_level,
+        battery_color,
+        LV_PART_MAIN
+    );
+
+    lv_obj_set_style_text_color(
+        battery_label,
+        battery_color,
+        LV_PART_MAIN
+    );
+
+    /* Update charging status */
+
     if (charging) {
         lv_label_set_text(
             charging_label,
             "Charging"
-        );
-    }
-    else {
-        lv_label_set_text(
-            charging_label,
-            "On battery"
         );
     }
 
@@ -536,6 +615,57 @@ static void brightness_slider_cb(
         lv_tick_get();
 }
 
+/* ---------------- SCREEN TIMEOUT ---------------- */
+
+static void screen_timeout_dropdown_cb(
+    lv_event_t *event
+)
+{
+    if (
+        lv_event_get_code(event) !=
+        LV_EVENT_VALUE_CHANGED
+    ) {
+        return;
+    }
+
+    lv_obj_t *dropdown =
+        static_cast<lv_obj_t *>(
+            lv_event_get_target(event)
+        );
+
+    uint32_t selected =
+        lv_dropdown_get_selected(dropdown);
+
+    switch (selected) {
+        case 0:
+            display_timeout_ms = 5000;
+            break;
+
+        case 1:
+            display_timeout_ms = 10000;
+            break;
+
+        case 2:
+            display_timeout_ms = 30000;
+            break;
+
+        case 3:
+            display_timeout_ms = 60000;
+            break;
+
+        case 4:
+            display_timeout_ms = 0;
+            break;
+
+        default:
+            display_timeout_ms = 10000;
+            break;
+    }
+
+    last_activity =
+        lv_tick_get();
+}
+
 /* ---------------- DISPLAY ---------------- */
 
 static void touch_event_cb(
@@ -578,11 +708,17 @@ static void display_timeout_cb(
     lv_timer_t *timer
 )
 {
+    (void)timer;
+
+    if (display_timeout_ms == 0) {
+        return;
+    }
+
     if (
         display_on &&
         lv_tick_elaps(
             last_activity
-        ) >= DISPLAY_TIMEOUT_MS
+        ) >= display_timeout_ms
     ) {
         bsp_display_brightness_set(0);
 
@@ -592,6 +728,39 @@ static void display_timeout_cb(
 }
 
 /* ---------------- NAVIGATION ---------------- */
+
+static void navigate_to(
+    WatchScreen screen
+)
+{
+    if (screen == current_screen) {
+        return;
+    }
+
+    last_activity =
+        lv_tick_get();
+
+    if (screen == WatchScreen::Settings) {
+        lv_screen_load_anim(
+            settings_screen,
+            LV_SCR_LOAD_ANIM_MOVE_LEFT,
+            250,
+            0,
+            false
+        );
+    }
+    else {
+        lv_screen_load_anim(
+            home_screen,
+            LV_SCR_LOAD_ANIM_MOVE_RIGHT,
+            250,
+            0,
+            false
+        );
+    }
+
+    current_screen = screen;
+}
 
 static void open_settings_cb(
     lv_event_t *event
@@ -604,10 +773,8 @@ static void open_settings_cb(
         return;
     }
 
-    last_activity = lv_tick_get();
-
-    lv_screen_load(
-        settings_screen
+    navigate_to(
+        WatchScreen::Settings
     );
 }
 
@@ -622,12 +789,52 @@ static void back_home_cb(
         return;
     }
 
-    last_activity = lv_tick_get();
-
-    lv_screen_load(
-        home_screen
+    navigate_to(
+        WatchScreen::Home
     );
 }
+
+static void navigation_gesture_cb(
+    lv_event_t *event
+)
+{
+    if (
+        lv_event_get_code(event) !=
+        LV_EVENT_GESTURE
+    ) {
+        return;
+    }
+
+    lv_indev_t *indev =
+        lv_indev_active();
+
+    if (indev == NULL) {
+        return;
+    }
+
+    lv_dir_t direction =
+        lv_indev_get_gesture_dir(
+            indev
+        );
+
+    if (
+        current_screen == WatchScreen::Home &&
+        direction == LV_DIR_LEFT
+    ) {
+        navigate_to(
+            WatchScreen::Settings
+        );
+    }
+    else if (
+        current_screen == WatchScreen::Settings &&
+        direction == LV_DIR_RIGHT
+    ) {
+        navigate_to(
+            WatchScreen::Home
+        );
+    }
+}
+
 
 /* ---------------- MAIN ---------------- */
 
@@ -662,6 +869,12 @@ extern "C" void app_main(void)
 
         return;
     }
+
+    /* Give LVGL task time to finish display initialization */
+
+    vTaskDelay(
+        pdMS_TO_TICKS(100)
+    );
 
     bsp_display_lock(0);
 
@@ -715,8 +928,8 @@ extern "C" void app_main(void)
 
     lv_obj_add_event_cb(
         home_screen,
-        touch_event_cb,
-        LV_EVENT_PRESSED,
+        navigation_gesture_cb,
+        LV_EVENT_GESTURE,
         NULL
     );
 
@@ -793,12 +1006,143 @@ extern "C" void app_main(void)
 
     /* ---------------- BATTERY ---------------- */
 
+    battery_icon_body =
+        lv_obj_create(home_screen);
+
+    lv_obj_remove_style_all(
+        battery_icon_body
+    );
+
+    lv_obj_set_size(
+        battery_icon_body,
+        56,
+        30
+    );
+
+    lv_obj_set_style_border_width(
+        battery_icon_body,
+        3,
+        LV_PART_MAIN
+    );
+
+    lv_obj_set_style_border_color(
+        battery_icon_body,
+        lv_color_hex(0xFFFFFF),
+        LV_PART_MAIN
+    );
+
+    lv_obj_set_style_radius(
+        battery_icon_body,
+        5,
+        LV_PART_MAIN
+    );
+
+    lv_obj_set_style_bg_opa(
+        battery_icon_body,
+        LV_OPA_TRANSP,
+        LV_PART_MAIN
+    );
+
+    lv_obj_align(
+        battery_icon_body,
+        LV_ALIGN_CENTER,
+        -45,
+        -10
+    );
+
+    /* Battery level */
+
+    battery_icon_level =
+        lv_obj_create(battery_icon_body);
+
+    lv_obj_remove_style_all(
+        battery_icon_level
+    );
+
+    lv_obj_set_height(
+        battery_icon_level,
+        20
+    );
+
+    lv_obj_set_width(
+        battery_icon_level,
+        0
+    );
+
+    lv_obj_set_style_bg_color(
+        battery_icon_level,
+        lv_color_hex(0xFFFFFF),
+        LV_PART_MAIN
+    );
+
+    lv_obj_set_style_bg_opa(
+        battery_icon_level,
+        LV_OPA_COVER,
+        LV_PART_MAIN
+    );
+
+    lv_obj_set_style_radius(
+        battery_icon_level,
+        2,
+        LV_PART_MAIN
+    );
+
+    lv_obj_align(
+        battery_icon_level,
+        LV_ALIGN_LEFT_MID,
+        5,
+        0
+    );
+
+    /* Battery tip */
+
+    battery_icon_tip =
+        lv_obj_create(home_screen);
+
+    lv_obj_remove_style_all(
+        battery_icon_tip
+    );
+
+    lv_obj_set_size(
+        battery_icon_tip,
+        5,
+        14
+    );
+
+    lv_obj_set_style_bg_color(
+        battery_icon_tip,
+        lv_color_hex(0xFFFFFF),
+        LV_PART_MAIN
+    );
+
+    lv_obj_set_style_bg_opa(
+        battery_icon_tip,
+        LV_OPA_COVER,
+        LV_PART_MAIN
+    );
+
+    lv_obj_set_style_radius(
+        battery_icon_tip,
+        2,
+        LV_PART_MAIN
+    );
+
+    lv_obj_align_to(
+        battery_icon_tip,
+        battery_icon_body,
+        LV_ALIGN_OUT_RIGHT_MID,
+        2,
+        0
+    );
+
+    /* Battery percentage */
+
     battery_label =
         lv_label_create(home_screen);
 
     lv_label_set_text(
         battery_label,
-        "Battery: --%"
+        "--%"
     );
 
     lv_obj_set_style_text_color(
@@ -816,9 +1160,11 @@ extern "C" void app_main(void)
     lv_obj_align(
         battery_label,
         LV_ALIGN_CENTER,
-        0,
+        40,
         -10
     );
+
+    /* Charging status */
 
     charging_label =
         lv_label_create(home_screen);
@@ -900,6 +1246,13 @@ extern "C" void app_main(void)
         settings_screen,
         touch_event_cb,
         LV_EVENT_PRESSED,
+        NULL
+    );
+
+    lv_obj_add_event_cb(
+        settings_screen,
+        navigation_gesture_cb,
+        LV_EVENT_GESTURE,
         NULL
     );
 
@@ -1019,6 +1372,67 @@ extern "C" void app_main(void)
     lv_obj_add_event_cb(
         brightness_slider,
         brightness_slider_cb,
+        LV_EVENT_VALUE_CHANGED,
+        NULL
+    );
+
+    /* ---------------- SCREEN TIMEOUT TITLE ---------------- */
+
+    lv_obj_t *screen_timeout_title =
+        lv_label_create(settings_screen);
+
+    lv_label_set_text(
+        screen_timeout_title,
+        "Screen timeout"
+    );
+
+    lv_obj_set_style_text_color(
+        screen_timeout_title,
+        lv_color_hex(0xFFFFFF),
+        LV_PART_MAIN
+    );
+
+    lv_obj_align(
+        screen_timeout_title,
+        LV_ALIGN_CENTER,
+        0,
+        80
+    );
+
+    /* ---------------- SCREEN TIMEOUT DROPDOWN ---------------- */
+
+    lv_obj_t *screen_timeout_dropdown =
+        lv_dropdown_create(settings_screen);
+
+    lv_dropdown_set_options(
+        screen_timeout_dropdown,
+        "5 seconds\n"
+        "10 seconds\n"
+        "30 seconds\n"
+        "60 seconds\n"
+        "Never"
+    );
+
+    lv_dropdown_set_selected(
+        screen_timeout_dropdown,
+        1
+    );
+
+    lv_obj_set_width(
+        screen_timeout_dropdown,
+        180
+    );
+
+    lv_obj_align(
+        screen_timeout_dropdown,
+        LV_ALIGN_CENTER,
+        0,
+        125
+    );
+
+    lv_obj_add_event_cb(
+        screen_timeout_dropdown,
+        screen_timeout_dropdown_cb,
         LV_EVENT_VALUE_CHANGED,
         NULL
     );
