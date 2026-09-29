@@ -29,6 +29,9 @@
 #define AXP2101_I2C_ADDRESS 0x34
 #define I2C_TIMEOUT_MS 1000
 
+static lv_obj_t *home_screen;
+static lv_obj_t *settings_screen;
+
 static EventGroupHandle_t wifi_event_group;
 
 static bool display_on = true;
@@ -588,6 +591,44 @@ static void display_timeout_cb(
     }
 }
 
+/* ---------------- NAVIGATION ---------------- */
+
+static void open_settings_cb(
+    lv_event_t *event
+)
+{
+    if (
+        lv_event_get_code(event) !=
+        LV_EVENT_CLICKED
+    ) {
+        return;
+    }
+
+    last_activity = lv_tick_get();
+
+    lv_screen_load(
+        settings_screen
+    );
+}
+
+static void back_home_cb(
+    lv_event_t *event
+)
+{
+    if (
+        lv_event_get_code(event) !=
+        LV_EVENT_CLICKED
+    ) {
+        return;
+    }
+
+    last_activity = lv_tick_get();
+
+    lv_screen_load(
+        home_screen
+    );
+}
+
 /* ---------------- MAIN ---------------- */
 
 extern "C" void app_main(void)
@@ -654,22 +695,26 @@ extern "C" void app_main(void)
 
     bsp_display_lock(0);
 
-    lv_obj_t *screen =
+    /* =========================================================
+    * HOME SCREEN
+    * ========================================================= */
+
+    home_screen =
         lv_screen_active();
 
     lv_obj_set_style_bg_color(
-        screen,
+        home_screen,
         lv_color_hex(0x000000),
         LV_PART_MAIN
     );
 
     lv_obj_add_flag(
-        screen,
+        home_screen,
         LV_OBJ_FLAG_CLICKABLE
     );
 
     lv_obj_add_event_cb(
-        screen,
+        home_screen,
         touch_event_cb,
         LV_EVENT_PRESSED,
         NULL
@@ -678,7 +723,7 @@ extern "C" void app_main(void)
     /* ---------------- TIME ---------------- */
 
     time_label =
-        lv_label_create(screen);
+        lv_label_create(home_screen);
 
     lv_obj_set_style_text_color(
         time_label,
@@ -702,7 +747,7 @@ extern "C" void app_main(void)
     /* ---------------- DATE ---------------- */
 
     date_label =
-        lv_label_create(screen);
+        lv_label_create(home_screen);
 
     lv_obj_set_style_text_color(
         date_label,
@@ -726,7 +771,7 @@ extern "C" void app_main(void)
     /* ---------------- WIFI STATUS ---------------- */
 
     wifi_status_label =
-        lv_label_create(screen);
+        lv_label_create(home_screen);
 
     lv_label_set_text(
         wifi_status_label,
@@ -749,7 +794,7 @@ extern "C" void app_main(void)
     /* ---------------- BATTERY ---------------- */
 
     battery_label =
-        lv_label_create(screen);
+        lv_label_create(home_screen);
 
     lv_label_set_text(
         battery_label,
@@ -776,7 +821,7 @@ extern "C" void app_main(void)
     );
 
     charging_label =
-        lv_label_create(screen);
+        lv_label_create(home_screen);
 
     lv_label_set_text(
         charging_label,
@@ -796,10 +841,101 @@ extern "C" void app_main(void)
         30
     );
 
+    /* ---------------- SETTINGS BUTTON ---------------- */
+
+    lv_obj_t *settings_button =
+        lv_button_create(home_screen);
+
+    lv_obj_set_size(
+        settings_button,
+        150,
+        50
+    );
+
+    lv_obj_align(
+        settings_button,
+        LV_ALIGN_BOTTOM_MID,
+        0,
+        -70
+    );
+
+    lv_obj_add_event_cb(
+        settings_button,
+        open_settings_cb,
+        LV_EVENT_CLICKED,
+        NULL
+    );
+
+    lv_obj_t *settings_button_label =
+        lv_label_create(settings_button);
+
+    lv_label_set_text(
+        settings_button_label,
+        "Settings"
+    );
+
+    lv_obj_center(
+        settings_button_label
+    );
+
+    /* =========================================================
+    * SETTINGS SCREEN
+    * ========================================================= */
+
+    settings_screen =
+        lv_obj_create(NULL);
+
+    lv_obj_set_style_bg_color(
+        settings_screen,
+        lv_color_hex(0x000000),
+        LV_PART_MAIN
+    );
+
+    lv_obj_add_flag(
+        settings_screen,
+        LV_OBJ_FLAG_CLICKABLE
+    );
+
+    lv_obj_add_event_cb(
+        settings_screen,
+        touch_event_cb,
+        LV_EVENT_PRESSED,
+        NULL
+    );
+
+    /* ---------------- SETTINGS TITLE ---------------- */
+
+    lv_obj_t *settings_title =
+        lv_label_create(settings_screen);
+
+    lv_label_set_text(
+        settings_title,
+        "Settings"
+    );
+
+    lv_obj_set_style_text_color(
+        settings_title,
+        lv_color_hex(0xFFFFFF),
+        LV_PART_MAIN
+    );
+
+    lv_obj_set_style_text_font(
+        settings_title,
+        &lv_font_montserrat_26,
+        LV_PART_MAIN
+    );
+
+    lv_obj_align(
+        settings_title,
+        LV_ALIGN_TOP_MID,
+        0,
+        30
+    );
+
     /* ---------------- BRIGHTNESS TITLE ---------------- */
 
     lv_obj_t *brightness_title =
-        lv_label_create(screen);
+        lv_label_create(settings_screen);
 
     lv_label_set_text(
         brightness_title,
@@ -814,15 +950,15 @@ extern "C" void app_main(void)
 
     lv_obj_align(
         brightness_title,
-        LV_ALIGN_BOTTOM_MID,
+        LV_ALIGN_CENTER,
         0,
-        -150
+        -70
     );
 
     /* ---------------- BRIGHTNESS VALUE ---------------- */
 
     brightness_label =
-        lv_label_create(screen);
+        lv_label_create(settings_screen);
 
     char brightness_buffer[16];
 
@@ -846,15 +982,15 @@ extern "C" void app_main(void)
 
     lv_obj_align(
         brightness_label,
-        LV_ALIGN_BOTTOM_MID,
+        LV_ALIGN_CENTER,
         0,
-        -115
+        -30
     );
 
     /* ---------------- BRIGHTNESS SLIDER ---------------- */
 
     brightness_slider =
-        lv_slider_create(screen);
+        lv_slider_create(settings_screen);
 
     lv_slider_set_range(
         brightness_slider,
@@ -875,9 +1011,9 @@ extern "C" void app_main(void)
 
     lv_obj_align(
         brightness_slider,
-        LV_ALIGN_BOTTOM_MID,
+        LV_ALIGN_CENTER,
         0,
-        -75
+        20
     );
 
     lv_obj_add_event_cb(
@@ -885,6 +1021,43 @@ extern "C" void app_main(void)
         brightness_slider_cb,
         LV_EVENT_VALUE_CHANGED,
         NULL
+    );
+
+    /* ---------------- BACK BUTTON ---------------- */
+
+    lv_obj_t *back_button =
+        lv_button_create(settings_screen);
+
+    lv_obj_set_size(
+        back_button,
+        130,
+        50
+    );
+
+    lv_obj_align(
+        back_button,
+        LV_ALIGN_BOTTOM_MID,
+        0,
+        -55
+    );
+
+    lv_obj_add_event_cb(
+        back_button,
+        back_home_cb,
+        LV_EVENT_CLICKED,
+        NULL
+    );
+
+    lv_obj_t *back_button_label =
+        lv_label_create(back_button);
+
+    lv_label_set_text(
+        back_button_label,
+        "Back"
+    );
+
+    lv_obj_center(
+        back_button_label
     );
 
     /* ---------------- TIMERS ---------------- */
