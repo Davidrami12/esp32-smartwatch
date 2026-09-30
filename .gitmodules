@@ -1,0 +1,3 @@
+[submodule "apps/watch-simulator/lvgl"]
+	path = apps/watch-simulator/lvgl
+	url = https://github.com/lvgl/lvgl.git
