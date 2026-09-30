@@ -18,11 +18,13 @@ static lv_obj_t *battery_icon_tip = NULL;
 
 static lv_obj_t *brightness_label = NULL;
 static lv_obj_t *brightness_slider = NULL;
+static lv_obj_t *screen_timeout_dropdown = NULL;
 
 static uint8_t current_brightness = 60;
 static uint32_t display_timeout_ms = 10000;
 
 static watch_ui_brightness_cb_t brightness_callback = NULL;
+static watch_ui_brightness_committed_cb_t brightness_committed_callback = NULL;
 static watch_ui_timeout_cb_t timeout_callback = NULL;
 
 enum class WatchScreen {
@@ -196,6 +198,16 @@ static void screen_timeout_dropdown_cb(lv_event_t *event)
 
     if (timeout_callback != NULL) {
         timeout_callback(display_timeout_ms);
+    }
+}
+
+static void brightness_slider_released_cb(lv_event_t *event)
+{
+    if (
+        lv_event_get_code(event) == LV_EVENT_RELEASED &&
+        brightness_committed_callback != NULL
+    ) {
+        brightness_committed_callback(current_brightness);
     }
 }
 
@@ -664,6 +676,13 @@ static void create_settings_screen(void)
         NULL
     );
 
+    lv_obj_add_event_cb(
+        brightness_slider,
+        brightness_slider_released_cb,
+        LV_EVENT_RELEASED,
+        NULL
+    );
+
     /* Screen timeout title */
 
     lv_obj_t *screen_timeout_title =
@@ -689,7 +708,7 @@ static void create_settings_screen(void)
 
     /* Screen timeout dropdown */
 
-    lv_obj_t *screen_timeout_dropdown =
+    screen_timeout_dropdown =
         lv_dropdown_create(settings_screen);
 
     lv_dropdown_set_options(
@@ -772,6 +791,41 @@ void watch_ui_create(void)
 
     current_screen =
         WatchScreen::Home;
+}
+
+void watch_ui_set_settings(
+    uint8_t brightness,
+    uint32_t timeout_ms
+)
+{
+    uint16_t timeout_selection = 1;
+
+    current_brightness = brightness;
+
+    switch (timeout_ms) {
+        case 5000: timeout_selection = 0; break;
+        case 10000: timeout_selection = 1; break;
+        case 30000: timeout_selection = 2; break;
+        case 60000: timeout_selection = 3; break;
+        case 0: timeout_selection = 4; break;
+        default: timeout_ms = 10000; break;
+    }
+
+    display_timeout_ms = timeout_ms;
+
+    if (brightness_slider != NULL) {
+        lv_slider_set_value(brightness_slider, current_brightness, LV_ANIM_OFF);
+    }
+
+    if (brightness_label != NULL) {
+        char buffer[16];
+        snprintf(buffer, sizeof(buffer), "%u%%", current_brightness);
+        lv_label_set_text(brightness_label, buffer);
+    }
+
+    if (screen_timeout_dropdown != NULL) {
+        lv_dropdown_set_selected(screen_timeout_dropdown, timeout_selection);
+    }
 }
 
 void watch_ui_set_time(const char *time)
@@ -955,4 +1009,11 @@ void watch_ui_set_timeout_callback(
 )
 {
     timeout_callback = callback;
+}
+
+void watch_ui_set_brightness_committed_callback(
+    watch_ui_brightness_committed_cb_t callback
+)
+{
+    brightness_committed_callback = callback;
 }

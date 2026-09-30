@@ -1,4 +1,5 @@
 #include "watch_ui.h"
+#include "watch_settings.h"
 #include <stdio.h>
 #include <time.h>
 #include <stdlib.h>
@@ -9,6 +10,7 @@
 #include "freertos/event_groups.h"
 
 #include "esp_wifi.h"
+#include "esp_log.h"
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
@@ -37,8 +39,8 @@ static volatile bool wifi_connected = false;
 static uint32_t last_activity;
 static uint32_t last_tap = 0;
 
+static watch_settings_t user_settings = {60, 10000};
 static uint8_t current_brightness = 60;
-
 static uint32_t display_timeout_ms = 10000;
 
 static XPowersPMU PMU;
@@ -572,6 +574,21 @@ static void ui_timeout_changed(
 
     last_activity =
         lv_tick_get();
+
+    esp_err_t error = watch_settings_save_screen_timeout(timeout_ms);
+    if (error != ESP_OK) {
+        ESP_LOGW("watch_settings", "Timeout persistence failed: %s",
+                 esp_err_to_name(error));
+    }
+}
+
+static void ui_brightness_committed(uint8_t brightness)
+{
+    esp_err_t error = watch_settings_save_brightness(brightness);
+    if (error != ESP_OK) {
+        ESP_LOGW("watch_settings", "Brightness persistence failed: %s",
+                 esp_err_to_name(error));
+    }
 }
 
 
@@ -595,6 +612,10 @@ extern "C" void app_main(void)
     }
 
     ESP_ERROR_CHECK(ret);
+
+    watch_settings_load(&user_settings);
+    current_brightness = user_settings.brightness;
+    display_timeout_ms = user_settings.screen_timeout_ms;
 
     /* Initialize display */
 
@@ -655,6 +676,15 @@ extern "C" void app_main(void)
 
     watch_ui_set_timeout_callback(
         ui_timeout_changed
+    );
+
+    watch_ui_set_brightness_committed_callback(
+        ui_brightness_committed
+    );
+
+    watch_ui_set_settings(
+        current_brightness,
+        display_timeout_ms
     );
 
     /* Initial UI state */
