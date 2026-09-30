@@ -2,6 +2,7 @@
 #include "watch_settings.h"
 #include "watch_rtc.h"
 #include "watch_power.h"
+#include "watch_motion.h"
 #include <stdio.h>
 #include <time.h>
 #include <stdlib.h>
@@ -686,6 +687,11 @@ extern "C" void app_main(void)
     }
     if (watch_rtc_init() == ESP_OK) {
         seed_clock_from_rtc();
+    }
+
+    esp_err_t motion_error = watch_motion_init();
+    if (motion_error != ESP_OK) {
+        ESP_LOGW("watch_motion", "Motion sensor unavailable; continuing without IMU");
     }
 
     /* Initialize battery monitoring */
