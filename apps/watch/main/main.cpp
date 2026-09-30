@@ -1,6 +1,7 @@
 #include "watch_ui.h"
 #include "watch_settings.h"
 #include "watch_rtc.h"
+#include "watch_power.h"
 #include <stdio.h>
 #include <time.h>
 #include <stdlib.h>
@@ -35,7 +36,6 @@ static EventGroupHandle_t wifi_event_group;
 static constexpr EventBits_t WIFI_CONNECTED_BIT = BIT0;
 static constexpr time_t MIN_VALID_EPOCH = 946684800; // 2000-01-01 UTC
 
-static bool display_on = true;
 static volatile bool wifi_connected = false;
 
 static uint32_t last_activity;
@@ -237,6 +237,9 @@ static void wifi_init(void)
         esp_wifi_init(&cfg)
     );
 
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
+    ESP_LOGI("watch_wifi", "Wi-Fi power save: minimum modem sleep");
+
     ESP_ERROR_CHECK(
         esp_event_handler_register(
             WIFI_EVENT,
@@ -303,6 +306,10 @@ static void update_wifi_status_cb(
 )
 {
     (void)timer;
+
+    if (!watch_power_is_active()) {
+        return;
+    }
 
     if (!wifi_connected) {
         watch_ui_set_wifi(
@@ -400,6 +407,10 @@ static void update_clock_cb(
 {
     (void)timer;
 
+    if (!watch_power_is_active()) {
+        return;
+    }
+
     time_t now;
     struct tm timeinfo;
 
@@ -443,6 +454,10 @@ static void update_battery_cb(
 )
 {
     (void)timer;
+
+    if (!watch_power_is_active()) {
+        return;
+    }
 
     if (!PMU.isBatteryConnect()) {
         watch_ui_set_battery(
@@ -493,10 +508,10 @@ static void touch_event_cb(
 
     printf(
         "Touch | display_on=%d\n",
-        display_on
+        watch_power_is_active()
     );
 
-    if (display_on) {
+    if (watch_power_is_active()) {
         last_activity = now;
         return;
     }
@@ -505,11 +520,7 @@ static void touch_event_cb(
         last_tap != 0 &&
         lv_tick_elaps(last_tap) <= DOUBLE_TAP_MS
     ) {
-        bsp_display_brightness_set(
-            current_brightness
-        );
-
-        display_on = true;
+        watch_power_set_active(true, current_brightness);
         last_activity = now;
         last_tap = 0;
 
@@ -559,14 +570,12 @@ static void display_timeout_cb(
     }
 
     if (
-        display_on &&
+        watch_power_is_active() &&
         lv_tick_elaps(
             last_activity
         ) >= display_timeout_ms
     ) {
-        bsp_display_brightness_set(0);
-
-        display_on = false;
+        watch_power_set_active(false, current_brightness);
         last_tap = 0;
     }
 }
@@ -578,9 +587,9 @@ static void ui_brightness_changed(
     current_brightness =
         brightness;
 
-    bsp_display_brightness_set(
-        current_brightness
-    );
+    if (watch_power_is_active()) {
+        bsp_display_brightness_set(current_brightness);
+    }
 
     last_activity =
         lv_tick_get();
@@ -633,6 +642,8 @@ extern "C" void app_main(void)
     }
 
     ESP_ERROR_CHECK(ret);
+
+    ESP_ERROR_CHECK(watch_power_init());
 
     setenv("TZ", "CET-1CEST,M3.5.0/2,M10.5.0/3", 1);
     tzset();
