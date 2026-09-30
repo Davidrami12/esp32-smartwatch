@@ -682,14 +682,20 @@ static void touch_event_cb(
     uint32_t now =
         lv_tick_get();
 
+    printf(
+        "Touch | display_on=%d\n",
+        display_on
+    );
+
     if (display_on) {
         last_activity = now;
         return;
     }
 
     if (
-        now - last_tap <=
-        DOUBLE_TAP_MS
+        last_tap != 0 &&
+        lv_tick_elaps(last_tap) <=
+            DOUBLE_TAP_MS
     ) {
         bsp_display_brightness_set(
             current_brightness
@@ -698,10 +704,40 @@ static void touch_event_cb(
         display_on = true;
         last_activity = now;
         last_tap = 0;
+
+        printf("Display wake\n");
     }
     else {
         last_tap = now;
     }
+}
+
+static void register_touch_handler(void)
+{
+    lv_indev_t *indev =
+        lv_indev_get_next(NULL);
+
+    while (indev != NULL) {
+        if (
+            lv_indev_get_type(indev) ==
+            LV_INDEV_TYPE_POINTER
+        ) {
+            lv_indev_add_event_cb(
+                indev,
+                touch_event_cb,
+                LV_EVENT_PRESSED,
+                NULL
+            );
+
+            printf("Touch handler registered\n");
+            return;
+        }
+
+        indev =
+            lv_indev_get_next(indev);
+    }
+
+    printf("Touch input device not found\n");
 }
 
 static void display_timeout_cb(
@@ -1244,13 +1280,6 @@ extern "C" void app_main(void)
 
     lv_obj_add_event_cb(
         settings_screen,
-        touch_event_cb,
-        LV_EVENT_PRESSED,
-        NULL
-    );
-
-    lv_obj_add_event_cb(
-        settings_screen,
         navigation_gesture_cb,
         LV_EVENT_GESTURE,
         NULL
@@ -1506,6 +1535,8 @@ extern "C" void app_main(void)
         200,
         NULL
     );
+
+    register_touch_handler();
 
     bsp_display_unlock();
 }
