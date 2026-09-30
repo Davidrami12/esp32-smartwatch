@@ -5,6 +5,7 @@ idf_component_register(
     SRCS
         main.cpp
         watch_settings.cpp
+        watch_rtc.cpp
         ${LV_DEMOS_SOURCES}
         ../../../components/watch-ui/watch_ui.cpp
     INCLUDE_DIRS

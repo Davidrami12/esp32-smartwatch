@@ -1,5 +1,6 @@
 #include "watch_ui.h"
 #include "watch_settings.h"
+#include "watch_rtc.h"
 #include <stdio.h>
 #include <time.h>
 #include <stdlib.h>
@@ -26,12 +27,13 @@
 #include "XPowersLib.h"
 
 #define DOUBLE_TAP_MS 500
-#define WIFI_CONNECTED_BIT BIT0
 
 #define AXP2101_I2C_ADDRESS 0x34
 #define I2C_TIMEOUT_MS 1000
 
 static EventGroupHandle_t wifi_event_group;
+static constexpr EventBits_t WIFI_CONNECTED_BIT = BIT0;
+static constexpr time_t MIN_VALID_EPOCH = 946684800; // 2000-01-01 UTC
 
 static bool display_on = true;
 static volatile bool wifi_connected = false;
@@ -294,13 +296,6 @@ static void wifi_init(void)
         esp_wifi_start()
     );
 
-    xEventGroupWaitBits(
-        wifi_event_group,
-        WIFI_CONNECTED_BIT,
-        pdFALSE,
-        pdTRUE,
-        portMAX_DELAY
-    );
 }
 
 static void update_wifi_status_cb(
@@ -340,30 +335,19 @@ static void update_wifi_status_cb(
 
 /* ---------------- TIME ---------------- */
 
+static void time_sync_notification_cb(struct timeval *tv);
+
 static void sync_time(void)
 {
     esp_sntp_config_t config =
         ESP_NETIF_SNTP_DEFAULT_CONFIG(
             "pool.ntp.org"
         );
+    config.sync_cb = time_sync_notification_cb;
 
-    ESP_ERROR_CHECK(
-        esp_netif_sntp_init(
-            &config
-        )
-    );
+    ESP_ERROR_CHECK(esp_netif_sntp_init(&config));
 
-    esp_err_t ret =
-        esp_netif_sntp_sync_wait(
-            pdMS_TO_TICKS(10000)
-        );
-
-    if (ret != ESP_OK) {
-        printf(
-            "NTP sync failed\n"
-        );
-    }
-
+    ESP_LOGI("watch_time", "SNTP initialized");
     setenv(
         "TZ",
         "CET-1CEST,M3.5.0/2,M10.5.0/3",
@@ -371,6 +355,43 @@ static void sync_time(void)
     );
 
     tzset();
+}
+
+static void time_sync_notification_cb(struct timeval *tv)
+{
+    (void)tv;
+    time_t now;
+    time(&now);
+    if (now < MIN_VALID_EPOCH) {
+        ESP_LOGW("watch_time", "SNTP callback received invalid system time");
+        return;
+    }
+    esp_err_t error = watch_rtc_write_utc(now);
+    if (error == ESP_OK) {
+        ESP_LOGI("watch_time", "SNTP UTC time synchronized to PCF85063");
+    } else {
+        ESP_LOGE("watch_time", "Could not synchronize SNTP time to RTC: %s",
+                 esp_err_to_name(error));
+    }
+}
+
+static void seed_clock_from_rtc(void)
+{
+    time_t timestamp;
+    if (!watch_rtc_read_utc(&timestamp)) {
+        ESP_LOGW("watch_rtc", "No valid RTC time; awaiting SNTP");
+        return;
+    }
+    struct timeval now = {.tv_sec = timestamp, .tv_usec = 0};
+    settimeofday(&now, NULL);
+    ESP_LOGI("watch_rtc", "Seeded system clock from UTC RTC");
+}
+
+static void start_sntp_when_wifi_connected(void *arg)
+{
+    (void)arg;
+    sync_time();
+    vTaskDelete(NULL);
 }
 
 static void update_clock_cb(
@@ -613,6 +634,9 @@ extern "C" void app_main(void)
 
     ESP_ERROR_CHECK(ret);
 
+    setenv("TZ", "CET-1CEST,M3.5.0/2,M10.5.0/3", 1);
+    tzset();
+
     watch_settings_load(&user_settings);
     current_brightness = user_settings.brightness;
     display_timeout_ms = user_settings.screen_timeout_ms;
@@ -646,6 +670,13 @@ extern "C" void app_main(void)
 
     bsp_display_unlock();
 
+    if (bsp_i2c_get_handle() == NULL) {
+        ESP_ERROR_CHECK(bsp_i2c_init());
+    }
+    if (watch_rtc_init() == ESP_OK) {
+        seed_clock_from_rtc();
+    }
+
     /* Initialize battery monitoring */
 
     if (
@@ -655,14 +686,6 @@ extern "C" void app_main(void)
             "Battery monitoring unavailable\n"
         );
     }
-
-    /* Initialize Wi-Fi */
-
-    wifi_init();
-
-    /* Synchronize time */
-
-    sync_time();
 
     /* Create LVGL UI */
 
@@ -725,4 +748,7 @@ extern "C" void app_main(void)
     register_touch_handler();
 
     bsp_display_unlock();
+
+    wifi_init();
+    xTaskCreate(start_sntp_when_wifi_connected, "sntp_start", 4096, NULL, 5, NULL);
 }
