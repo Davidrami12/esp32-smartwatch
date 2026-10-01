@@ -3,6 +3,8 @@
 #include "watch_rtc.h"
 #include "watch_power.h"
 #include "watch_motion.h"
+#include "watch_steps.h"
+#include "watch_activity.h"
 #include <stdio.h>
 #include <time.h>
 #include <stdlib.h>
@@ -613,6 +615,15 @@ static void ui_timeout_changed(
     }
 }
 
+static void update_steps_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    if (!watch_power_is_active()) {
+        return;
+    }
+    watch_ui_set_steps(watch_steps_get_count());
+}
+
 static void ui_brightness_committed(uint8_t brightness)
 {
     esp_err_t error = watch_settings_save_brightness(brightness);
@@ -689,6 +700,12 @@ extern "C" void app_main(void)
         seed_clock_from_rtc();
     }
 
+    watch_steps_init();
+    esp_err_t activity_error = watch_activity_init();
+    if (activity_error != ESP_OK) {
+        ESP_LOGW("watch_activity", "Daily activity persistence unavailable: %s",
+                 esp_err_to_name(activity_error));
+    }
     esp_err_t motion_error = watch_motion_init();
     if (motion_error != ESP_OK) {
         ESP_LOGW("watch_motion", "Motion sensor unavailable; continuing without IMU");
@@ -730,6 +747,7 @@ extern "C" void app_main(void)
     /* Initial UI state */
 
     update_clock_cb(NULL);
+    update_steps_cb(NULL);
     update_wifi_status_cb(NULL);
     update_battery_cb(NULL);
 
@@ -740,6 +758,12 @@ extern "C" void app_main(void)
 
     lv_timer_create(
         update_clock_cb,
+        1000,
+        NULL
+    );
+
+    lv_timer_create(
+        update_steps_cb,
         1000,
         NULL
     );

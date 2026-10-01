@@ -8,6 +8,8 @@ idf_component_register(
         watch_rtc.cpp
         watch_power.cpp
         watch_motion.cpp
+        watch_steps.cpp
+        watch_activity.cpp
         ${LV_DEMOS_SOURCES}
         ../../../components/watch-ui/watch_ui.cpp
     INCLUDE_DIRS

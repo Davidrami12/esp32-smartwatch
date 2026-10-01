@@ -32,6 +32,7 @@ void watch_ui_set_settings(
 
 void watch_ui_set_time(const char *time);
 void watch_ui_set_date(const char *date);
+void watch_ui_set_steps(uint32_t steps);
 
 void watch_ui_set_wifi(
     bool connected,
