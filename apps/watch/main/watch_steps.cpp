@@ -138,3 +138,19 @@ void watch_steps_set_count(uint32_t count)
     step_count = count;
     portEXIT_CRITICAL(&count_lock);
 }
+
+void watch_steps_add_count(uint32_t count)
+{
+    portENTER_CRITICAL(&count_lock);
+    step_count = count > UINT32_MAX - step_count ? UINT32_MAX : step_count + count;
+    portEXIT_CRITICAL(&count_lock);
+}
+
+uint32_t watch_steps_exchange_count(uint32_t count)
+{
+    portENTER_CRITICAL(&count_lock);
+    const uint32_t previous = step_count;
+    step_count = count;
+    portEXIT_CRITICAL(&count_lock);
+    return previous;
+}

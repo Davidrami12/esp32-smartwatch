@@ -5,6 +5,8 @@
 #include "watch_motion.h"
 #include "watch_steps.h"
 #include "watch_activity.h"
+#include "watch_wifi.h"
+#include "watch_weather.h"
 #include <stdio.h>
 #include <time.h>
 #include <stdlib.h>
@@ -35,11 +37,8 @@
 #define AXP2101_I2C_ADDRESS 0x34
 #define I2C_TIMEOUT_MS 1000
 
-static EventGroupHandle_t wifi_event_group;
-static constexpr EventBits_t WIFI_CONNECTED_BIT = BIT0;
 static constexpr time_t MIN_VALID_EPOCH = 946684800; // 2000-01-01 UTC
 
-static volatile bool wifi_connected = false;
 
 static uint32_t last_activity;
 static uint32_t last_tap = 0;
@@ -184,124 +183,9 @@ static esp_err_t battery_init(void)
 
 /* ---------------- WIFI ---------------- */
 
-static void wifi_event_handler(
-    void *arg,
-    esp_event_base_t event_base,
-    int32_t event_id,
-    void *event_data
-)
+static bool ui_wifi_request(bool enabled)
 {
-    if (
-        event_base == WIFI_EVENT &&
-        event_id == WIFI_EVENT_STA_START
-    ) {
-        esp_wifi_connect();
-    }
-    else if (
-        event_base == WIFI_EVENT &&
-        event_id == WIFI_EVENT_STA_DISCONNECTED
-    ) {
-        wifi_connected = false;
-
-        esp_wifi_connect();
-    }
-    else if (
-        event_base == IP_EVENT &&
-        event_id == IP_EVENT_STA_GOT_IP
-    ) {
-        wifi_connected = true;
-
-        xEventGroupSetBits(
-            wifi_event_group,
-            WIFI_CONNECTED_BIT
-        );
-    }
-}
-
-static void wifi_init(void)
-{
-    wifi_event_group =
-        xEventGroupCreate();
-
-    ESP_ERROR_CHECK(
-        esp_netif_init()
-    );
-
-    ESP_ERROR_CHECK(
-        esp_event_loop_create_default()
-    );
-
-    esp_netif_create_default_wifi_sta();
-
-    wifi_init_config_t cfg =
-        WIFI_INIT_CONFIG_DEFAULT();
-
-    ESP_ERROR_CHECK(
-        esp_wifi_init(&cfg)
-    );
-
-    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
-    ESP_LOGI("watch_wifi", "Wi-Fi power save: minimum modem sleep");
-
-    ESP_ERROR_CHECK(
-        esp_event_handler_register(
-            WIFI_EVENT,
-            ESP_EVENT_ANY_ID,
-            wifi_event_handler,
-            NULL
-        )
-    );
-
-    ESP_ERROR_CHECK(
-        esp_event_handler_register(
-            IP_EVENT,
-            IP_EVENT_STA_GOT_IP,
-            wifi_event_handler,
-            NULL
-        )
-    );
-
-    wifi_config_t wifi_config = {};
-
-    snprintf(
-        reinterpret_cast<char *>(
-            wifi_config.sta.ssid
-        ),
-        sizeof(
-            wifi_config.sta.ssid
-        ),
-        "%s",
-        WIFI_SSID
-    );
-
-    snprintf(
-        reinterpret_cast<char *>(
-            wifi_config.sta.password
-        ),
-        sizeof(
-            wifi_config.sta.password
-        ),
-        "%s",
-        WIFI_PASSWORD
-    );
-
-    ESP_ERROR_CHECK(
-        esp_wifi_set_mode(
-            WIFI_MODE_STA
-        )
-    );
-
-    ESP_ERROR_CHECK(
-        esp_wifi_set_config(
-            WIFI_IF_STA,
-            &wifi_config
-        )
-    );
-
-    ESP_ERROR_CHECK(
-        esp_wifi_start()
-    );
-
+    return watch_wifi_request_enabled(enabled);
 }
 
 static void update_wifi_status_cb(
@@ -314,33 +198,13 @@ static void update_wifi_status_cb(
         return;
     }
 
-    if (!wifi_connected) {
-        watch_ui_set_wifi(
-            false,
-            0
-        );
-
-        return;
-    }
-
-    wifi_ap_record_t ap_info = {};
-
-    if (
-        esp_wifi_sta_get_ap_info(
-            &ap_info
-        ) == ESP_OK
-    ) {
-        watch_ui_set_wifi(
-            true,
-            ap_info.rssi
-        );
-    }
-    else {
-        watch_ui_set_wifi(
-            true,
-            0
-        );
-    }
+    const auto state = watch_wifi_get_state();
+    watch_ui_set_wifi_state(state == watch_wifi_state_t::Connected ? WATCH_UI_WIFI_CONNECTED :
+        state == watch_wifi_state_t::Connecting ? WATCH_UI_WIFI_CONNECTING : WATCH_UI_WIFI_DISCONNECTED,
+        watch_wifi_get_rssi());
+    const auto weather = watch_weather_get();
+    watch_ui_set_weather(weather.available, weather.temperature_c,
+                         static_cast<watch_ui_weather_condition_t>(weather.condition));
 }
 
 /* ---------------- TIME ---------------- */
@@ -419,6 +283,12 @@ static void update_clock_cb(
 
     time(&now);
 
+    if (now < MIN_VALID_EPOCH) {
+        watch_ui_set_time("--:--");
+        watch_ui_set_date("Waiting for local date");
+        return;
+    }
+
     localtime_r(
         &now,
         &timeinfo
@@ -434,12 +304,9 @@ static void update_clock_cb(
         &timeinfo
     );
 
-    strftime(
-        date_buffer,
-        sizeof(date_buffer),
-        "%d/%m/%Y",
-        &timeinfo
-    );
+    static const char *weekdays[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+    snprintf(date_buffer, sizeof(date_buffer), "%s  %02d/%02d/%04d", weekdays[timeinfo.tm_wday],
+             timeinfo.tm_mday, timeinfo.tm_mon + 1, timeinfo.tm_year + 1900);
 
     watch_ui_set_time(
         time_buffer
@@ -495,6 +362,8 @@ static void update_battery_cb(
 
 /* ---------------- DISPLAY ---------------- */
 
+static void update_steps_cb(lv_timer_t *timer);
+
 static void touch_event_cb(
     lv_event_t *event
 )
@@ -526,6 +395,11 @@ static void touch_event_cb(
         watch_power_set_active(true, current_brightness);
         last_activity = now;
         last_tap = 0;
+
+        update_clock_cb(NULL);
+        update_steps_cb(NULL);
+        update_wifi_status_cb(NULL);
+        update_battery_cb(NULL);
 
         printf("Display wake\n");
     }
@@ -622,6 +496,13 @@ static void update_steps_cb(lv_timer_t *timer)
         return;
     }
     watch_ui_set_steps(watch_steps_get_count());
+    watch_activity_day_t history[7];
+    watch_ui_activity_day_t rows[7];
+    const bool valid = watch_activity_get_history(history);
+    if (valid) {
+        for (unsigned i = 0; i < 7; ++i) rows[i] = {history[i].steps, history[i].weekday};
+    }
+    watch_ui_set_history(valid ? rows : nullptr);
 }
 
 static void ui_brightness_committed(uint8_t brightness)
@@ -726,6 +607,7 @@ extern "C" void app_main(void)
     bsp_display_lock(0);
 
     watch_ui_create();
+    watch_ui_set_wifi_control_callback(ui_wifi_request);
 
     watch_ui_set_brightness_callback(
         ui_brightness_changed
@@ -790,6 +672,7 @@ extern "C" void app_main(void)
 
     bsp_display_unlock();
 
-    wifi_init();
+    ESP_ERROR_CHECK(watch_wifi_init());
+    ESP_ERROR_CHECK(watch_weather_init());
     xTaskCreate(start_sntp_when_wifi_connected, "sntp_start", 4096, NULL, 5, NULL);
 }

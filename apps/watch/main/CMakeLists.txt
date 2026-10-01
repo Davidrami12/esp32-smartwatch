@@ -10,12 +10,15 @@ idf_component_register(
         watch_motion.cpp
         watch_steps.cpp
         watch_activity.cpp
+        watch_wifi.cpp
+        watch_weather.cpp
         ${LV_DEMOS_SOURCES}
         ../../../components/watch-ui/watch_ui.cpp
     INCLUDE_DIRS
         .
         ${LV_DEMO_DIR}
         ../../../components/watch-ui
+    PRIV_REQUIRES esp_http_client mbedtls esp_timer esp_wifi esp_netif nvs_flash esp_pm XPowersLib
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-error=cpp)
