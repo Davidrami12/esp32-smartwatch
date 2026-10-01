@@ -1,5 +1,6 @@
 ## IDF Component Manager Manifest File
 dependencies:
+  espressif/cjson: ^1.7.19
   espressif/esp_codec_dev:
     version: ~1.5
     public: true

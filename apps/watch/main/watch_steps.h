@@ -9,4 +9,7 @@ void watch_steps_init(void);
 void watch_steps_process_sample(const watch_motion_data_t *sample);
 uint32_t watch_steps_get_count(void);
 void watch_steps_set_count(uint32_t count);
+// Atomic count adjustment/swap; detector filter state is unchanged.
+void watch_steps_add_count(uint32_t count);
+uint32_t watch_steps_exchange_count(uint32_t count);
 void watch_steps_reset(void);

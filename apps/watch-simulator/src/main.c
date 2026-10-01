@@ -84,7 +84,7 @@ static void update_clock_cb(lv_timer_t *timer)
 #endif
 
     char time_buffer[16];
-    char date_buffer[16];
+    char date_buffer[40];
 
     strftime(
         time_buffer,
@@ -93,15 +93,31 @@ static void update_clock_cb(lv_timer_t *timer)
         &timeinfo
     );
 
-    strftime(
-        date_buffer,
-        sizeof(date_buffer),
-        "%d/%m/%Y",
-        &timeinfo
-    );
+    static const char *weekdays[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+    snprintf(date_buffer, sizeof(date_buffer), "%s  %02d/%02d/%04d", weekdays[timeinfo.tm_wday],
+             timeinfo.tm_mday, timeinfo.tm_mon + 1, timeinfo.tm_year + 1900);
 
     watch_ui_set_time(time_buffer);
     watch_ui_set_date(date_buffer);
+}
+
+/* Alternate mock connectivity so both status states can be inspected without hardware. */
+static watch_ui_wifi_state_t mock_wifi = WATCH_UI_WIFI_CONNECTED;
+static unsigned mock_connect_ticks = 0;
+
+static bool mock_wifi_control(bool enabled)
+{
+    mock_wifi = enabled ? WATCH_UI_WIFI_CONNECTING : WATCH_UI_WIFI_DISCONNECTED;
+    mock_connect_ticks = 0;
+    watch_ui_set_wifi_state(mock_wifi, 0);
+    return true;
+}
+
+static void update_mock_wifi_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    if (mock_wifi == WATCH_UI_WIFI_CONNECTING && ++mock_connect_ticks >= 3) mock_wifi = WATCH_UI_WIFI_CONNECTED;
+    watch_ui_set_wifi_state(mock_wifi, mock_wifi == WATCH_UI_WIFI_CONNECTED ? -65 : 0);
 }
 
 int main(int argc, char **argv)
@@ -128,9 +144,32 @@ int main(int argc, char **argv)
   /* Initialize clock and update it every second */
   update_clock_cb(NULL);
   lv_timer_create(update_clock_cb, 1000, NULL);
-  watch_ui_set_wifi(true, -65);
+  watch_ui_set_wifi_control_callback(mock_wifi_control);
+  watch_ui_set_wifi_state(WATCH_UI_WIFI_CONNECTED, -65);
+  lv_timer_create(update_mock_wifi_cb, 1000, NULL);
+  watch_ui_set_weather(true, 24, WATCH_UI_WEATHER_SUNNY);
+  {
+    const uint32_t counts[7] = {1234, 8140, 0, 7283, 4612, 0, 9050};
+    watch_ui_activity_day_t days[7];
+    time_t now = time(NULL);
+    struct tm local;
+#ifdef _MSC_VER
+    localtime_s(&local, &now);
+#else
+    localtime_r(&now, &local);
+#endif
+    local.tm_hour = 12;
+    for (unsigned i = 0; i < 7; ++i) {
+        local.tm_isdst = -1;
+        mktime(&local);
+        days[i].steps = counts[i];
+        days[i].weekday = (uint8_t)local.tm_wday;
+        --local.tm_mday;
+    }
+    watch_ui_set_history(days);
+  }
   watch_ui_set_battery(100, false);
-  watch_ui_set_steps(1234); /* Mock value for validating the shared Home screen UI. */
+  watch_ui_set_steps(1234); /* Shared Home and Activity daily-count mock. */
 
   while(1) {
     /* Periodically call the lv_task handler.

@@ -23,10 +23,12 @@ When finishing an implementation feature, do not stop after compilation. Unless 
    ```sh
    idf.py -p COM9 flash
    ```
+   If COM9 is busy/access denied, identify any existing ESP-IDF serial monitor using COM9 (including one started with `idf.py -p COM9 flash monitor`). You are authorized to stop that identified monitor/process tree, release the port, and retry flashing automatically. Prefer stopping the monitor rather than closing its entire terminal. Do not terminate unrelated processes or terminals, or an active flash operation. If the owner cannot be safely identified or the retry still fails, report the blocker accurately rather than claiming PASS.
 5. After flashing, start the serial monitor from `apps/watch` when runtime validation is useful:
    ```sh
    idf.py -p COM9 monitor
    ```
+   Capture a bounded startup/runtime log window, then stop the monitor cleanly so COM9 is available for subsequent development and manual testing.
 6. Inspect startup/runtime logs for crashes, initialization failures, warnings related to the implemented feature, and regressions in existing functionality.
 7. Do not treat successful compilation as sufficient validation when the physical device is available.
 8. If COM9 or the device is unavailable, do not fail the implementation solely because flashing could not be performed. Report physical validation as **SKIPPED** and explain why.
