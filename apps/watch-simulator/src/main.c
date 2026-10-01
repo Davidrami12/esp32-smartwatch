@@ -130,6 +130,7 @@ int main(int argc, char **argv)
   lv_timer_create(update_clock_cb, 1000, NULL);
   watch_ui_set_wifi(true, -65);
   watch_ui_set_battery(100, false);
+  watch_ui_set_steps(1234); /* Mock value for validating the shared Home screen UI. */
 
   while(1) {
     /* Periodically call the lv_task handler.

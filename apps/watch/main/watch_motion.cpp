@@ -7,13 +7,13 @@
 #include "freertos/task.h"
 #include "qmi8658.h"
 #include "watch_power.h"
+#include "watch_steps.h"
 
 namespace {
 
 constexpr char kTag[] = "watch_motion";
 constexpr uint8_t kAddress = QMI8658_ADDRESS_HIGH;
-constexpr uint32_t kActivePeriodMs = 50; // 20 Hz application sampling
-constexpr uint32_t kIdlePeriodMs = 500;  // 2 Hz application sampling
+constexpr uint32_t kSamplePeriodMs = 40; // 25 Hz in ACTIVE and IDLE for step detection
 constexpr int64_t kActiveLogPeriodUs = 2'000'000;
 constexpr int64_t kIdleLogPeriodUs = 10'000'000;
 
@@ -23,28 +23,17 @@ bool has_sample = false;
 watch_motion_data_t latest = {};
 portMUX_TYPE data_lock = portMUX_INITIALIZER_UNLOCKED;
 
-qmi8658_accel_odr_t sensor_odr_for_state(bool active)
+qmi8658_accel_odr_t sensor_odr(void)
 {
-    return active ? QMI8658_ACCEL_ODR_62_5HZ : QMI8658_ACCEL_ODR_31_25HZ;
+    return QMI8658_ACCEL_ODR_31_25HZ;
 }
 
 void sampling_task(void *)
 {
-    bool configured_active = watch_power_is_active();
     int64_t last_log_us = 0;
 
     while (true) {
         const bool active = watch_power_is_active();
-        if (active != configured_active) {
-            esp_err_t error = qmi8658_set_accel_odr(&device, sensor_odr_for_state(active));
-            if (error == ESP_OK) {
-                configured_active = active;
-                ESP_LOGI(kTag, "Accelerometer ODR set to %s state rate",
-                         active ? "ACTIVE (62.5 Hz)" : "IDLE (31.25 Hz)");
-            } else {
-                ESP_LOGW(kTag, "Could not change accelerometer ODR: %s", esp_err_to_name(error));
-            }
-        }
 
         bool ready = false;
         esp_err_t error = qmi8658_is_data_ready(&device, &ready);
@@ -62,6 +51,7 @@ void sampling_task(void *)
                 latest = sample;
                 has_sample = true;
                 portEXIT_CRITICAL(&data_lock);
+                watch_steps_process_sample(&sample);
 
                 const int64_t now_us = esp_timer_get_time();
                 const int64_t log_period = active ? kActiveLogPeriodUs : kIdleLogPeriodUs;
@@ -80,7 +70,7 @@ void sampling_task(void *)
             ESP_LOGW(kTag, "Sensor sample failed: %s", esp_err_to_name(error));
             vTaskDelay(pdMS_TO_TICKS(1000));
         } else {
-            vTaskDelay(pdMS_TO_TICKS(active ? kActivePeriodMs : kIdlePeriodMs));
+            vTaskDelay(pdMS_TO_TICKS(kSamplePeriodMs));
         }
     }
 }
@@ -114,7 +104,7 @@ esp_err_t watch_motion_init(void)
     // a watch-oriented accelerometer-only mode and leave the gyroscope disabled.
     error = qmi8658_set_accel_range(&device, QMI8658_ACCEL_RANGE_4G);
     if (error == ESP_OK) {
-        error = qmi8658_set_accel_odr(&device, sensor_odr_for_state(watch_power_is_active()));
+        error = qmi8658_set_accel_odr(&device, sensor_odr());
     }
     if (error == ESP_OK) {
         qmi8658_set_accel_unit_mps2(&device, true);
@@ -126,7 +116,8 @@ esp_err_t watch_motion_init(void)
     }
 
     available = true;
-    ESP_LOGI(kTag, "QMI8658 ready at 0x%02X: accel ±4 g, gyro disabled", kAddress);
+    ESP_LOGI(kTag, "QMI8658 ready at 0x%02X: accel ±4 g, 31.25 Hz ODR / 25 Hz sampling, gyro disabled",
+             kAddress);
     if (xTaskCreate(sampling_task, "motion_sample", 3072, nullptr, 4, nullptr) != pdPASS) {
         available = false;
         ESP_LOGE(kTag, "Could not start motion sampling task");

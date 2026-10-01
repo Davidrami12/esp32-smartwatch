@@ -9,6 +9,7 @@ static lv_obj_t *settings_screen = NULL;
 static lv_obj_t *time_label = NULL;
 static lv_obj_t *date_label = NULL;
 static lv_obj_t *wifi_status_label = NULL;
+static lv_obj_t *steps_label = NULL;
 
 static lv_obj_t *battery_label = NULL;
 static lv_obj_t *charging_label = NULL;
@@ -315,6 +316,13 @@ static void create_home_screen(void)
         0,
         105
     );
+
+    /* Step count */
+    steps_label = lv_label_create(home_screen);
+    lv_label_set_text(steps_label, "Steps: 0");
+    lv_obj_set_style_text_color(steps_label, lv_color_hex(0xAAAAAA), LV_PART_MAIN);
+    lv_obj_set_style_text_font(steps_label, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_obj_align(steps_label, LV_ALIGN_TOP_MID, 0, 140);
 
     /* Battery body */
 
@@ -1009,6 +1017,15 @@ void watch_ui_set_timeout_callback(
 )
 {
     timeout_callback = callback;
+}
+
+void watch_ui_set_steps(uint32_t steps)
+{
+    if (steps_label != NULL) {
+        char buffer[32];
+        snprintf(buffer, sizeof(buffer), "Steps: %lu", (unsigned long)steps);
+        lv_label_set_text(steps_label, buffer);
+    }
 }
 
 void watch_ui_set_brightness_committed_callback(
