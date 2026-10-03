@@ -12,11 +12,13 @@ constexpr uint32_t kWhite = 0xF4F7FB;
 constexpr uint32_t kWarning = 0xFFB26B;
 constexpr uint32_t kTimeouts[] = {5000, 10000, 30000, 60000, 0};
 
-enum class WatchScreen { Home, Launcher, Activity, Settings, Wifi };
+enum class WatchScreen { Home, Launcher, Activity, Settings, Wifi, Bluetooth };
 static WatchScreen current_screen = WatchScreen::Home;
-static lv_obj_t *screens[5] = {};
+static lv_obj_t *screens[6] = {};
 static lv_obj_t *time_label, *date_label, *steps_label, *activity_steps_label;
 static lv_obj_t *battery_label, *wifi_status_label, *wifi_detail_label;
+static lv_obj_t *bluetooth_status_label;
+static lv_obj_t *wifi_name_label;
 static lv_obj_t *wifi_signal_label, *launcher_wifi_label;
 static lv_obj_t *wifi_action, *wifi_action_label;
 static lv_obj_t *history_names[7], *history_counts[7];
@@ -24,6 +26,9 @@ static lv_obj_t *weather_label, *weather_icon;
 static watch_ui_weather_condition_t weather_condition = WATCH_UI_WEATHER_SUNNY;
 static watch_ui_wifi_state_t wifi_state = WATCH_UI_WIFI_DISCONNECTED;
 static watch_ui_wifi_control_cb_t wifi_callback = nullptr;
+static watch_ui_bluetooth_control_cb_t bluetooth_callback = nullptr;
+static watch_ui_bluetooth_state_t bluetooth_state = WATCH_UI_BLUETOOTH_DISABLED;
+static lv_obj_t *launcher_bluetooth_label, *bluetooth_detail_label, *bluetooth_action, *bluetooth_action_label;
 static lv_obj_t *brightness_label, *brightness_slider, *screen_timeout_dropdown;
 static uint8_t current_brightness = 60;
 static uint32_t display_timeout_ms = 10000;
@@ -61,6 +66,16 @@ static void open_launcher_cb(lv_event_t *) { navigate_to(WatchScreen::Launcher);
 static void open_activity_cb(lv_event_t *) { navigate_to(WatchScreen::Activity); }
 static void open_settings_cb(lv_event_t *) { navigate_to(WatchScreen::Settings); }
 static void open_wifi_cb(lv_event_t *) { navigate_to(WatchScreen::Wifi); }
+static void open_bluetooth_cb(lv_event_t *) { navigate_to(WatchScreen::Bluetooth); }
+static void bluetooth_action_cb(lv_event_t *)
+{
+    if (!bluetooth_callback) return;
+    const bool enable = bluetooth_state == WATCH_UI_BLUETOOTH_DISABLED;
+    if (bluetooth_callback(enable)) {
+        lv_obj_add_state(bluetooth_action, LV_STATE_DISABLED);
+        lv_label_set_text(bluetooth_action_label, enable ? "Enabling..." : "Disabling...");
+    }
+}
 static void wifi_action_cb(lv_event_t *)
 {
     if (wifi_state == WATCH_UI_WIFI_CONNECTING || !wifi_callback) return;
@@ -213,10 +228,12 @@ static lv_obj_t *footprints_icon(lv_obj_t *parent, int size, uint32_t color)
 static void create_home_screen()
 {
     lv_obj_t *screen = create_screen(WatchScreen::Home, nullptr);
-    battery_label = label(screen, LV_SYMBOL_BATTERY_FULL "  --%", &lv_font_montserrat_16,
+    battery_label = label(screen, LV_SYMBOL_BATTERY_FULL "  --%", &lv_font_montserrat_14,
                           kMuted, LV_ALIGN_TOP_RIGHT, -34, 34);
-    wifi_status_label = label(screen, LV_SYMBOL_WIFI "  Waiting", &lv_font_montserrat_16,
+    wifi_status_label = label(screen, LV_SYMBOL_WIFI, &lv_font_montserrat_14,
                               kMuted, LV_ALIGN_TOP_LEFT, 34, 34);
+    bluetooth_status_label = label(screen, LV_SYMBOL_BLUETOOTH " Disabled", &lv_font_montserrat_14,
+                                    kMuted, LV_ALIGN_TOP_MID, 0, 34);
     // HH:MM gets priority; the firmware still supplies its unchanged time string.
     time_label = label(screen, "--:--", &lv_font_montserrat_48, kWhite,
                        LV_ALIGN_TOP_MID, 0, 139);
@@ -255,10 +272,10 @@ static void create_home_screen()
 static void create_launcher_screen()
 {
     lv_obj_t *screen = create_screen(WatchScreen::Launcher, "Apps");
-    // Two large primary tiles, then a full-width connectivity/status card.
-    lv_obj_t *activity = button(screen, "Activity", 154, 154, LV_ALIGN_TOP_MID,
+    // Two rows of large icon-and-label tiles: apps first, connectivity second.
+    lv_obj_t *activity = button(screen, "Activity", 154, 130, LV_ALIGN_TOP_MID,
                                 -85, 112, open_activity_cb);
-    lv_obj_t *settings = button(screen, "Settings", 154, 154, LV_ALIGN_TOP_MID,
+    lv_obj_t *settings = button(screen, "Settings", 154, 130, LV_ALIGN_TOP_MID,
                                 85, 112, open_settings_cb);
     lv_obj_align(lv_obj_get_child(activity, 0), LV_ALIGN_BOTTOM_MID, 0, -24);
     lv_obj_align(lv_obj_get_child(settings, 0), LV_ALIGN_BOTTOM_MID, 0, -24);
@@ -266,13 +283,31 @@ static void create_launcher_screen()
     lv_obj_align(activity_icon, LV_ALIGN_TOP_MID, 0, 26);
     label(settings, LV_SYMBOL_SETTINGS, &lv_font_montserrat_26, kAccent,
           LV_ALIGN_TOP_MID, 0, 30);
-    lv_obj_t *wifi = button(screen, "", 324, 100, LV_ALIGN_TOP_MID, 0, 282, open_wifi_cb);
-    label(wifi, LV_SYMBOL_WIFI "  Wi-Fi", &lv_font_montserrat_20, kWhite,
-          LV_ALIGN_TOP_LEFT, 24, 16);
-    launcher_wifi_label = label(wifi, "Waiting for status", &lv_font_montserrat_16,
-                                kMuted, LV_ALIGN_BOTTOM_LEFT, 24, -16);
-    label(wifi, LV_SYMBOL_RIGHT, &lv_font_montserrat_20, kMuted,
-          LV_ALIGN_RIGHT_MID, -24, 0);
+    lv_obj_t *wifi = button(screen, "", 154, 130, LV_ALIGN_TOP_MID, -85, 258, open_wifi_cb);
+    label(wifi, LV_SYMBOL_WIFI, &lv_font_montserrat_26, kAccent, LV_ALIGN_TOP_MID, 0, 16);
+    label(wifi, "Wi-Fi", &lv_font_montserrat_20, kWhite, LV_ALIGN_TOP_MID, 0, 56);
+    launcher_wifi_label = label(wifi, "Waiting", &lv_font_montserrat_14,
+                                kMuted, LV_ALIGN_BOTTOM_MID, 0, -16);
+    lv_obj_t *bluetooth = button(screen, "", 154, 130, LV_ALIGN_TOP_MID, 85, 258, open_bluetooth_cb);
+    label(bluetooth, LV_SYMBOL_BLUETOOTH, &lv_font_montserrat_26, kAccent, LV_ALIGN_TOP_MID, 0, 16);
+    label(bluetooth, "Bluetooth", &lv_font_montserrat_20, kWhite, LV_ALIGN_TOP_MID, 0, 56);
+    launcher_bluetooth_label = label(bluetooth, "Disabled", &lv_font_montserrat_14,
+                                     kMuted, LV_ALIGN_BOTTOM_MID, 0, -16);
+}
+
+static void create_bluetooth_screen()
+{
+    lv_obj_t *screen = create_screen(WatchScreen::Bluetooth, "Bluetooth");
+    label(screen, LV_SYMBOL_BLUETOOTH, &lv_font_montserrat_26, kAccent,
+          LV_ALIGN_TOP_MID, 0, 130);
+    bluetooth_detail_label = label(screen, "Disabled", &lv_font_montserrat_26, kMuted,
+                                   LV_ALIGN_TOP_MID, 0, 192);
+    label(screen, "ESP32 Smartwatch", &lv_font_montserrat_18, kMuted,
+          LV_ALIGN_TOP_MID, 0, 244);
+    bluetooth_action = button(screen, "Enable Bluetooth", 300, 64, LV_ALIGN_TOP_MID, 0, 314,
+                              bluetooth_action_cb);
+    bluetooth_action_label = lv_obj_get_child(bluetooth_action, 0);
+    lv_obj_add_state(bluetooth_action, LV_STATE_DISABLED);
 }
 
 static void create_activity_screen()
@@ -297,8 +332,13 @@ static void create_wifi_screen()
           LV_ALIGN_TOP_MID, 0, 130);
     wifi_detail_label = label(screen, "Waiting for status", &lv_font_montserrat_26,
                               kMuted, LV_ALIGN_TOP_MID, 0, 192);
+    wifi_name_label = label(screen, "", &lv_font_montserrat_18, kWhite,
+                            LV_ALIGN_TOP_MID, 0, 240);
+    lv_obj_set_width(wifi_name_label, 300);
+    lv_label_set_long_mode(wifi_name_label, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(wifi_name_label, LV_TEXT_ALIGN_CENTER, 0);
     wifi_signal_label = label(screen, "", &lv_font_montserrat_20, kMuted,
-                              LV_ALIGN_TOP_MID, 0, 244);
+                               LV_ALIGN_TOP_MID, 0, 272);
     wifi_action = button(screen, "Connect", 300, 64, LV_ALIGN_TOP_MID, 0, 314, wifi_action_cb);
     wifi_action_label = lv_obj_get_child(wifi_action, 0);
     lv_obj_add_state(wifi_action, LV_STATE_DISABLED);
@@ -373,6 +413,7 @@ void watch_ui_create(void)
     create_activity_screen();
     create_settings_screen();
     create_wifi_screen();
+    create_bluetooth_screen();
     current_screen = WatchScreen::Home;
 }
 
@@ -448,6 +489,42 @@ void watch_ui_set_wifi_state(watch_ui_wifi_state_t state, int rssi)
 void watch_ui_set_wifi_control_callback(watch_ui_wifi_control_cb_t callback)
 {
     wifi_callback = callback;
+}
+
+void watch_ui_set_bluetooth_control_callback(watch_ui_bluetooth_control_cb_t callback)
+{
+    bluetooth_callback = callback;
+}
+
+void watch_ui_set_wifi_name(const char *name)
+{
+    if (wifi_name_label) lv_label_set_text(wifi_name_label, name ? name : "");
+}
+
+void watch_ui_set_bluetooth_state(watch_ui_bluetooth_state_t state)
+{
+    bluetooth_state = state;
+    const char *text = state == WATCH_UI_BLUETOOTH_DISABLED ? "Disabled" :
+                       state == WATCH_UI_BLUETOOTH_CONNECTED ? "Connected" : "Available";
+    const uint32_t color = state == WATCH_UI_BLUETOOTH_DISABLED ? kMuted : kAccent;
+    if (bluetooth_status_label) {
+        lv_label_set_text_fmt(bluetooth_status_label, LV_SYMBOL_BLUETOOTH " %s", text);
+        lv_obj_set_style_text_color(bluetooth_status_label, lv_color_hex(color), 0);
+    }
+    if (launcher_bluetooth_label) {
+        lv_label_set_text(launcher_bluetooth_label, text);
+        lv_obj_set_style_text_color(launcher_bluetooth_label, lv_color_hex(color), 0);
+    }
+    if (bluetooth_detail_label) {
+        lv_label_set_text(bluetooth_detail_label, text);
+        lv_obj_set_style_text_color(bluetooth_detail_label, lv_color_hex(color), 0);
+    }
+    if (bluetooth_action) {
+        lv_label_set_text(bluetooth_action_label, state == WATCH_UI_BLUETOOTH_DISABLED ?
+                          "Enable Bluetooth" : "Disable Bluetooth");
+        if (bluetooth_callback) lv_obj_remove_state(bluetooth_action, LV_STATE_DISABLED);
+        else lv_obj_add_state(bluetooth_action, LV_STATE_DISABLED);
+    }
 }
 
 void watch_ui_set_weather(bool available, float temperature, watch_ui_weather_condition_t condition)

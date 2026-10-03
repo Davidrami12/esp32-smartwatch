@@ -7,3 +7,4 @@ esp_err_t watch_wifi_init(void);
 bool watch_wifi_request_enabled(bool enabled);
 watch_wifi_state_t watch_wifi_get_state(void);
 int watch_wifi_get_rssi(void);
+bool watch_wifi_is_enabled(void);

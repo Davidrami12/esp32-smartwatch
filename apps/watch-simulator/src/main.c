@@ -104,12 +104,19 @@ static void update_clock_cb(lv_timer_t *timer)
 /* Alternate mock connectivity so both status states can be inspected without hardware. */
 static watch_ui_wifi_state_t mock_wifi = WATCH_UI_WIFI_CONNECTED;
 static unsigned mock_connect_ticks = 0;
+static watch_ui_bluetooth_state_t mock_bluetooth = WATCH_UI_BLUETOOTH_ADVERTISING;
+static bool mock_bluetooth_control(bool enabled)
+{
+    mock_bluetooth = enabled ? WATCH_UI_BLUETOOTH_ADVERTISING : WATCH_UI_BLUETOOTH_DISABLED;
+    return true;
+}
 
 static bool mock_wifi_control(bool enabled)
 {
     mock_wifi = enabled ? WATCH_UI_WIFI_CONNECTING : WATCH_UI_WIFI_DISCONNECTED;
     mock_connect_ticks = 0;
     watch_ui_set_wifi_state(mock_wifi, 0);
+    watch_ui_set_wifi_name("");
     return true;
 }
 
@@ -118,6 +125,8 @@ static void update_mock_wifi_cb(lv_timer_t *timer)
     (void)timer;
     if (mock_wifi == WATCH_UI_WIFI_CONNECTING && ++mock_connect_ticks >= 3) mock_wifi = WATCH_UI_WIFI_CONNECTED;
     watch_ui_set_wifi_state(mock_wifi, mock_wifi == WATCH_UI_WIFI_CONNECTED ? -65 : 0);
+    watch_ui_set_wifi_name(mock_wifi == WATCH_UI_WIFI_CONNECTED ? "Simulator Wi-Fi" : "");
+    watch_ui_set_bluetooth_state(mock_bluetooth);
 }
 
 int main(int argc, char **argv)
@@ -145,6 +154,9 @@ int main(int argc, char **argv)
   update_clock_cb(NULL);
   lv_timer_create(update_clock_cb, 1000, NULL);
   watch_ui_set_wifi_control_callback(mock_wifi_control);
+  watch_ui_set_wifi_name("Simulator Wi-Fi");
+  watch_ui_set_bluetooth_control_callback(mock_bluetooth_control);
+  watch_ui_set_bluetooth_state(WATCH_UI_BLUETOOTH_ADVERTISING);
   watch_ui_set_wifi_state(WATCH_UI_WIFI_CONNECTED, -65);
   lv_timer_create(update_mock_wifi_cb, 1000, NULL);
   watch_ui_set_weather(true, 24, WATCH_UI_WEATHER_SUNNY);

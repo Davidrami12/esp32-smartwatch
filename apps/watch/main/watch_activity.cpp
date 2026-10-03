@@ -1,5 +1,6 @@
 #include "watch_activity.h"
 #include "watch_steps.h"
+#include "watch_ble.h"
 
 #include <string.h>
 #include <time.h>
@@ -159,6 +160,7 @@ void reconcile()
     if (steps != observed_steps) { observed_steps = steps; dirty = true; }
     set_record(current_day, steps);
     xSemaphoreGive(lock);
+    watch_ble_update_steps(steps);
 }
 
 void save_if_due()

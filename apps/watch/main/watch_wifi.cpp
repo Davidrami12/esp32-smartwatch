@@ -1,4 +1,5 @@
 #include "watch_wifi.h"
+#include "watch_ble.h"
 
 #include <atomic>
 #include <stdio.h>
@@ -22,7 +23,7 @@ enum class Event { Start, Lost, GotIp, Enable, Disable };
 QueueHandle_t queue = nullptr;
 std::atomic<watch_wifi_state_t> state{watch_wifi_state_t::Disconnected};
 std::atomic<bool> request_pending{false};
-bool enabled = true; // Worker-owned user intent, independent of radio state.
+std::atomic<bool> enabled{true}; // Serialized writes by worker; safe snapshot for BLE init.
 nvs_handle_t handle = 0;
 bool storage_ready = false;
 
@@ -32,6 +33,8 @@ void set_state(watch_wifi_state_t next)
         ESP_LOGI(kTag, "State: %s", next == watch_wifi_state_t::Connected ? "CONNECTED" :
                  next == watch_wifi_state_t::Connecting ? "CONNECTING" : "DISCONNECTED");
     }
+    watch_ble_update_wifi(!enabled.load() ? 3 : next == watch_wifi_state_t::Connected ? 2 :
+                          next == watch_wifi_state_t::Connecting ? 1 : 0);
 }
 
 void event_handler(void *, esp_event_base_t base, int32_t id, void *)
@@ -78,6 +81,7 @@ void worker(void *)
                     break;
                 case Event::Enable:
                     enabled = true;
+                    set_state(watch_wifi_state_t::Connecting);
                     attempts = 0;
                     retry_at = esp_timer_get_time();
                     persist_intent();
@@ -175,3 +179,5 @@ int watch_wifi_get_rssi(void)
     wifi_ap_record_t info = {};
     return state.load() == watch_wifi_state_t::Connected && esp_wifi_sta_get_ap_info(&info) == ESP_OK ? info.rssi : 0;
 }
+
+bool watch_wifi_is_enabled(void) { return enabled.load(); }
