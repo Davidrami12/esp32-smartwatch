@@ -84,6 +84,7 @@ static tm *fake_localtime(const time_t *in,tm *out) {
 #undef time
 #undef localtime_r
 static uint32_t live;
+void watch_ble_update_steps(uint32_t) {}
 uint32_t watch_steps_get_count() { return live; }
 void watch_steps_add_count(uint32_t n) { live += n; }
 uint32_t watch_steps_exchange_count(uint32_t n) { auto old=live; live=n; return old; }

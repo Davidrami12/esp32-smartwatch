@@ -7,6 +7,7 @@
 #include "watch_activity.h"
 #include "watch_wifi.h"
 #include "watch_weather.h"
+#include "watch_ble.h"
 #include <stdio.h>
 #include <time.h>
 #include <stdlib.h>
@@ -188,6 +189,11 @@ static bool ui_wifi_request(bool enabled)
     return watch_wifi_request_enabled(enabled);
 }
 
+static bool ui_bluetooth_request(bool enabled)
+{
+    return watch_ble_set_enabled(enabled);
+}
+
 static void update_wifi_status_cb(
     lv_timer_t *timer
 )
@@ -199,9 +205,13 @@ static void update_wifi_status_cb(
     }
 
     const auto state = watch_wifi_get_state();
+    const auto ble_state = watch_ble_get_state();
+    watch_ui_set_bluetooth_state(ble_state == watch_ble_state_t::Connected ? WATCH_UI_BLUETOOTH_CONNECTED :
+        ble_state == watch_ble_state_t::Advertising ? WATCH_UI_BLUETOOTH_ADVERTISING : WATCH_UI_BLUETOOTH_DISABLED);
     watch_ui_set_wifi_state(state == watch_wifi_state_t::Connected ? WATCH_UI_WIFI_CONNECTED :
         state == watch_wifi_state_t::Connecting ? WATCH_UI_WIFI_CONNECTING : WATCH_UI_WIFI_DISCONNECTED,
         watch_wifi_get_rssi());
+    watch_ui_set_wifi_name(state == watch_wifi_state_t::Connected ? WIFI_SSID : "");
     const auto weather = watch_weather_get();
     watch_ui_set_weather(weather.available, weather.temperature_c,
                          static_cast<watch_ui_weather_condition_t>(weather.condition));
@@ -325,12 +335,15 @@ static void update_battery_cb(
 {
     (void)timer;
 
-    if (!watch_power_is_active()) {
-        return;
-    }
-
+    // Reuse the existing PMIC acquisition; only sample in IDLE for a connected BLE peer.
+    static uint32_t last_battery_sample = 0;
+    const bool active = watch_power_is_active();
+    if (!active && (watch_ble_get_state() != watch_ble_state_t::Connected ||
+                   lv_tick_elaps(last_battery_sample) < 30000)) return;
+    last_battery_sample = lv_tick_get();
     if (!PMU.isBatteryConnect()) {
-        watch_ui_set_battery(
+        watch_ble_update_battery(-1);
+        if (active) watch_ui_set_battery(
             -1,
             false
         );
@@ -347,6 +360,8 @@ static void update_battery_cb(
     bool charging =
         PMU.isCharging();
 
+    watch_ble_update_battery(battery_percent);
+    if (!active) return;
     watch_ui_set_battery(
         battery_percent,
         charging
@@ -608,6 +623,7 @@ extern "C" void app_main(void)
 
     watch_ui_create();
     watch_ui_set_wifi_control_callback(ui_wifi_request);
+    watch_ui_set_bluetooth_control_callback(ui_bluetooth_request);
 
     watch_ui_set_brightness_callback(
         ui_brightness_changed
@@ -674,5 +690,11 @@ extern "C" void app_main(void)
 
     ESP_ERROR_CHECK(watch_wifi_init());
     ESP_ERROR_CHECK(watch_weather_init());
+    watch_ble_update_steps(watch_steps_get_count());
+    const auto wifi_state = watch_wifi_get_state();
+    watch_ble_update_wifi(!watch_wifi_is_enabled() ? 3 : wifi_state == watch_wifi_state_t::Connected ? 2 :
+                          wifi_state == watch_wifi_state_t::Connecting ? 1 : 0);
+    const esp_err_t ble_error = watch_ble_init();
+    if (ble_error != ESP_OK) ESP_LOGW("watch_ble", "BLE unavailable: %s", esp_err_to_name(ble_error));
     xTaskCreate(start_sntp_when_wifi_connected, "sntp_start", 4096, NULL, 5, NULL);
 }

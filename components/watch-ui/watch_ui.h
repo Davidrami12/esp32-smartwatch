@@ -40,6 +40,13 @@ typedef enum {
 typedef bool (*watch_ui_wifi_control_cb_t)(bool enabled);
 void watch_ui_set_wifi_state(watch_ui_wifi_state_t state, int rssi);
 void watch_ui_set_wifi_control_callback(watch_ui_wifi_control_cb_t callback);
+typedef enum {
+    WATCH_UI_BLUETOOTH_DISABLED, WATCH_UI_BLUETOOTH_ADVERTISING, WATCH_UI_BLUETOOTH_CONNECTED
+} watch_ui_bluetooth_state_t;
+void watch_ui_set_bluetooth_state(watch_ui_bluetooth_state_t state);
+void watch_ui_set_wifi_name(const char *name);
+typedef bool (*watch_ui_bluetooth_control_cb_t)(bool enabled);
+void watch_ui_set_bluetooth_control_callback(watch_ui_bluetooth_control_cb_t callback);
 
 typedef enum {
     WATCH_UI_WEATHER_SUNNY, WATCH_UI_WEATHER_CLOUDY, WATCH_UI_WEATHER_RAIN,
