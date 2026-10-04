@@ -2,6 +2,7 @@
 #include "../components/watch-ui/watch_ui.cpp"
 #include <assert.h>
 #include <initializer_list>
+#include "../apps/watch/main/watch_ble_control_protocol.h"
 
 static unsigned brightness_calls, commit_calls;
 static uint8_t committed;
@@ -28,6 +29,30 @@ int main()
     lv_init();
     lv_display_create(410, 502);
     watch_ui_create();
+    uint32_t decoded = 0;
+    uint8_t bytes[4] = {};
+    for (unsigned i = 0; i <= 255; ++i) {
+        bytes[0] = i;
+        assert(watch_ble_decode_control(watch_ble_control_t::Brightness, bytes, 1, decoded) == (i >= 10 && i <= 100));
+        assert(watch_ble_decode_control(watch_ble_control_t::WifiEnabled, bytes, 1, decoded) == (i <= 1));
+    }
+    for (uint32_t value : {0u, 5000u, 10000u, 30000u, 60000u, 1u, 9999u, UINT32_MAX}) {
+        for (unsigned i = 0; i < 4; ++i) bytes[i] = value >> (8 * i);
+        const bool valid = value == 0 || value == 5000 || value == 10000 || value == 30000 || value == 60000;
+        assert(watch_ble_decode_control(watch_ble_control_t::ScreenTimeout, bytes, 4, decoded) == valid);
+        assert(decoded == value);
+    }
+    for (auto control : {watch_ble_control_t::Brightness, watch_ble_control_t::ScreenTimeout, watch_ble_control_t::WifiEnabled}) {
+        for (size_t length : {0u, 2u, 3u, 5u}) assert(!watch_ble_decode_control(control, bytes, length, decoded));
+        assert(!watch_ble_decode_control(control, nullptr, watch_ble_control_length(control), decoded));
+    }
+    watch_ui_set_bluetooth_state(WATCH_UI_BLUETOOTH_CONNECTED);
+    assert(strcmp(lv_label_get_text(bluetooth_status_label), LV_SYMBOL_BLUETOOTH " ON") == 0);
+    assert(strcmp(lv_label_get_text(bluetooth_detail_label), "CONNECTED") == 0);
+    watch_ui_set_bluetooth_state(WATCH_UI_BLUETOOTH_ADVERTISING);
+    assert(strcmp(lv_label_get_text(bluetooth_status_label), LV_SYMBOL_BLUETOOTH " READY") == 0);
+    watch_ui_set_bluetooth_state(WATCH_UI_BLUETOOTH_DISABLED);
+    assert(strcmp(lv_label_get_text(bluetooth_status_label), LV_SYMBOL_BLUETOOTH " OFF") == 0);
     assert(navigation_animation(WatchScreen::Home, WatchScreen::Settings) == LV_SCR_LOAD_ANIM_MOVE_RIGHT);
     assert(navigation_animation(WatchScreen::Settings, WatchScreen::Home) == LV_SCR_LOAD_ANIM_MOVE_LEFT);
     assert(navigation_animation(WatchScreen::Home, WatchScreen::Launcher) == LV_SCR_LOAD_ANIM_MOVE_LEFT);

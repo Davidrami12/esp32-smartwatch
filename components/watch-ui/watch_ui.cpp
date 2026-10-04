@@ -998,7 +998,7 @@ void watch_ui_set_bluetooth_state(watch_ui_bluetooth_state_t state)
     const uint32_t color = state == WATCH_UI_BLUETOOTH_DISABLED ? kMuted : design::Bluetooth;
     if (bluetooth_status_label) {
         lv_label_set_text_fmt(bluetooth_status_label, LV_SYMBOL_BLUETOOTH " %s",
-                              state == WATCH_UI_BLUETOOTH_DISABLED ? "OFF" : state == WATCH_UI_BLUETOOTH_CONNECTED ? "LINK" : "READY");
+                              state == WATCH_UI_BLUETOOTH_DISABLED ? "OFF" : state == WATCH_UI_BLUETOOTH_CONNECTED ? "ON" : "READY");
         lv_obj_set_style_text_color(bluetooth_status_label, lv_color_hex(color), 0);
     }
     if (launcher_bluetooth_label) {

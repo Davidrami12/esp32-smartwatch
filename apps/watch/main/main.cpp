@@ -530,6 +530,7 @@ static void ui_timeout_changed(
         ESP_LOGW("watch_settings", "Timeout persistence failed: %s",
                  esp_err_to_name(error));
     }
+    watch_ble_update_settings(current_brightness, display_timeout_ms);
 }
 
 static void update_steps_cb(lv_timer_t *timer)
@@ -553,13 +554,49 @@ static void ui_brightness_committed(uint8_t brightness)
     esp_err_t error = watch_settings_save_brightness(brightness);
     if (error != ESP_OK) {
         ESP_LOGW("watch_settings", "Brightness persistence failed: %s",
-                 esp_err_to_name(error));
+                  esp_err_to_name(error));
     }
+    watch_ble_update_settings(current_brightness, display_timeout_ms);
 }
 
 static bool ui_step_goal_changed(uint32_t goal)
 {
     return watch_settings_save_step_goal(goal) == ESP_OK;
+}
+
+static esp_err_t ble_apply_control(watch_ble_control_t control, uint32_t value)
+{
+    // Serializes NVS/runtime settings with local UI callbacks. Never call LVGL
+    // from the host without this lock; remote changes do not wake the display.
+    if (!bsp_display_lock(500)) return ESP_ERR_TIMEOUT;
+    esp_err_t result = ESP_OK;
+    switch (control) {
+        case watch_ble_control_t::Brightness:
+            result = watch_settings_save_brightness(static_cast<uint8_t>(value));
+            if (result == ESP_OK) {
+                ui_brightness_changed(static_cast<uint8_t>(value));
+                watch_ui_set_settings(current_brightness, display_timeout_ms);
+                watch_ble_update_settings(current_brightness, display_timeout_ms);
+            }
+            break;
+        case watch_ble_control_t::ScreenTimeout:
+            result = watch_settings_save_screen_timeout(value);
+            if (result == ESP_OK) {
+                // Existing callback now sees an unchanged persisted value, so no second commit.
+                ui_timeout_changed(value);
+                watch_ui_set_settings(current_brightness, display_timeout_ms);
+            }
+            break;
+        case watch_ble_control_t::WifiEnabled:
+            result = watch_wifi_request_enabled_confirmed(value != 0);
+            // Refresh even on failure/timeout: display actual worker intent/state.
+            watch_ble_update_wifi(!watch_wifi_is_enabled() ? 3 : watch_wifi_get_state() == watch_wifi_state_t::Connected ? 2 :
+                                  watch_wifi_get_state() == watch_wifi_state_t::Connecting ? 1 : 0);
+            update_wifi_status_cb(nullptr);
+            break;
+    }
+    bsp_display_unlock();
+    return result;
 }
 
 
@@ -729,6 +766,8 @@ extern "C" void app_main(void)
     const auto wifi_state = watch_wifi_get_state();
     watch_ble_update_wifi(!watch_wifi_is_enabled() ? 3 : wifi_state == watch_wifi_state_t::Connected ? 2 :
                           wifi_state == watch_wifi_state_t::Connecting ? 1 : 0);
+    watch_ble_update_settings(current_brightness, display_timeout_ms);
+    watch_ble_set_control_callback(ble_apply_control);
     const esp_err_t ble_error = watch_ble_init();
     if (ble_error != ESP_OK) ESP_LOGW("watch_ble", "BLE unavailable: %s", esp_err_to_name(ble_error));
     xTaskCreate(start_sntp_when_wifi_connected, "sntp_start", 4096, NULL, 5, NULL);
