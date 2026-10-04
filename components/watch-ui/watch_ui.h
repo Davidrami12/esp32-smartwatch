@@ -25,6 +25,8 @@ void watch_ui_set_brightness_committed_callback(
 );
 
 void watch_ui_create(void);
+// Firmware supplies display activity; time tools continue without IDLE redraws.
+void watch_ui_set_display_active(bool active);
 void watch_ui_set_settings(
     uint8_t brightness,
     uint32_t timeout_ms
@@ -33,6 +35,10 @@ void watch_ui_set_settings(
 void watch_ui_set_time(const char *time);
 void watch_ui_set_date(const char *date);
 void watch_ui_set_steps(uint32_t steps);
+// Daily goal: 1,000-30,000 in increments of 1,000. Callback rejects failed saves.
+typedef bool (*watch_ui_step_goal_cb_t)(uint32_t goal);
+void watch_ui_set_step_goal(uint32_t goal);
+void watch_ui_set_step_goal_callback(watch_ui_step_goal_cb_t callback);
 
 typedef enum {
     WATCH_UI_WIFI_DISCONNECTED, WATCH_UI_WIFI_CONNECTING, WATCH_UI_WIFI_CONNECTED
@@ -53,6 +59,15 @@ typedef enum {
     WATCH_UI_WEATHER_THUNDERSTORM, WATCH_UI_WEATHER_WINDY
 } watch_ui_weather_condition_t;
 void watch_ui_set_weather(bool available, float temperature_c, watch_ui_weather_condition_t condition);
+typedef struct {
+    bool available;
+    uint32_t date; // Local YYYYMMDD; supplied by platform.
+    uint8_t weekday; // Sunday = 0.
+    float low_c, high_c;
+    watch_ui_weather_condition_t condition;
+} watch_ui_forecast_day_t;
+// Seven local-calendar slots including today. NULL means no data.
+void watch_ui_set_forecast(const watch_ui_forecast_day_t days[7], bool online, uint32_t age_minutes);
 typedef struct { uint32_t steps; uint8_t weekday; } watch_ui_activity_day_t;
 // Seven newest-first calendar rows supplied by firmware; NULL means date unavailable.
 void watch_ui_set_history(const watch_ui_activity_day_t days[7]);

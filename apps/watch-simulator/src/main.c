@@ -104,6 +104,7 @@ static void update_clock_cb(lv_timer_t *timer)
 /* Alternate mock connectivity so both status states can be inspected without hardware. */
 static watch_ui_wifi_state_t mock_wifi = WATCH_UI_WIFI_CONNECTED;
 static unsigned mock_connect_ticks = 0;
+static watch_ui_forecast_day_t mock_forecast[7];
 static watch_ui_bluetooth_state_t mock_bluetooth = WATCH_UI_BLUETOOTH_ADVERTISING;
 static bool mock_bluetooth_control(bool enabled)
 {
@@ -125,6 +126,7 @@ static void update_mock_wifi_cb(lv_timer_t *timer)
     (void)timer;
     if (mock_wifi == WATCH_UI_WIFI_CONNECTING && ++mock_connect_ticks >= 3) mock_wifi = WATCH_UI_WIFI_CONNECTED;
     watch_ui_set_wifi_state(mock_wifi, mock_wifi == WATCH_UI_WIFI_CONNECTED ? -65 : 0);
+    watch_ui_set_forecast(mock_forecast, mock_wifi == WATCH_UI_WIFI_CONNECTED, 12);
     watch_ui_set_wifi_name(mock_wifi == WATCH_UI_WIFI_CONNECTED ? "Simulator Wi-Fi" : "");
     watch_ui_set_bluetooth_state(mock_bluetooth);
 }
@@ -161,7 +163,29 @@ int main(int argc, char **argv)
   lv_timer_create(update_mock_wifi_cb, 1000, NULL);
   watch_ui_set_weather(true, 24, WATCH_UI_WEATHER_SUNNY);
   {
-    const uint32_t counts[7] = {1234, 8140, 0, 7283, 4612, 0, 9050};
+    time_t now = time(NULL);
+    struct tm day;
+#ifdef _MSC_VER
+    localtime_s(&day, &now);
+#else
+    localtime_r(&now, &day);
+#endif
+    day.tm_hour = 12; day.tm_min = day.tm_sec = 0;
+    for (unsigned i = 0; i < 7; ++i) {
+      day.tm_isdst = -1;
+      mktime(&day);
+      mock_forecast[i].available = true;
+      mock_forecast[i].date = (day.tm_year + 1900) * 10000 + (day.tm_mon + 1) * 100 + day.tm_mday;
+      mock_forecast[i].weekday = (uint8_t)day.tm_wday;
+      mock_forecast[i].low_c = 12 + i;
+      mock_forecast[i].high_c = 24 - i;
+      mock_forecast[i].condition = (watch_ui_weather_condition_t)(i % 5);
+      ++day.tm_mday;
+    }
+    watch_ui_set_forecast(mock_forecast, true, 12);
+  }
+  {
+    const uint32_t counts[7] = {5421, 8140, 0, 7283, 4612, 0, 9050};
     watch_ui_activity_day_t days[7];
     time_t now = time(NULL);
     struct tm local;
@@ -180,8 +204,8 @@ int main(int argc, char **argv)
     }
     watch_ui_set_history(days);
   }
-  watch_ui_set_battery(100, false);
-  watch_ui_set_steps(1234); /* Shared Home and Activity daily-count mock. */
+  watch_ui_set_battery(82, false);
+  watch_ui_set_steps(5421); /* Shared Home and Activity daily-count mock. */
 
   while(1) {
     /* Periodically call the lv_task handler.

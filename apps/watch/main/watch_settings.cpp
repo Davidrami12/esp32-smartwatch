@@ -12,11 +12,14 @@ constexpr char kBrightnessKey[] = "brightness";
 constexpr char kScreenTimeoutKey[] = "screen_timeout";
 constexpr uint8_t kDefaultBrightness = 60;
 constexpr uint32_t kDefaultScreenTimeoutMs = 10000;
+constexpr uint32_t kDefaultStepGoal = 8000;
+constexpr char kStepGoalKey[] = "step_goal";
 
 nvs_handle_t settings_handle = 0;
 watch_settings_t current_settings = {
     kDefaultBrightness,
-    kDefaultScreenTimeoutMs
+    kDefaultScreenTimeoutMs,
+    kDefaultStepGoal
 };
 bool settings_open = false;
 const char *TAG = "watch_settings";
@@ -45,7 +48,7 @@ void watch_settings_load(watch_settings_t *settings)
         return;
     }
 
-    current_settings = {kDefaultBrightness, kDefaultScreenTimeoutMs};
+    current_settings = {kDefaultBrightness, kDefaultScreenTimeoutMs, kDefaultStepGoal};
 
     esp_err_t error = nvs_open(kNamespace, NVS_READWRITE, &settings_handle);
     if (error != ESP_OK) {
@@ -80,9 +83,16 @@ void watch_settings_load(watch_settings_t *settings)
         log_read_error(kScreenTimeoutKey, error);
     }
 
+    uint32_t goal = 0;
+    error = nvs_get_u32(settings_handle, kStepGoalKey, &goal);
+    if (error == ESP_OK) {
+        if (goal >= 1000 && goal <= 30000 && goal % 1000 == 0) current_settings.step_goal = goal;
+        else ESP_LOGW(TAG, "Ignoring invalid step goal: %" PRIu32, goal);
+    } else log_read_error(kStepGoalKey, error);
+
     *settings = current_settings;
-    ESP_LOGI(TAG, "Loaded brightness=%u timeout_ms=%" PRIu32,
-             current_settings.brightness, current_settings.screen_timeout_ms);
+    ESP_LOGI(TAG, "Loaded brightness=%u timeout_ms=%" PRIu32 " step_goal=%" PRIu32,
+             current_settings.brightness, current_settings.screen_timeout_ms, current_settings.step_goal);
 }
 
 esp_err_t watch_settings_save_brightness(uint8_t brightness)
@@ -107,6 +117,20 @@ esp_err_t watch_settings_save_brightness(uint8_t brightness)
     } else {
         ESP_LOGE(TAG, "Could not save brightness: %s", esp_err_to_name(error));
     }
+    return error;
+}
+
+esp_err_t watch_settings_save_step_goal(uint32_t goal)
+{
+    if (goal < 1000 || goal > 30000 || goal % 1000) return ESP_ERR_INVALID_ARG;
+    if (goal == current_settings.step_goal) return ESP_OK;
+    if (!settings_open) return ESP_ERR_INVALID_STATE;
+    esp_err_t error = nvs_set_u32(settings_handle, kStepGoalKey, goal);
+    if (error == ESP_OK) error = nvs_commit(settings_handle);
+    if (error == ESP_OK) {
+        current_settings.step_goal = goal;
+        ESP_LOGI(TAG, "Saved step goal=%" PRIu32, goal);
+    } else ESP_LOGE(TAG, "Could not save step goal: %s", esp_err_to_name(error));
     return error;
 }
 

@@ -7,6 +7,7 @@
 #include "watch_activity.h"
 #include "watch_wifi.h"
 #include "watch_weather.h"
+#include "esp_timer.h"
 #include "watch_ble.h"
 #include <stdio.h>
 #include <time.h>
@@ -44,7 +45,7 @@ static constexpr time_t MIN_VALID_EPOCH = 946684800; // 2000-01-01 UTC
 static uint32_t last_activity;
 static uint32_t last_tap = 0;
 
-static watch_settings_t user_settings = {60, 10000};
+static watch_settings_t user_settings = {60, 10000, 8000};
 static uint8_t current_brightness = 60;
 static uint32_t display_timeout_ms = 10000;
 
@@ -213,6 +214,30 @@ static void update_wifi_status_cb(
         watch_wifi_get_rssi());
     watch_ui_set_wifi_name(state == watch_wifi_state_t::Connected ? WIFI_SSID : "");
     const auto weather = watch_weather_get();
+    const auto forecast = watch_weather_forecast_get();
+    watch_ui_forecast_day_t forecast_rows[7] = {};
+    const time_t forecast_now = time(nullptr);
+    if (forecast_now >= 1577836800) {
+        struct tm day = {};
+        localtime_r(&forecast_now, &day);
+        day.tm_hour = 12; day.tm_min = day.tm_sec = 0;
+        for (unsigned i = 0; i < 7; ++i) {
+            day.tm_isdst = -1;
+            mktime(&day);
+            const uint32_t key = (day.tm_year + 1900) * 10000 + (day.tm_mon + 1) * 100 + day.tm_mday;
+            forecast_rows[i].date = key;
+            forecast_rows[i].weekday = day.tm_wday;
+            for (const auto &source : forecast.days) if (forecast.available && source.date == key) {
+                forecast_rows[i].available = true;
+                forecast_rows[i].low_c = source.low_c; forecast_rows[i].high_c = source.high_c;
+                forecast_rows[i].condition = static_cast<watch_ui_weather_condition_t>(source.condition);
+            }
+            ++day.tm_mday;
+        }
+    }
+    const uint32_t forecast_age = forecast.available ? static_cast<uint32_t>(
+        (esp_timer_get_time() - forecast.fetched_monotonic_us) / 60000000) : 0;
+    watch_ui_set_forecast(forecast_rows, state == watch_wifi_state_t::Connected, forecast_age);
     watch_ui_set_weather(weather.available, weather.temperature_c,
                          static_cast<watch_ui_weather_condition_t>(weather.condition));
 }
@@ -408,6 +433,7 @@ static void touch_event_cb(
         lv_tick_elaps(last_tap) <= DOUBLE_TAP_MS
     ) {
         watch_power_set_active(true, current_brightness);
+        watch_ui_set_display_active(true);
         last_activity = now;
         last_tap = 0;
 
@@ -456,6 +482,7 @@ static void display_timeout_cb(
 )
 {
     (void)timer;
+    watch_ui_set_display_active(watch_power_is_active());
 
     if (display_timeout_ms == 0) {
         return;
@@ -468,6 +495,7 @@ static void display_timeout_cb(
         ) >= display_timeout_ms
     ) {
         watch_power_set_active(false, current_brightness);
+        watch_ui_set_display_active(false);
         last_tap = 0;
     }
 }
@@ -527,6 +555,11 @@ static void ui_brightness_committed(uint8_t brightness)
         ESP_LOGW("watch_settings", "Brightness persistence failed: %s",
                  esp_err_to_name(error));
     }
+}
+
+static bool ui_step_goal_changed(uint32_t goal)
+{
+    return watch_settings_save_step_goal(goal) == ESP_OK;
 }
 
 
@@ -643,6 +676,8 @@ extern "C" void app_main(void)
     );
 
     /* Initial UI state */
+    watch_ui_set_step_goal(user_settings.step_goal);
+    watch_ui_set_step_goal_callback(ui_step_goal_changed);
 
     update_clock_cb(NULL);
     update_steps_cb(NULL);
