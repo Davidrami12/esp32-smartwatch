@@ -77,6 +77,11 @@ set(
 )
 set(MAIN_LIBS lvgl lvgl::examples lvgl::demos lvgl::thorvg ${SDL2_LIBRARIES})
 
+# Explicitly built headless integration tests; not part of normal firmware/simulator startup.
+add_executable(watch_ui_tools_tests EXCLUDE_FROM_ALL ../../tests/time_tools_ui_host.cpp)
+target_include_directories(watch_ui_tools_tests PRIVATE ../../components/watch-ui)
+target_link_libraries(watch_ui_tools_tests PRIVATE ${MAIN_LIBS})
+
 # Create the main executable, depending on the FreeRTOS option
 if(USE_FREERTOS)
     list(APPEND MAIN_SOURCES src/freertos_main.c src/freertos/freertos_posix_port.c ${FREERTOS_SOURCES})

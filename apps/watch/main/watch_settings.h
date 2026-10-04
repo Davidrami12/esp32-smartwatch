@@ -6,8 +6,10 @@
 typedef struct {
     uint8_t brightness;
     uint32_t screen_timeout_ms;
+    uint32_t step_goal;
 } watch_settings_t;
 
 void watch_settings_load(watch_settings_t *settings);
 esp_err_t watch_settings_save_brightness(uint8_t brightness);
 esp_err_t watch_settings_save_screen_timeout(uint32_t timeout_ms);
+esp_err_t watch_settings_save_step_goal(uint32_t goal);
