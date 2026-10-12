@@ -49,6 +49,22 @@ and on explicit Sync now, always through the serialized GATT queue. Read failure
 disable that snapshot only; they do not weaken BLE security or disconnect unrelated
 media/notification features. No synthetic data is substituted.
 
+## Read-only daily step goal (`000e`)
+
+Optional `7e57000e-8e7a-4b6d-9f2a-6c4d3e2f1000`: exactly four little-endian
+uint32 bytes, persistent daily goal (1,000–30,000, multiples of 1,000). Same SC/
+MITM/trusted-phone encryption and 16-byte minimum key requirement as activity.
+No writes, notifications or CCCD. Firmware publishes the loaded goal at boot and
+updates it only after a watch-side goal change successfully persists. No Android
+default goal or editing is introduced. Missing/failed reads display goal unavailable
+(or explicitly dated cached goal), never an invented independent goal.
+
+Android reads it immediately after `000d` in the serialized GATT queue, including
+manual dashboard refresh and the existing once/minute activity refresh. All prior
+UUIDs, activity payloads and protocol version 1 remain unchanged; older firmware is
+usable without goal progress. The dashboard's missing-day zeros are presentation
+only and never passed to Health Connect as recorded dates.
+
 ## Native Android media extension
 
 Optional UUIDs `000a`/`000b` extend v1 without changing existing UUIDs/payloads.

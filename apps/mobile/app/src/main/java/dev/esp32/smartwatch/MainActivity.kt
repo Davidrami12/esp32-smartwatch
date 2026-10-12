@@ -37,6 +37,9 @@ import androidx.health.connect.client.PermissionController
 import dev.esp32.smartwatch.health.HealthConnectRepository
 import dev.esp32.smartwatch.health.HealthConnectState
 import dev.esp32.smartwatch.health.HealthPrivacyActivity
+import dev.esp32.smartwatch.activity.ActivityDashboardScreen
+import androidx.activity.compose.BackHandler
+import androidx.compose.runtime.saveable.rememberSaveable
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -51,6 +54,9 @@ class MainActivity : ComponentActivity() {
                 val model: WatchViewModel = viewModel()
                 val state by model.state.collectAsStateWithLifecycle()
                 val health by model.healthState.collectAsStateWithLifecycle()
+                val activity by model.activityState.collectAsStateWithLifecycle()
+                var showActivity by rememberSaveable { mutableStateOf(false) }
+                BackHandler(enabled = showActivity) { showActivity = false }
                 val healthPermissions = rememberLauncherForActivityResult(PermissionController.createRequestPermissionResultContract()) {
                     model.healthPermissionResult(it.containsAll(HealthConnectRepository.PERMISSIONS))
                 }
@@ -84,7 +90,10 @@ class MainActivity : ComponentActivity() {
                     if (model.hasPermissions()) model.scan()
                     else permissions.launch(arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT))
                 }
-                SmartwatchScreen(state, permitted, requestScan, model::stopScan, model::connect, model::disconnect,
+                if (showActivity) ActivityDashboardScreen(activity,
+                    state.secureLink && state.connectionState == ConnectionState.CONNECTED && state.activityAvailable,
+                    { showActivity = false }, model::refreshActivity)
+                else SmartwatchScreen(state, permitted, requestScan, model::stopScan, model::connect, model::disconnect,
                     model::setBrightness, model::setScreenTimeout, model::setWifiEnabled,
                     model::resumeCompanion, notificationAllowed,
                     { notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS) },
@@ -92,7 +101,8 @@ class MainActivity : ComponentActivity() {
                     { healthPermissions.launch(HealthConnectRepository.PERMISSIONS) }, model::syncHealthNow,
                     model::setHealthAutomatic,
                     { startActivity(Intent(this, HealthPrivacyActivity::class.java)) },
-                    { runCatching { startActivity(Intent(HealthConnectClient.ACTION_HEALTH_CONNECT_SETTINGS)) } }) {
+                    { runCatching { startActivity(Intent(HealthConnectClient.ACTION_HEALTH_CONNECT_SETTINGS)) } },
+                    { showActivity = true; model.refreshActivity() }) {
                     startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
                 }
             }
@@ -109,6 +119,7 @@ private fun SmartwatchScreen(
     notificationSettings: () -> Unit,
     health: HealthConnectState, healthPermission: () -> Unit, syncHealth: () -> Unit,
     healthAutomatic: (Boolean) -> Unit, healthPrivacy: () -> Unit, healthSettings: () -> Unit,
+    openActivity: () -> Unit,
     appSettings: () -> Unit,
 ) {
     val busy = state.connectionState in listOf(ConnectionState.CONNECTING, ConnectionState.PAIRING, ConnectionState.DISCOVERING_SERVICES, ConnectionState.RECONNECTING)
@@ -116,6 +127,7 @@ private fun SmartwatchScreen(
         LazyColumn(modifier = Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(24.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)) {
             item { Text("Smartwatch", fontSize = 34.sp, fontWeight = FontWeight.Bold) }
+            item { OutlinedButton(onClick = openActivity, modifier = Modifier.fillMaxWidth()) { Text("Activity dashboard") } }
             item { HealthConnectCard(health, state, healthPermission, syncHealth, healthAutomatic, healthPrivacy, healthSettings) }
             item {
                 Text(when (state.connectionState) {

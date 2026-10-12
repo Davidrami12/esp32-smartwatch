@@ -159,6 +159,11 @@ class WatchRepository(context: Context) {
                            devices: List<NearbyWatch> = state.value.devices) = WatchState(connectionState = connection,
         devices = devices, message = message, notificationAccess = state.value.notificationAccess,
         companionEnabled = serviceEnabled, savedWatchAvailable = preferences.contains("watch_address"),
+        pairingState = try { when (lastDevice?.bondState) {
+            BluetoothDevice.BOND_BONDED -> PairingState.BONDED
+            BluetoothDevice.BOND_BONDING -> PairingState.PAIRING
+            else -> PairingState.NOT_BONDED
+        } } catch (_: SecurityException) { PairingState.NOT_BONDED },
         disconnectReason = state.value.disconnectReason)
 
     fun forwardNotification(item: PhoneNotification) { handler.post {
@@ -372,6 +377,9 @@ class WatchRepository(context: Context) {
             val activityAvailable = activity != null && activity.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0
             if (activityAvailable) characteristics[WatchBleProtocol.ACTIVITY] = activity!!
             mutableState.value = state.value.copy(activityAvailable = activityAvailable)
+            val goal = watch?.getCharacteristic(WatchBleProtocol.STEP_GOAL)
+            if (goal != null && goal.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0)
+                characteristics[WatchBleProtocol.STEP_GOAL] = goal
             mediaVolumeSupported = false
             if (supportsMedia && mediaCapabilities != null && mediaCapabilities.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0) {
                 characteristics[mediaCapabilities.uuid] = mediaCapabilities
@@ -423,10 +431,21 @@ class WatchRepository(context: Context) {
                     try {
                         require(status == BluetoothGatt.GATT_SUCCESS)
                         val activity = dev.esp32.smartwatch.activity.WatchActivityProtocol.decode(source.device.address, snapshot)
-                        mutableState.value = state.value.copy(activity = activity, activityError = if (activity.days.isEmpty()) "Watch calendar is not ready." else null)
+                        mutableState.value = state.value.copy(activity = activity, activityUpdatedAt = System.currentTimeMillis(),
+                            activityError = if (activity.days.isEmpty()) "Watch calendar is not ready." else null)
                         activitySnapshotHandler?.invoke()
                     } catch (_: Exception) {
                         mutableState.value = state.value.copy(activity = null, activityError = "Dated watch activity unavailable or malformed ($status).")
+                    }
+                    pending = null; nextOperation(); return@onSession
+                }
+                if (c.uuid == WatchBleProtocol.STEP_GOAL) {
+                    try {
+                        require(status == BluetoothGatt.GATT_SUCCESS)
+                        mutableState.value = state.value.copy(stepGoal = WatchBleProtocol.stepGoal(snapshot),
+                            stepGoalUpdatedAt = System.currentTimeMillis(), stepGoalError = null)
+                    } catch (_: IllegalArgumentException) {
+                        mutableState.value = state.value.copy(stepGoal = null, stepGoalError = "Watch goal read failed; refresh to retry.")
                     }
                     pending = null; nextOperation(); return@onSession
                 }
@@ -537,6 +556,9 @@ class WatchRepository(context: Context) {
     } }
 
     private fun nextOperation() {
+        // CONNECTED StateFlow observers can enqueue/start activity reads synchronously.
+        // A re-entrant pump must not overwrite that pending read or cancel its timer.
+        if (pending != null) return
         clearTimeout()
         val source = gatt ?: return
         if (operations.isEmpty() && state.value.connectionState == ConnectionState.CONNECTED && state.value.secureLink &&
@@ -639,6 +661,8 @@ class WatchRepository(context: Context) {
         if (!state.value.secureLink || state.value.connectionState != ConnectionState.CONNECTED || !state.value.activityAvailable) return@safely
         if (pending?.uuid == WatchBleProtocol.ACTIVITY || operations.any { it.uuid == WatchBleProtocol.ACTIVITY }) return@safely
         operations.add(Operation(WatchBleProtocol.ACTIVITY))
+        if (WatchBleProtocol.STEP_GOAL in characteristics && pending?.uuid != WatchBleProtocol.STEP_GOAL && operations.none { it.uuid == WatchBleProtocol.STEP_GOAL })
+            operations.add(Operation(WatchBleProtocol.STEP_GOAL))
         if (pending == null) nextOperation()
     }
     fun setScreenTimeout(value: Long) = writeControl(WatchBleProtocol.TIMEOUT) { WatchBleProtocol.encodeTimeout(value) }
@@ -657,6 +681,7 @@ class WatchRepository(context: Context) {
     }
 
     private fun unexpectedDisconnect(message: String) {
+        Log.w(TAG, message)
         cancelReconnect(); stopScan(); releaseGatt()
         mutableState.value = freshState(ConnectionState.RECONNECTING, message).copy(disconnectReason = DisconnectReason.UNEXPECTED_DISCONNECT)
         scheduleReconnect()

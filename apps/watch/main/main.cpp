@@ -568,7 +568,9 @@ static void ui_brightness_committed(uint8_t brightness)
 
 static bool ui_step_goal_changed(uint32_t goal)
 {
-    return watch_settings_save_step_goal(goal) == ESP_OK;
+    if (watch_settings_save_step_goal(goal) != ESP_OK) return false;
+    watch_ble_update_step_goal(goal);
+    return true;
 }
 
 static esp_err_t ble_apply_control(watch_ble_control_t control, uint32_t value)
@@ -791,6 +793,7 @@ extern "C" void app_main(void)
 
     /* Initial UI state */
     watch_ui_set_step_goal(user_settings.step_goal);
+    watch_ble_update_step_goal(user_settings.step_goal);
     watch_ui_set_step_goal_callback(ui_step_goal_changed);
 
     update_clock_cb(NULL);

@@ -1,5 +1,16 @@
 # Android companion — secure background BLE, controls, notifications and media
 
+## Activity dashboard (TFM)
+
+Open **Activity dashboard** for today's watch steps, watch-owned goal/progress,
+interactive seven-day Canvas chart and total/average. A private persistent cache
+keeps the latest snapshot offline, clearly marked CACHED/NOT LIVE with update time.
+Dates use watch CET/CEST semantics; missing chart dates display zero but are never
+manufactured into Health Connect records. Optional protected read-only `000e`
+provides the existing persistent goal; older firmware shows unavailable progress.
+No extra permissions or Health Connect readback. Full implementation/validation:
+`../../docs/mobile-activity-dashboard.md`.
+
 ## Health Connect steps (TFM)
 
 Official Health Connect SDK, write-steps-only permission, explicit Sync now and

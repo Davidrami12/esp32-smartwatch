@@ -6,6 +6,8 @@ import androidx.lifecycle.AndroidViewModel
 class WatchViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = (application as SmartwatchApplication).companion
     val state = repository.state
+    val activityState = (application as SmartwatchApplication).activityDashboard.state
+    fun refreshActivity() = (getApplication<Application>() as SmartwatchApplication).companion.repository.requestActivitySnapshot()
     private val health = (application as SmartwatchApplication).health
     val healthState = health.state
     fun refreshHealthPermissions() = health.refreshPermissions()
