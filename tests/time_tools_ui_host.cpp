@@ -3,6 +3,58 @@
 #include <assert.h>
 #include <initializer_list>
 #include "../apps/watch/main/watch_ble_control_protocol.h"
+#include "../apps/watch/main/watch_notification_protocol.h"
+#include "../apps/watch/main/watch_ble_security_policy.h"
+#include "../apps/watch/main/watch_media_protocol.h"
+#include <vector>
+
+static void notification_protocol_tests()
+{
+    WatchNotificationAssembler assembler;
+    watch_notification_t item = {};
+    std::vector<uint8_t> message(16, 0);
+    const char *fields[] = {"demo.app", "Demo", "David", "Hello there"};
+    for (unsigned f = 0; f < 4; ++f) {
+        const size_t size = strlen(fields[f]); message[8 + 2*f] = size;
+        message.insert(message.end(), fields[f], fields[f] + size);
+    }
+    auto frame = [&](size_t offset) {
+        std::vector<uint8_t> result = {1, 1, 7, 0, static_cast<uint8_t>(offset), static_cast<uint8_t>(offset >> 8),
+            static_cast<uint8_t>(message.size()), static_cast<uint8_t>(message.size() >> 8)};
+        const size_t end = offset + 12 < message.size() ? offset + 12 : message.size();
+        result.insert(result.end(), message.begin() + offset, message.begin() + end); return result;
+    };
+    for (size_t offset = 0; offset < message.size(); offset += 12) {
+        const auto bytes = frame(offset);
+        const int result = assembler.accept(bytes.data(), bytes.size(), 100, item);
+        assert(result == (offset + 12 >= message.size() ? 1 : 0));
+    }
+    assert(strcmp(item.app, "Demo") == 0 && strcmp(item.title, "David") == 0 && strcmp(item.body, "Hello there") == 0);
+    auto bytes = frame(0);
+    assert(assembler.accept(bytes.data(), bytes.size(), UINT32_MAX - 1, item) == 0);
+    auto next = frame(12);
+    assert(assembler.accept(next.data(), next.size(), 2, item) == 0); // Tick wrap.
+    assembler.reset();
+    assert(assembler.accept(next.data(), next.size(), 0, item) == -1); // No START.
+    assert(assembler.accept(bytes.data(), bytes.size(), 0, item) == 0);
+    assert(assembler.accept(next.data(), next.size(), 6000, item) == -1); // Timeout.
+    bytes[0] = 9; assert(assembler.accept(bytes.data(), bytes.size(), 0, item) == -1);
+    bytes[0] = 1; bytes[6] = 1; bytes[7] = 3; // Total 769 exceeds cap.
+    assert(assembler.accept(bytes.data(), bytes.size(), 0, item) == -1);
+    assert(assembler.accept(nullptr, 20, 0, item) == -1);
+    for (size_t length : {0u, 8u, 21u, 100u}) assert(assembler.accept(bytes.data(), length, 0, item) == -1);
+    message[8] = 97; // Malformed package size / exact structure.
+    for (size_t offset = 0; offset < message.size(); offset += 12) {
+        const auto part = frame(offset);
+        const int result = assembler.accept(part.data(), part.size(), 0, item);
+        assert(result == (offset + 12 >= message.size() ? -1 : 0));
+    }
+    WatchNotificationQueue queue;
+    for (unsigned i = 0; i < 7; ++i) { item.timestamp_ms = i; queue.push(item); }
+    assert(queue.size() == 5);
+    for (unsigned i = 2; i < 7; ++i) { assert(queue.pop(item)); assert(item.timestamp_ms == i); }
+    assert(!queue.pop(item));
+}
 
 static unsigned brightness_calls, commit_calls;
 static uint8_t committed;
@@ -26,9 +78,115 @@ static lv_obj_t *find_button(lv_obj_t *screen, const char *text)
 
 int main()
 {
+    {
+        WatchMediaAssembler assembler; watch_media_t media;
+        uint8_t frame[] = {1, 2, 1, 0, 0, 0, 12, 0, 1, 1, 7, 0, 99, 0, 0, 0, 0, 0, 0, 0};
+        assert(assembler.accept(frame, sizeof(frame), 0, media) == 1);
+        assert(media.state == 1 && media.actions == 7 && media.session == 99);
+        frame[9] = 0; assert(assembler.accept(frame, sizeof(frame), 0, media) == -1); // unavailable can't carry session/actions.
+        frame[10] = 0; frame[12] = 0;
+        assert(assembler.accept(frame, sizeof(frame), 0, media) == 1);
+        assert(media.state == 0);
+        frame[0] = 2; assert(assembler.accept(frame, sizeof(frame), 0, media) == -1);
+        frame[0] = 1; frame[6] = 253; assert(assembler.accept(frame, sizeof(frame), 0, media) == -1);
+        assert(assembler.accept(nullptr, 20, 0, media) == -1);
+        frame[6] = 12;
+        assert(assembler.accept(frame, 10, 0, media) == 0);
+        frame[4] = 2;
+        assert(assembler.accept(frame, sizeof(frame), 6000, media) == -1); // timeout/out of order.
+        const uint8_t first[] = {1, 2, 2, 0, 0, 0, 23, 0, 1, 2, 2, 0, 99, 0, 0, 0, 5, 0, 6, 0};
+        const uint8_t second[] = {1, 2, 2, 0, 12, 0, 23, 0, 'T', 'r', 'a', 'c', 'k', 'A', 'r', 't', 'i', 's', 't'};
+        assert(assembler.accept(first, sizeof(first), 0, media) == 0);
+        assert(assembler.accept(second, sizeof(second), 1, media) == 1);
+        assert(strcmp(media.title, "Track") == 0 && strcmp(media.artist, "Artist") == 0);
+        uint8_t volume_frame[] = {1, 2, 3, 0, 0, 0, 12, 0, 2, 1, 31, 0, 99, 0, 0, 0, 0, 0, 0, 0};
+        assert(assembler.accept(volume_frame, sizeof(volume_frame), 2, media) == 1);
+        assert(media.actions == 31);
+        volume_frame[8] = 1; // Legacy schema cannot claim volume.
+        assert(assembler.accept(volume_frame, sizeof(volume_frame), 3, media) == -1);
+        volume_frame[8] = 2; volume_frame[10] = 32;
+        assert(assembler.accept(volume_frame, sizeof(volume_frame), 4, media) == -1);
+    }
+    assert(watch_ble_key_is_strong(true, true, true, 16, true));
+    assert(!watch_ble_key_is_strong(false, true, true, 16, true));
+    assert(!watch_ble_key_is_strong(true, false, true, 16, true));
+    assert(!watch_ble_key_is_strong(true, true, false, 16, true));
+    assert(!watch_ble_key_is_strong(true, true, true, 7, true));
+    assert(!watch_ble_key_is_strong(true, true, true, 16, false));
+    assert(watch_ble_can_pair(0, false, false));
+    assert(!watch_ble_can_pair(1, false, false));
+    assert(!watch_ble_can_pair(2, false, false));
+    assert(!watch_ble_can_pair(0, true, false));
+    assert(!watch_ble_can_pair(0, false, true));
+    notification_protocol_tests();
     lv_init();
     lv_display_create(410, 502);
     watch_ui_create();
+    watch_ui_set_media(1, 7, 99, "A readable track", "Artist");
+    static unsigned media_commands = 0;
+    watch_ui_set_media_callback([](uint8_t command, uint32_t token) { assert(command == 2 && token == 99); ++media_commands; return true; });
+    lv_obj_send_event(media_toggle, LV_EVENT_CLICKED, nullptr); assert(media_commands == 1);
+    open_media_cb(nullptr); assert(current_screen == WatchScreen::Media);
+    assert(media_record_spinning && lv_anim_get(media_record, rotate_media_record) != nullptr);
+    watch_ui_set_display_active(false);
+    assert(!media_record_spinning && lv_anim_get(media_record, rotate_media_record) == nullptr);
+    watch_ui_set_display_active(true); assert(media_record_spinning);
+    assert(strcmp(lv_label_get_text(media_title), "A readable track") == 0);
+    assert(strcmp(lv_label_get_text(media_artist), "Artist: Artist") == 0);
+    assert(lv_obj_get_style_text_align(media_title, LV_PART_MAIN) == LV_TEXT_ALIGN_CENTER);
+    lv_obj_update_layout(media_title);
+    assert(lv_obj_get_y(media_artist) == lv_obj_get_y(media_title) + lv_obj_get_height(media_title) + 8);
+    assert(lv_obj_get_style_text_font(media_title, LV_PART_MAIN) == &lv_font_montserrat_30);
+    watch_ui_set_media(1, 7, 99, "A deliberately long song name that spans many lines and must remain safely bounded above the playback controls even with extra descriptive words", "An artist name that is also deliberately long to exercise wrapping");
+    lv_obj_update_layout(media_artist);
+    assert(lv_obj_get_height(media_title) <= 80 && lv_obj_get_height(media_artist) <= 48);
+    assert(lv_obj_get_y(media_artist) + lv_obj_get_height(media_artist) + 8 <= lv_obj_get_y(media_toggle));
+    assert(lv_obj_get_y(media_toggle) + lv_obj_get_height(media_toggle) + 8 <= lv_obj_get_y(media_volume_up));
+    auto *media_back = lv_obj_get_child(screen_for(WatchScreen::Media), 1);
+    assert(lv_obj_get_y(media_volume_up) + lv_obj_get_height(media_volume_up) + 16 <= lv_obj_get_y(media_back));
+    assert(lv_obj_get_y(media_volume_down) + lv_obj_get_height(media_volume_down) + 16 <= lv_obj_get_y(media_back));
+    assert(lv_obj_get_y(media_artist) == lv_obj_get_y(media_title) + lv_obj_get_height(media_title) + 8);
+    watch_ui_set_media(1, 7, 99, "A readable track", "Artist");
+    assert(lv_obj_get_style_radius(media_previous, LV_PART_MAIN) == LV_RADIUS_CIRCLE);
+    assert(lv_obj_has_state(media_volume_up, LV_STATE_DISABLED));
+    watch_ui_set_media(1, 31, 99, "A readable track", "Artist");
+    assert(!lv_obj_has_state(media_volume_up, LV_STATE_DISABLED));
+    assert(!lv_obj_has_state(media_volume_down, LV_STATE_DISABLED));
+    watch_ui_set_media(1, 7, 99, "A readable track", "Artist");
+    assert(strcmp(lv_label_get_text(lv_obj_get_child(media_toggle, 0)), LV_SYMBOL_PAUSE) == 0);
+    assert(!lv_obj_has_state(media_next, LV_STATE_DISABLED));
+    watch_ui_set_media(2, 2, 99, "Track", "Artist");
+    assert(!media_record_spinning && lv_anim_get(media_record, rotate_media_record) == nullptr);
+    assert(strcmp(lv_label_get_text(lv_obj_get_child(media_toggle, 0)), LV_SYMBOL_PLAY) == 0);
+    assert(lv_obj_has_state(media_next, LV_STATE_DISABLED));
+    watch_ui_set_media(0, 0, 0, "", "");
+    assert(!media_record_spinning);
+    assert(lv_obj_has_state(media_toggle, LV_STATE_DISABLED));
+    back_cb(nullptr); assert(current_screen == WatchScreen::Launcher); navigate_to(WatchScreen::Home);
+    static unsigned security_answers = 0;
+    watch_ui_set_security_callbacks([](uint32_t token, bool accept) { assert(token == 77); assert(!accept); ++security_answers; return true; },
+                                    []() { return true; });
+    watch_ui_show_pairing(77, 123);
+    assert(current_screen == WatchScreen::Pairing);
+    assert(strcmp(lv_label_get_text(pairing_code), "000123") == 0);
+    back_cb(nullptr); assert(security_answers == 1); // Back explicitly rejects, never implicitly accepts.
+    watch_ui_hide_pairing(); assert(current_screen == WatchScreen::Home);
+    watch_ui_set_security_status("Trusted phone / bonded", true);
+    assert(!lv_obj_has_state(forget_phone_button, LV_STATE_DISABLED));
+    navigate_to(WatchScreen::ForgetPhone); back_cb(nullptr);
+    assert(current_screen == WatchScreen::Bluetooth);
+    watch_ui_set_security_status("No paired phone", false);
+    assert(lv_obj_has_state(forget_phone_button, LV_STATE_DISABLED));
+    navigate_to(WatchScreen::Home);
+    navigate_to(WatchScreen::Settings);
+    watch_ui_show_notification("Demo", "David", "Hello there");
+    assert(current_screen == WatchScreen::Notification);
+    assert(strcmp(lv_label_get_text(notification_app), "Demo") == 0);
+    assert(strcmp(lv_label_get_text(notification_body), "Hello there") == 0);
+    watch_ui_show_notification("Next", "Title", "Body");
+    back_cb(nullptr);
+    assert(current_screen == WatchScreen::Settings);
+    back_cb(nullptr);
     uint32_t decoded = 0;
     uint8_t bytes[4] = {};
     for (unsigned i = 0; i <= 255; ++i) {

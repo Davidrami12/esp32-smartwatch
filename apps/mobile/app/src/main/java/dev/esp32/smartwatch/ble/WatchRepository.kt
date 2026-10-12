@@ -1,6 +1,11 @@
 package dev.esp32.smartwatch.ble
 
 import android.Manifest
+import android.app.NotificationManager
+import android.content.ComponentName
+import android.content.BroadcastReceiver
+import android.content.Intent
+import android.content.IntentFilter
 import android.annotation.SuppressLint
 import android.bluetooth.*
 import android.bluetooth.le.*
@@ -14,6 +19,11 @@ import dev.esp32.smartwatch.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.util.UUID
+import dev.esp32.smartwatch.notifications.PhoneNotification
+import dev.esp32.smartwatch.notifications.NotificationTransport
+import dev.esp32.smartwatch.notifications.WatchNotificationListener
+import dev.esp32.smartwatch.companion.ReconnectPolicy
+import dev.esp32.smartwatch.media.*
 
 /** All mutable BLE/session state is confined to the main looper, including callbacks. */
 @SuppressLint("MissingPermission") // Every entry point/callback checks permissions; revocation is caught.
@@ -21,14 +31,15 @@ class WatchRepository(context: Context) {
     private val context = context.applicationContext
     private val adapter = this.context.getSystemService(BluetoothManager::class.java)?.adapter
     private val handler = Handler(Looper.getMainLooper())
-    private val mutableState = MutableStateFlow(WatchState())
+    private val preferences = this.context.getSharedPreferences("companion", Context.MODE_PRIVATE)
+    private val mutableState = MutableStateFlow(WatchState(savedWatchAvailable = preferences.contains("watch_address")))
     val state = mutableState.asStateFlow()
     private val devices = mutableMapOf<String, BluetoothDevice>()
     private var scanner: BluetoothLeScanner? = null
     private var scanCallback: ScanCallback? = null
     private var gatt: BluetoothGatt? = null
     private var lastDevice: BluetoothDevice? = null
-    private var foreground = false
+    private var serviceEnabled = false
     private var reconnectAllowed = false
     private var retryCount = 0
     private var reconnectTask: Runnable? = null
@@ -36,9 +47,128 @@ class WatchRepository(context: Context) {
     private var databaseSubscriptionDone = false
     private var discoveryDelay: Runnable? = null
     private val characteristics = mutableMapOf<UUID, BluetoothGattCharacteristic>()
-    private data class Operation(val uuid: UUID, val subscribe: Boolean = false, val writeValue: ByteArray? = null, val readback: Boolean = false)
+    private data class Operation(val uuid: UUID, val subscribe: Boolean = false, val writeValue: ByteArray? = null, val readback: Boolean = false,
+                                 val notificationChunk: Boolean = false, val mediaChunk: Boolean = false)
     private val operations = ArrayDeque<Operation>()
     private var pending: Operation? = null
+    private val phoneNotifications = ArrayDeque<PhoneNotification>()
+    private var notificationId = 0
+    private var latestMedia = PhoneMedia()
+    private var sentMedia: PhoneMedia? = null
+    private var mediaInFlight: PhoneMedia? = null
+    private var mediaCommandHandler: ((MediaCommand) -> Unit)? = null
+    private var mediaSequence: Int? = null
+    private var mediaVolumeSupported = false
+    fun setMediaCommandHandler(handler: ((MediaCommand) -> Unit)?) { mediaCommandHandler = handler }
+    fun updateMedia(value: PhoneMedia) {
+        latestMedia = value
+        if (serviceEnabled && state.value.connectionState == ConnectionState.CONNECTED && state.value.mediaAvailable && pending == null && operations.isEmpty())
+            safely { nextOperation() }
+    }
+    private var bondReceiverRegistered = false
+    private var transportConnected = false
+    private var discoveryStarted = false
+    private var automaticConnection = false
+    private var adapterReceiverRegistered = false
+    private val adapterReceiver = object : BroadcastReceiver() {
+        override fun onReceive(ctx: Context, intent: Intent) = safely {
+            if (intent.action != BluetoothAdapter.ACTION_STATE_CHANGED || !serviceEnabled || !permitted()) return@safely
+            when (adapter?.state) {
+                BluetoothAdapter.STATE_OFF, BluetoothAdapter.STATE_TURNING_OFF -> {
+                    stopScan(); cancelReconnect(); releaseGatt()
+                    mutableState.value = freshState(ConnectionState.RECONNECTING, "Bluetooth is off. Waiting for it to be enabled.")
+                        .copy(disconnectReason = DisconnectReason.UNEXPECTED_DISCONNECT)
+                }
+                BluetoothAdapter.STATE_ON -> if (reconnectAllowed && lastDevice != null && gatt == null) {
+                    retryCount = 0; scheduleReconnect()
+                }
+                BluetoothAdapter.STATE_TURNING_ON -> Unit
+            }
+        }
+    }
+    private val bondReceiver = object : BroadcastReceiver() {
+        override fun onReceive(ctx: Context, intent: Intent) { safely {
+            if (!hasPermissions()) return@safely
+            val device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java) ?: return@safely
+            if (gatt == null || lastDevice?.address != device.address) return@safely
+            when (intent.action) {
+                BluetoothDevice.ACTION_PAIRING_REQUEST -> {
+                    if (state.value.secureLink) return@safely
+                    if (automaticConnection) {
+                        securityFailure("Unexpected pairing request during bonded recovery. Repair stale keys explicitly on BOTH devices from the app."); return@safely
+                    }
+                    // Android owns the numeric-comparison dialog. Never auto-confirm or abort its broadcast.
+                    mutableState.value = state.value.copy(pairingState = PairingState.PAIRING,
+                        message = "Compare the six-digit code on the watch and Android pairing dialog. Confirm on BOTH devices only if it matches.")
+                    Log.i(TAG, "System pairing confirmation requested")
+                }
+                BluetoothDevice.ACTION_BOND_STATE_CHANGED -> when (device.bondState) {
+                    BluetoothDevice.BOND_BONDING -> {
+                        if (automaticConnection) {
+                            securityFailure("Bond repair requires explicit user pairing. Automatic recovery stopped."); return@safely
+                        }
+                        mutableState.value = state.value.copy(connectionState = ConnectionState.PAIRING, pairingState = PairingState.PAIRING)
+                        armTimeout(60_000) { securityFailure("Pairing timed out. Retry; if keys are stale, forget on both devices.") }
+                    }
+                    BluetoothDevice.BOND_BONDED -> {
+                        if (state.value.secureLink) return@safely
+                        Log.i(TAG, "Android bond established; protected GATT verification still required")
+                        mutableState.value = state.value.copy(pairingState = PairingState.BONDED)
+                        discoverSecureServices()
+                    }
+                    BluetoothDevice.BOND_NONE -> securityFailure("Pairing was rejected/failed or the bond was removed. If keys are stale, use Forget paired phone on the watch and Forget ESP32 Smartwatch in Android Bluetooth settings, then reconnect.")
+                }
+            }
+        } }
+    }
+    private fun registerBondReceiver() {
+        if (bondReceiverRegistered) return
+        context.registerReceiver(bondReceiver, IntentFilter().apply {
+            addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED); addAction(BluetoothDevice.ACTION_PAIRING_REQUEST)
+        }, Context.RECEIVER_EXPORTED) // Bluetooth broadcasts originate in the privileged Bluetooth process.
+        bondReceiverRegistered = true
+    }
+    private fun securityFailure(message: String) {
+        fail(message)
+        mutableState.value = state.value.copy(pairingState = PairingState.REJECTED_OR_FAILED, disconnectReason = DisconnectReason.SECURITY_FAILURE)
+    }
+    private fun discoverSecureServices() {
+        val source = gatt ?: return
+        if (!transportConnected || discoveryStarted || source.device.bondState != BluetoothDevice.BOND_BONDED) return
+        discoveryStarted = true
+        mutableState.value = state.value.copy(connectionState = ConnectionState.DISCOVERING_SERVICES, pairingState = PairingState.VERIFYING,
+            message = "Verifying authenticated, encrypted watch communication…")
+        if (!source.discoverServices()) unexpectedDisconnect("Secure service discovery could not start.")
+        else armTimeout(20_000) { unexpectedDisconnect("Secure communication timed out. Retrying the existing bond; no pairing downgrade.") }
+    }
+
+    fun refreshNotificationAccess() {
+        val granted = context.getSystemService(NotificationManager::class.java)
+            .isNotificationListenerAccessGranted(ComponentName(context, WatchNotificationListener::class.java))
+        mutableState.value = state.value.copy(notificationAccess = if (granted) NotificationAccess.GRANTED else NotificationAccess.NOT_GRANTED)
+        if (!granted) {
+            phoneNotifications.clear()
+            operations.removeAll { it.notificationChunk }
+            if (state.value.sendingNotification) mutableState.value = state.value.copy(notificationError = "Notification access revoked; pending content dropped.")
+            if (pending?.notificationChunk != true) mutableState.value = state.value.copy(sendingNotification = false)
+        }
+    }
+    private fun freshState(connection: ConnectionState = ConnectionState.DISCONNECTED, message: String? = null,
+                           devices: List<NearbyWatch> = state.value.devices) = WatchState(connectionState = connection,
+        devices = devices, message = message, notificationAccess = state.value.notificationAccess,
+        companionEnabled = serviceEnabled, savedWatchAvailable = preferences.contains("watch_address"),
+        disconnectReason = state.value.disconnectReason)
+
+    fun forwardNotification(item: PhoneNotification) { handler.post {
+        refreshNotificationAccess()
+        if (!serviceEnabled || state.value.notificationAccess != NotificationAccess.GRANTED || !state.value.secureLink || state.value.connectionState != ConnectionState.CONNECTED ||
+            !state.value.notificationTransportAvailable || !hasPermissions()) {
+            Log.d(TAG, "Phone notification dropped (access/disconnected/unsupported)"); return@post
+        }
+        if (phoneNotifications.size == 5) { phoneNotifications.removeFirst(); Log.d(TAG, "Notification send queue full; oldest dropped") }
+        phoneNotifications.add(item)
+        if (pending == null && operations.isEmpty()) safely { nextOperation() }
+    } }
 
     fun hasPermissions(): Boolean = listOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
         .all { context.checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }
@@ -62,24 +192,48 @@ class WatchRepository(context: Context) {
         else mutableState.value = state.value.copy(message = null)
     }
 
-    fun setForeground(value: Boolean) {
-        foreground = value
-        if (value && (gatt != null || scanCallback != null) && !permitted()) return
-        if (!value) {
-            stopScan()
-            cancelReconnect()
-        } else if (reconnectAllowed && gatt == null && lastDevice != null) scheduleReconnect()
+    fun serviceStarted() {
+        serviceEnabled = true
+        mutableState.value = state.value.copy(companionEnabled = true, disconnectReason = DisconnectReason.NONE)
+        refreshNotificationAccess()
+        if (!adapterReceiverRegistered) {
+            context.registerReceiver(adapterReceiver, IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED), Context.RECEIVER_EXPORTED)
+            adapterReceiverRegistered = true
+        }
+    }
+    fun serviceStopped(user: Boolean) {
+        serviceEnabled = false; reconnectAllowed = false; lastDevice = null
+        cancelReconnect(); stopScan(); releaseGatt()
+        if (adapterReceiverRegistered) { context.unregisterReceiver(adapterReceiver); adapterReceiverRegistered = false }
+        val error = !user && state.value.connectionState == ConnectionState.ERROR
+        mutableState.value = freshState(if (error) ConnectionState.ERROR else ConnectionState.DISCONNECTED,
+            if (error) state.value.message else null).copy(disconnectReason = if (user) DisconnectReason.USER_DISCONNECTED else DisconnectReason.SERVICE_STOPPED)
+        Log.i(TAG, "Service stopped: ${state.value.disconnectReason}")
+    }
+    fun serviceStartFailed(message: String) { fail(message) }
+    fun resumeBonded() = safely {
+        if (!serviceEnabled || !permitted()) return@safely
+        val address = preferences.getString("watch_address", null)
+        if (address == null || !BluetoothAdapter.checkBluetoothAddress(address)) {
+            fail("No saved secure watch. Scan and connect first."); return@safely
+        }
+        stopScan(); cancelReconnect(); releaseGatt()
+        lastDevice = adapter?.getRemoteDevice(address)
+        reconnectAllowed = true; retryCount = 0
+        mutableState.value = freshState(ConnectionState.CONNECTING).copy(disconnectReason = DisconnectReason.NONE)
+        lastDevice?.let { connectDevice(it, recovery = true) } ?: fail("Bluetooth adapter unavailable.")
     }
 
     fun startScan() = safely {
-        if (!permitted()) return@safely
+        if (!serviceEnabled || !permitted()) return@safely
         if (adapter?.isEnabled != true) { fail("Enable Bluetooth, then scan again."); return@safely }
         if (gatt != null) return@safely
         stopScan()
         cancelReconnect()
         reconnectAllowed = false
+        lastDevice = null
         devices.clear()
-        mutableState.value = WatchState(connectionState = ConnectionState.SCANNING)
+        mutableState.value = freshState(ConnectionState.SCANNING, devices = emptyList()).copy(disconnectReason = DisconnectReason.NONE)
         val callback = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: ScanResult) = deliver(result)
             override fun onBatchScanResults(results: MutableList<ScanResult>) = results.forEach(::deliver)
@@ -120,7 +274,7 @@ class WatchRepository(context: Context) {
     }
 
     fun connect(id: String) = safely {
-        if (!permitted()) return@safely
+        if (!serviceEnabled || !permitted()) return@safely
         val device = devices[id] ?: return@safely
         stopScan()
         cancelReconnect()
@@ -128,45 +282,64 @@ class WatchRepository(context: Context) {
         retryCount = 0
         reconnectAllowed = true
         lastDevice = device
+        mutableState.value = state.value.copy(disconnectReason = DisconnectReason.NONE)
         connectDevice(device)
     }
 
-    private fun connectDevice(device: BluetoothDevice) {
-        if (!permitted()) return
-        if (adapter?.isEnabled != true) { fail("Enable Bluetooth and reconnect."); return }
-        mutableState.value = WatchState(connectionState = ConnectionState.CONNECTING, devices = state.value.devices)
+    private fun connectDevice(device: BluetoothDevice, recovery: Boolean = false) {
+        if (!serviceEnabled || !permitted()) return
+        if (adapter?.isEnabled != true) { unexpectedDisconnect("Bluetooth is off. Waiting for it to be enabled."); return }
+        if (recovery && device.bondState != BluetoothDevice.BOND_BONDED) {
+            securityFailure("The saved watch bond is missing. Pair explicitly from the app; automatic recovery will not create a new bond."); return
+        }
+        mutableState.value = freshState(ConnectionState.CONNECTING)
+        automaticConnection = recovery
+        registerBondReceiver()
         Log.i(TAG, "Connecting GATT")
         gatt = device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
-        if (gatt == null) { fail("Could not start GATT connection."); return }
-        armTimeout(20_000) { fail("Connection timed out. Scan and retry.") }
+        if (gatt == null) { unexpectedDisconnect("Could not start GATT connection."); return }
+        armTimeout(20_000) { unexpectedDisconnect("Watch not reachable. Retrying with backoff.") }
     }
 
     private val callback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(source: BluetoothGatt, status: Int, newState: Int) = onSession(source) {
             Log.i(TAG, "GATT connection callback: status=$status state=$newState")
             if (status != BluetoothGatt.GATT_SUCCESS || newState == BluetoothProfile.STATE_DISCONNECTED) {
-                releaseGatt()
-                mutableState.value = WatchState(connectionState = ConnectionState.DISCONNECTED, devices = state.value.devices,
-                    message = "Watch disconnected (status $status).")
-                scheduleReconnect()
+                // Authentication/key-loss errors require explicit recovery, not repeated re-pairing.
+                if (status == BluetoothGatt.GATT_INSUFFICIENT_AUTHENTICATION || status == BluetoothGatt.GATT_INSUFFICIENT_ENCRYPTION) {
+                    securityFailure("Secure connection failed ($status). For stale keys, forget on BOTH devices and pair explicitly in the app.")
+                    return@onSession
+                }
+                unexpectedDisconnect("Watch disconnected unexpectedly (status $status).")
             } else if (newState == BluetoothProfile.STATE_CONNECTED) {
-                mutableState.value = state.value.copy(connectionState = ConnectionState.DISCOVERING_SERVICES)
-                Log.i(TAG, "Discovering services")
-                if (!source.discoverServices()) fail("Service discovery could not start.")
-                else armTimeout(15_000) { fail("Service discovery timed out.") }
+                transportConnected = true
+                when (source.device.bondState) {
+                    BluetoothDevice.BOND_BONDED -> discoverSecureServices()
+                    else -> {
+                        if (automaticConnection) {
+                            securityFailure("Bond was removed while reconnecting. Pair explicitly from the app."); return@onSession
+                        }
+                        mutableState.value = state.value.copy(connectionState = ConnectionState.PAIRING, pairingState = PairingState.PAIRING,
+                            message = "Compare the code and accept pairing on the watch and Android. No private data is available before secure verification.")
+                        if (source.device.bondState == BluetoothDevice.BOND_NONE && !source.device.createBond()) {
+                            securityFailure("Android pairing could not start. Retry from Bluetooth settings."); return@onSession
+                        }
+                        armTimeout(60_000) { securityFailure("Pairing timed out. Retry; stale keys require Forget on both devices.") }
+                    }
+                }
             }
         }
 
         override fun onServicesDiscovered(source: BluetoothGatt, status: Int) = onSession(source) {
-            if (status != BluetoothGatt.GATT_SUCCESS) { fail("Service discovery failed ($status)."); return@onSession }
+            if (status != BluetoothGatt.GATT_SUCCESS) { unexpectedDisconnect("Service discovery failed ($status)."); return@onSession }
             Log.i(TAG, "Services discovered; verifying protocol characteristics")
             val watch = source.getService(WatchBleProtocol.WATCH_SERVICE)
             val battery = source.getService(WatchBleProtocol.BATTERY_SERVICE)
-            for (uuid in listOf(WatchBleProtocol.VERSION) + WatchBleProtocol.TELEMETRY) {
+            for (uuid in listOf(WatchBleProtocol.SECURITY, WatchBleProtocol.VERSION) + WatchBleProtocol.TELEMETRY) {
                 val c = (if (uuid == WatchBleProtocol.BATTERY) battery else watch)?.getCharacteristic(uuid)
                 if (c == null || c.properties and BluetoothGattCharacteristic.PROPERTY_READ == 0 ||
                     (uuid in WatchBleProtocol.NOTIFY && (c.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY == 0 || c.getDescriptor(WatchBleProtocol.CCCD) == null))) {
-                    fail("Incompatible watch: required services, reads or notifications missing."); return@onSession
+                    securityFailure("Incompatible watch: secure GATT service or required telemetry missing. Install security-enabled firmware."); return@onSession
                 }
                 characteristics[uuid] = c
             }
@@ -181,15 +354,34 @@ class WatchRepository(context: Context) {
             }
             if (supportsControls) controls.forEach { characteristics[it.uuid] = it }
             mutableState.value = state.value.copy(controlsAvailable = supportsControls)
+            val notification = watch?.getCharacteristic(WatchBleProtocol.PHONE_NOTIFICATION)
+            val supportsNotifications = notification != null && notification.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0
+            if (supportsNotifications) characteristics[WatchBleProtocol.PHONE_NOTIFICATION] = notification!!
+            mutableState.value = state.value.copy(notificationTransportAvailable = supportsNotifications)
+            val media = watch?.getCharacteristic(WatchBleProtocol.MEDIA)
+            val command = watch?.getCharacteristic(WatchBleProtocol.MEDIA_COMMAND)
+            val supportsMedia = media != null && command != null && media.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0 &&
+                command.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0 && command.getDescriptor(WatchBleProtocol.CCCD) != null
+            Log.i(TAG, "Media discovery: metadata=${media != null}, commands=${command != null}, supported=$supportsMedia")
+            if (supportsMedia) { characteristics[media!!.uuid] = media; characteristics[command!!.uuid] = command }
+            mutableState.value = state.value.copy(mediaAvailable = supportsMedia)
+            val mediaCapabilities = watch?.getCharacteristic(WatchBleProtocol.MEDIA_CAPABILITIES)
+            mediaVolumeSupported = false
+            if (supportsMedia && mediaCapabilities != null && mediaCapabilities.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0) {
+                characteristics[mediaCapabilities.uuid] = mediaCapabilities
+            }
             // One outstanding GATT operation. Version must succeed before custom values are decoded.
+            operations.add(Operation(WatchBleProtocol.SECURITY))
             operations.add(Operation(WatchBleProtocol.VERSION))
+            if (WatchBleProtocol.MEDIA_CAPABILITIES in characteristics) operations.add(Operation(WatchBleProtocol.MEDIA_CAPABILITIES))
             WatchBleProtocol.NOTIFY.filter { it in characteristics }.forEach { operations.add(Operation(it)) }
             WatchBleProtocol.NOTIFY.filter { it in characteristics }.forEach { operations.add(Operation(it, subscribe = true)) }
+            if (supportsMedia) operations.add(Operation(WatchBleProtocol.MEDIA_COMMAND, subscribe = true))
             val changed = source.getService(WatchBleProtocol.GATT_SERVICE)?.getCharacteristic(WatchBleProtocol.SERVICE_CHANGED)
             if (!databaseSubscriptionDone && changed != null && changed.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0 &&
                 changed.getDescriptor(WatchBleProtocol.CCCD) != null) {
                 characteristics[changed.uuid] = changed
-                operations.addFirst(Operation(changed.uuid, subscribe = true))
+                operations.add(1, Operation(changed.uuid, subscribe = true))
             }
             nextOperation()
         }
@@ -200,6 +392,18 @@ class WatchRepository(context: Context) {
                 val op = pending ?: return@onSession
                 if (op.uuid != c.uuid || op.subscribe || op.writeValue != null) return@onSession
                 Log.d(TAG, "Characteristic read: ${c.uuid}, status=$status")
+                if (c.uuid == WatchBleProtocol.SECURITY) {
+                    if (status != BluetoothGatt.GATT_SUCCESS && status != BluetoothGatt.GATT_INSUFFICIENT_AUTHENTICATION &&
+                        status != BluetoothGatt.GATT_INSUFFICIENT_ENCRYPTION) {
+                        unexpectedDisconnect("Protected GATT transport failed ($status); retrying the existing bond."); return@onSession
+                    }
+                    if (status != BluetoothGatt.GATT_SUCCESS || source.device.bondState != BluetoothDevice.BOND_BONDED || !WatchBleProtocol.secureStatus(snapshot)) {
+                        securityFailure("Authenticated/encrypted watch verification failed ($status). For stale keys, forget on BOTH devices and pair again."); return@onSession
+                    }
+                    mutableState.value = state.value.copy(secureLink = true, pairingState = PairingState.SECURE, message = null)
+                    Log.i(TAG, "Protected GATT verified: SC, MITM, encryption, 128-bit keys, trusted bond")
+                    pending = null; nextOperation(); return@onSession
+                }
                 if (op.readback) {
                     val valid = status == BluetoothGatt.GATT_SUCCESS && decode(c.uuid, snapshot, strict = false)
                     mutableState.value = state.value.copy(writingControl = false,
@@ -222,7 +426,36 @@ class WatchRepository(context: Context) {
         override fun onCharacteristicWrite(source: BluetoothGatt, c: BluetoothGattCharacteristic, status: Int) = onSession(source) {
             val op = pending ?: return@onSession
             if (op.uuid != c.uuid || op.writeValue == null) return@onSession
-            Log.i(TAG, "Control write callback: ${c.uuid}, status=$status")
+            Log.i(TAG, if (op.mediaChunk) "Media frame write callback: status=$status" else if (op.notificationChunk) "Notification frame write callback: status=$status" else "Control write callback: ${c.uuid}, status=$status")
+            if (op.mediaChunk) {
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    operations.removeAll { it.mediaChunk }
+                    mutableState.value = state.value.copy(mediaAvailable = false, sendingMedia = false, mediaError = "Media snapshot rejected ($status); reconnect to retry.")
+                    mediaInFlight = null
+                } else if (operations.none { it.mediaChunk }) {
+                    sentMedia = mediaInFlight; mediaInFlight = null
+                    mutableState.value = state.value.copy(sendingMedia = false)
+                    Log.i(TAG, "Media snapshot delivered")
+                }
+                pending = null; nextOperation(); return@onSession
+            }
+            if (op.notificationChunk) {
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    operations.removeAll { it.notificationChunk }
+                    mutableState.value = state.value.copy(sendingNotification = false, notificationError = "Watch rejected notification content ($status).")
+                    Log.w(TAG, "Notification frame rejected: status=$status")
+                } else {
+                    Log.d(TAG, "Notification frame acknowledged")
+                    if (operations.none { it.notificationChunk }) {
+                        mutableState.value = state.value.copy(sendingNotification = false)
+                        Log.i(TAG, if (state.value.notificationAccess == NotificationAccess.GRANTED)
+                            "Notification message delivered" else "Notification transmission cancelled (access revoked)")
+                    }
+                }
+                pending = null
+                nextOperation()
+                return@onSession
+            }
             if (status != BluetoothGatt.GATT_SUCCESS) mutableState.value = state.value.copy(
                 controlError = "Watch rejected the change ($status). Reading its actual value.")
             pending = null
@@ -249,16 +482,31 @@ class WatchRepository(context: Context) {
             discoveryDelay?.let(handler::removeCallbacks); discoveryDelay = null
             clearTimeout()
             operations.clear(); pending = null; characteristics.clear()
+            phoneNotifications.clear()
+            sentMedia = null; mediaInFlight = null; mediaSequence = null
             databaseSubscriptionDone = true
-            mutableState.value = WatchState(connectionState = ConnectionState.DISCOVERING_SERVICES, devices = state.value.devices)
-            if (!source.discoverServices()) fail("Changed-service discovery could not start. Reconnect.")
-            else armTimeout(15_000) { fail("Changed-service discovery timed out.") }
+            mutableState.value = freshState(ConnectionState.DISCOVERING_SERVICES)
+            // Bonded Android may invalidate its database asynchronously after this callback.
+            discoveryDelay = Runnable {
+                discoveryDelay = null
+                if (gatt !== source) return@Runnable
+                if (!source.discoverServices()) fail("Changed-service discovery could not start. Reconnect.")
+                else armTimeout(15_000) { fail("Changed-service discovery timed out.") }
+            }.also { handler.postDelayed(it, 750) }
         }
 
         override fun onCharacteristicChanged(source: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray) {
             val snapshot = value.copyOf()
             onSession(source) {
-                if (state.value.protocolVersion == WatchBleProtocol.SUPPORTED_VERSION && c.uuid in WatchBleProtocol.NOTIFY && c.uuid in characteristics) {
+                if (c.uuid == WatchBleProtocol.MEDIA_COMMAND && state.value.connectionState == ConnectionState.CONNECTED && state.value.secureLink && state.value.mediaAvailable) {
+                    val command = try { MediaProtocol.command(snapshot) } catch (_: IllegalArgumentException) { Log.w(TAG, "Invalid media command rejected"); return@onSession }
+                    if (command.action != 0 && MediaProtocol.isNewSequence(mediaSequence, command.sequence)) {
+                        mediaSequence = command.sequence
+                        mediaCommandHandler?.invoke(command)
+                    }
+                    return@onSession
+                }
+                if (state.value.secureLink && state.value.protocolVersion == WatchBleProtocol.SUPPORTED_VERSION && c.uuid in WatchBleProtocol.NOTIFY && c.uuid in characteristics) {
                     Log.d(TAG, "Notification: ${c.uuid}")
                     decode(c.uuid, snapshot, strict = false)
                 }
@@ -274,12 +522,38 @@ class WatchRepository(context: Context) {
     private fun nextOperation() {
         clearTimeout()
         val source = gatt ?: return
+        if (operations.isEmpty() && state.value.connectionState == ConnectionState.CONNECTED && state.value.secureLink &&
+            state.value.mediaAvailable && latestMedia != sentMedia) {
+            mediaInFlight = latestMedia
+            mutableState.value = state.value.copy(sendingMedia = true, mediaError = null)
+            MediaProtocol.frames(latestMedia, notificationId++, mediaVolumeSupported).forEach {
+                operations.add(Operation(WatchBleProtocol.MEDIA, writeValue = it, mediaChunk = true))
+            }
+            Log.i(TAG, "Media snapshot transmission started")
+        }
+        if (operations.isEmpty() && phoneNotifications.isNotEmpty() && state.value.connectionState == ConnectionState.CONNECTED) {
+            val item = phoneNotifications.removeFirst()
+            val frames = try { NotificationTransport.frames(item, notificationId++) } catch (_: IllegalArgumentException) {
+                Log.w(TAG, "Invalid normalized notification dropped")
+                mutableState.value = state.value.copy(notificationError = "Invalid notification dropped.")
+                nextOperation(); return
+            }
+            frames.forEach { operations.add(Operation(WatchBleProtocol.PHONE_NOTIFICATION, writeValue = it, notificationChunk = true)) }
+            mutableState.value = state.value.copy(sendingNotification = true, notificationError = null)
+            Log.i(TAG, "Notification transmission started: chunks=${frames.size}")
+        }
         val op = operations.removeFirstOrNull()
         if (op == null) {
+            if (!state.value.secureLink || source.device.bondState != BluetoothDevice.BOND_BONDED) {
+                securityFailure("Secure communication is not ready."); return
+            }
             if (state.value.connectionState != ConnectionState.CONNECTED) {
                 retryCount = 0
+                preferences.edit().putString("watch_address", source.device.address).apply()
                 Log.i(TAG, "Watch ready: initial reads and all subscriptions complete")
-                mutableState.value = state.value.copy(connectionState = ConnectionState.CONNECTED)
+                mutableState.value = state.value.copy(connectionState = ConnectionState.CONNECTED, savedWatchAvailable = true,
+                    disconnectReason = DisconnectReason.NONE, retryDelayMillis = null)
+                if (state.value.mediaAvailable) { nextOperation(); return }
             }
             return
         }
@@ -292,20 +566,34 @@ class WatchRepository(context: Context) {
                 if (c.uuid == WatchBleProtocol.SERVICE_CHANGED) BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
                 else BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) == BluetoothStatusCodes.SUCCESS
         } else source.readCharacteristic(c)
-        if (!started && op.writeValue != null) {
+        if (!started && op.mediaChunk) {
+            pending = null; operations.removeAll { it.mediaChunk }; mediaInFlight = null
+            mutableState.value = state.value.copy(mediaAvailable = false, sendingMedia = false, mediaError = "Media transmission could not start; reconnect to retry.")
+            nextOperation()
+        } else if (!started && op.notificationChunk) {
+            pending = null
+            operations.removeAll { it.notificationChunk }
+            phoneNotifications.clear()
+            mutableState.value = state.value.copy(sendingNotification = false, notificationError = "Notification transmission could not start; message dropped.")
+        } else if (!started && op.writeValue != null) {
             pending = null
             mutableState.value = state.value.copy(writingControl = false, controlError = "Could not send the change. Previous confirmed value retained; retry.")
         } else if (!started && op.readback) {
             pending = null
             mutableState.value = state.value.copy(writingControl = false, controlsAvailable = false,
                 controlError = "Readback could not start. Reconnect to confirm settings.")
-        } else if (!started) fail("GATT operation could not start. Reconnect and retry.")
-        else armTimeout(10_000) { fail(if (state.value.writingControl)
+        } else if (!started) unexpectedDisconnect("GATT operation could not start. Reconnecting securely.")
+        else armTimeout(10_000) { unexpectedDisconnect(if (state.value.writingControl)
             "Settings confirmation timed out. Outcome unknown; reconnect to read actual values."
             else "GATT operation timed out. Reconnect and retry.") }
     }
 
     private fun decode(uuid: UUID, value: ByteArray, strict: Boolean): Boolean {
+        if (uuid == WatchBleProtocol.MEDIA_CAPABILITIES) {
+            mediaVolumeSupported = value.size == 1 && value[0].toInt() == 1
+            Log.i(TAG, "Relative media volume support=$mediaVolumeSupported")
+            return true // Unknown capability falls back to the original media snapshot.
+        }
         try {
             mutableState.value = when (uuid) {
                 WatchBleProtocol.VERSION -> {
@@ -335,7 +623,7 @@ class WatchRepository(context: Context) {
 
     private fun writeControl(uuid: UUID, encode: () -> ByteArray) = safely {
         if (!permitted()) return@safely
-        if (state.value.connectionState != ConnectionState.CONNECTED || !state.value.controlsAvailable || state.value.writingControl || pending != null) return@safely
+        if (!state.value.secureLink || state.value.connectionState != ConnectionState.CONNECTED || !state.value.controlsAvailable || state.value.writingControl || pending != null) return@safely
         val bytes = try { encode() } catch (_: IllegalArgumentException) {
             mutableState.value = state.value.copy(controlError = "Unsupported setting value."); return@safely
         }
@@ -345,28 +633,34 @@ class WatchRepository(context: Context) {
         nextOperation()
     }
 
+    private fun unexpectedDisconnect(message: String) {
+        cancelReconnect(); stopScan(); releaseGatt()
+        mutableState.value = freshState(ConnectionState.RECONNECTING, message).copy(disconnectReason = DisconnectReason.UNEXPECTED_DISCONNECT)
+        scheduleReconnect()
+    }
     private fun scheduleReconnect() {
-        if (!foreground || !reconnectAllowed || reconnectTask != null || retryCount >= 3) return
+        if (!serviceEnabled || !reconnectAllowed || reconnectTask != null || gatt != null) return
         val device = lastDevice ?: return
-        retryCount++
-        Log.i(TAG, "Scheduling foreground reconnect attempt $retryCount/3")
-        mutableState.value = state.value.copy(message = "Watch disconnected. Reconnecting ($retryCount/3)…")
+        if (!permitted()) return
+        if (adapter?.isEnabled != true) {
+            mutableState.value = state.value.copy(connectionState = ConnectionState.RECONNECTING, retryDelayMillis = null,
+                message = "Bluetooth is off. Waiting for it to be enabled.")
+            return
+        }
+        if (!ReconnectPolicy.mayRecover(serviceEnabled, state.value.disconnectReason, device.bondState == BluetoothDevice.BOND_BONDED)) {
+            securityFailure("Bond missing or removed. Automatic recovery stopped; pair explicitly from the app."); return
+        }
+        val delay = ReconnectPolicy.delayMillis(retryCount)
+        retryCount = (retryCount + 1).coerceAtMost(6)
+        Log.i(TAG, "Unexpected disconnect; retry in ${delay}ms (no recovery scan)")
+        mutableState.value = state.value.copy(connectionState = ConnectionState.RECONNECTING, retryDelayMillis = delay,
+            message = "Reconnecting to the bonded watch in ${delay / 1000}s…")
         val task = Runnable {
             reconnectTask = null
-            if (foreground && reconnectAllowed && gatt == null) safely { connectDevice(device) }
+            if (serviceEnabled && reconnectAllowed && gatt == null) safely { connectDevice(device, recovery = true) }
         }
         reconnectTask = task
-        handler.postDelayed(task, 2_000L * retryCount)
-    }
-
-    fun disconnect() {
-        Log.i(TAG, "Manual disconnect")
-        reconnectAllowed = false
-        lastDevice = null
-        cancelReconnect()
-        stopScan()
-        releaseGatt()
-        mutableState.value = WatchState(devices = state.value.devices)
+        handler.postDelayed(task, delay)
     }
 
     private fun fail(message: String) {
@@ -375,10 +669,14 @@ class WatchRepository(context: Context) {
         cancelReconnect()
         stopScan()
         releaseGatt()
-        mutableState.value = WatchState(connectionState = ConnectionState.ERROR, devices = state.value.devices, message = message)
+        mutableState.value = freshState(ConnectionState.ERROR, message)
     }
 
     private fun releaseGatt() {
+        if (bondReceiverRegistered) { context.unregisterReceiver(bondReceiver); bondReceiverRegistered = false }
+        transportConnected = false
+        discoveryStarted = false
+        automaticConnection = false
         clearTimeout()
         discoveryDelay?.let(handler::removeCallbacks); discoveryDelay = null
         databaseSubscriptionDone = false
@@ -386,6 +684,9 @@ class WatchRepository(context: Context) {
         gatt = null
         pending = null
         operations.clear()
+        phoneNotifications.clear()
+        sentMedia = null; mediaInFlight = null; mediaSequence = null
+        mediaVolumeSupported = false
         characteristics.clear()
         try { old?.disconnect() } catch (_: SecurityException) { Log.w(TAG, "Permission revoked during disconnect") }
         try { old?.close() } catch (_: SecurityException) { Log.w(TAG, "Permission revoked during close") }
@@ -396,6 +697,5 @@ class WatchRepository(context: Context) {
         clearTimeout()
         timeout = Runnable { timeout = null; action() }.also { handler.postDelayed(it, delay) }
     }
-    fun close() { disconnect(); handler.removeCallbacksAndMessages(null) }
     companion object { private const val TAG = "WatchBle" }
 }

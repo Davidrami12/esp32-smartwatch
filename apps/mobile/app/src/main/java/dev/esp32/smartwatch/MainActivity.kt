@@ -2,6 +2,7 @@ package dev.esp32.smartwatch
 
 import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
@@ -45,6 +46,10 @@ class MainActivity : ComponentActivity() {
                 val model: WatchViewModel = viewModel()
                 val state by model.state.collectAsStateWithLifecycle()
                 var permitted by remember { mutableStateOf(model.hasPermissions()) }
+                var notificationAllowed by remember { mutableStateOf(checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) }
+                val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
+                    notificationAllowed = it
+                }
                 val permissions = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
                     permitted = model.hasPermissions()
                     model.permissionResult(permitted)
@@ -55,6 +60,8 @@ class MainActivity : ComponentActivity() {
                     val observer = LifecycleEventObserver { _, event ->
                         if (event == Lifecycle.Event.ON_START) {
                             permitted = model.hasPermissions()
+                            model.refreshNotificationAccess()
+                            notificationAllowed = checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
                             model.setForeground(true)
                         } else if (event == Lifecycle.Event.ON_STOP) model.setForeground(false)
                     }
@@ -67,7 +74,10 @@ class MainActivity : ComponentActivity() {
                     else permissions.launch(arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT))
                 }
                 SmartwatchScreen(state, permitted, requestScan, model::stopScan, model::connect, model::disconnect,
-                    model::setBrightness, model::setScreenTimeout, model::setWifiEnabled) {
+                    model::setBrightness, model::setScreenTimeout, model::setWifiEnabled,
+                    model::resumeCompanion, notificationAllowed,
+                    { notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS) },
+                    { startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) }) {
                     startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
                 }
             }
@@ -80,9 +90,11 @@ private fun SmartwatchScreen(
     state: WatchState, permitted: Boolean, scan: () -> Unit, stopScan: () -> Unit,
     connect: (String) -> Unit, disconnect: () -> Unit,
     brightnessChanged: (Int) -> Unit, timeoutChanged: (Long) -> Unit, wifiChanged: (Boolean) -> Unit,
+    resumeCompanion: () -> Unit, notificationAllowed: Boolean, notificationPermission: () -> Unit,
+    notificationSettings: () -> Unit,
     appSettings: () -> Unit,
 ) {
-    val busy = state.connectionState in listOf(ConnectionState.CONNECTING, ConnectionState.DISCOVERING_SERVICES)
+    val busy = state.connectionState in listOf(ConnectionState.CONNECTING, ConnectionState.PAIRING, ConnectionState.DISCOVERING_SERVICES, ConnectionState.RECONNECTING)
     Scaffold(containerColor = Color.Black) { padding ->
         LazyColumn(modifier = Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(24.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)) {
@@ -92,8 +104,10 @@ private fun SmartwatchScreen(
                     ConnectionState.DISCONNECTED -> "Disconnected"
                     ConnectionState.SCANNING -> "Scanning for compatible watches…"
                     ConnectionState.CONNECTING -> "Connecting…"
+                    ConnectionState.PAIRING -> "Pairing · compare codes on both devices"
                     ConnectionState.DISCOVERING_SERVICES -> "Discovering services and preparing data…"
-                    ConnectionState.CONNECTED -> "Connected"
+                    ConnectionState.CONNECTED -> "Connected · encrypted + MITM protected"
+                    ConnectionState.RECONNECTING -> "Reconnecting to bonded watch…"
                     ConnectionState.ERROR -> "Connection error"
                 }, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
@@ -102,6 +116,45 @@ private fun SmartwatchScreen(
                 TextButton(onClick = appSettings) { Text("Open app settings") }
             }
             state.message?.let { message -> item { Text(message, color = MaterialTheme.colorScheme.onSurfaceVariant) } }
+            item { Text("Pairing · ${state.pairingState.name}", style = MaterialTheme.typography.bodySmall) }
+            item {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(if (state.companionEnabled) "Background companion enabled" else "Background companion stopped",
+                        style = MaterialTheme.typography.titleMedium)
+                    Text("Home, screen lock and removing this app from recents keep the enabled service running. Disconnect stops it. Phone reboot or Android force-stop requires enabling it again.",
+                        style = MaterialTheme.typography.bodySmall)
+                    if (!notificationAllowed) {
+                        Text("Allow notifications to see connection status in the notification drawer. The foreground service can run without this permission, but Android may show it only in Active apps.",
+                            style = MaterialTheme.typography.bodySmall)
+                        TextButton(onClick = notificationPermission) { Text("Allow connection notification") }
+                    }
+                    if (!state.companionEnabled && state.savedWatchAvailable) {
+                        OutlinedButton(onClick = resumeCompanion, enabled = permitted, modifier = Modifier.fillMaxWidth()) { Text("Enable companion · saved watch") }
+                    }
+                    if (state.companionEnabled && state.connectionState != ConnectionState.CONNECTED && !busy) {
+                        TextButton(onClick = disconnect) { Text("Disconnect · stop companion") }
+                    }
+                }
+            }
+            item {
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("Notification access · ${state.notificationAccess.name}", style = MaterialTheme.typography.titleMedium)
+                        Text("Selected text notifications are sent only after bonded, authenticated LE Secure Connections communication is verified. Confirm matching pairing codes on both devices. This is not a full production security audit.",
+                            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        if (state.notificationAccess == NotificationAccess.NOT_GRANTED) {
+                            OutlinedButton(onClick = notificationSettings) { Text("Grant notification access") }
+                        } else TextButton(onClick = notificationSettings) { Text("Manage notification access") }
+                        if (state.connectionState == ConnectionState.CONNECTED && !state.notificationTransportAvailable)
+                            Text("Notification transport unavailable on this firmware.")
+                        if (state.sendingNotification) Text("Sending notification…", style = MaterialTheme.typography.bodySmall)
+                        state.notificationError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                        state.mediaError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                        if (state.connectionState == ConnectionState.CONNECTED && !state.mediaAvailable)
+                            Text("Media transport unavailable on this firmware.", style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            }
             if (state.connectionState == ConnectionState.CONNECTED) {
                 item { ValueCard("Battery", state.battery?.let { "$it%" } ?: "Unavailable") }
                 item { ValueCard("Steps today", state.steps?.let { NumberFormat.getIntegerInstance().format(it) } ?: "—") }
@@ -119,7 +172,7 @@ private fun SmartwatchScreen(
                 item {
                     if (busy) {
                         LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-                        TextButton(onClick = disconnect) { Text("Cancel connection") }
+                        TextButton(onClick = disconnect) { Text("Disconnect · stop companion") }
                     } else if (state.connectionState == ConnectionState.SCANNING) {
                         LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                         OutlinedButton(onClick = stopScan) { Text("Stop scan") }
@@ -162,7 +215,7 @@ private fun WatchControls(state: WatchState, brightnessChanged: (Int) -> Unit,
     LaunchedEffect(state.brightness, state.writingControl, dragging) {
         if (!dragging && !state.writingControl) draft = (state.brightness ?: 60).toFloat()
     }
-    val enabled = state.controlsAvailable && !state.writingControl
+    val enabled = state.controlsAvailable && !state.writingControl && !state.sendingNotification && !state.sendingMedia
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("Settings / Controls", style = MaterialTheme.typography.titleLarge)

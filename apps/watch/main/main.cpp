@@ -9,6 +9,9 @@
 #include "watch_weather.h"
 #include "esp_timer.h"
 #include "watch_ble.h"
+#include "watch_notifications.h"
+#include "watch_ble_security.h"
+#include "watch_media.h"
 #include <stdio.h>
 #include <time.h>
 #include <stdlib.h>
@@ -483,6 +486,7 @@ static void display_timeout_cb(
 {
     (void)timer;
     watch_ui_set_display_active(watch_power_is_active());
+    if (watch_ble_security_status().state == watch_pairing_state_t::Comparing) return;
 
     if (display_timeout_ms == 0) {
         return;
@@ -599,6 +603,72 @@ static esp_err_t ble_apply_control(watch_ble_control_t control, uint32_t value)
     return result;
 }
 
+static bool notification_showing = false;
+static watch_notification_t displayed_notification;
+static void show_next_notification()
+{
+    if (watch_notifications_pop(displayed_notification)) {
+        notification_showing = true;
+        watch_ui_show_notification(displayed_notification.app, displayed_notification.title, displayed_notification.body);
+        last_activity = lv_tick_get();
+    } else {
+        notification_showing = false;
+        watch_ui_hide_notification();
+    }
+}
+static void dismiss_notification()
+{
+    show_next_notification();
+    last_activity = lv_tick_get();
+}
+static void notification_update_cb(lv_timer_t *)
+{
+    if (!watch_notifications_take_arrival()) return;
+    if (!watch_power_is_active()) {
+        watch_power_set_active(true, current_brightness);
+        watch_ui_set_display_active(true);
+        update_clock_cb(nullptr); update_steps_cb(nullptr);
+        update_wifi_status_cb(nullptr); update_battery_cb(nullptr);
+    }
+    last_activity = lv_tick_get(); last_tap = 0;
+    if (!notification_showing) show_next_notification();
+    ESP_LOGI("watch_notifications", "Displayed notification; normal timeout resumed");
+}
+static void security_update_cb(lv_timer_t *)
+{
+    static uint32_t previous = UINT32_MAX;
+    const auto security = watch_ble_security_status();
+    if (security.token == previous) return;
+    previous = security.token;
+    if (security.state == watch_pairing_state_t::Comparing) {
+        if (!watch_power_is_active()) {
+            watch_power_set_active(true, current_brightness); watch_ui_set_display_active(true);
+        }
+        watch_ui_show_pairing(security.token, security.code);
+    } else watch_ui_hide_pairing();
+    last_activity = lv_tick_get(); last_tap = 0;
+    const char *text = "No paired phone";
+    switch (security.state) {
+    case watch_pairing_state_t::Comparing: text = "Compare codes"; break;
+    case watch_pairing_state_t::Securing: text = "Securing connection..."; break;
+    case watch_pairing_state_t::Trusted: text = "Trusted phone / bonded"; break;
+    case watch_pairing_state_t::Rejected: text = "Pairing rejected"; break;
+    case watch_pairing_state_t::Failed: text = "Security failed / retry or forget"; break;
+    case watch_pairing_state_t::Forgetting: text = "Forgetting phone..."; break;
+    case watch_pairing_state_t::Forgotten: text = "Phone forgotten"; break;
+    case watch_pairing_state_t::Locked: text = "Stale keys / forget both sides"; break;
+    default: break;
+    }
+    watch_ui_set_security_status(text, security.has_phone);
+}
+static void media_update_cb(lv_timer_t *)
+{
+    static uint32_t revision = 0;
+    watch_media_t media;
+    if (watch_media_snapshot(media, revision))
+        watch_ui_set_media(media.state, media.actions, media.session, media.title, media.artist);
+}
+
 
 /* ---------------- MAIN ---------------- */
 
@@ -692,6 +762,9 @@ extern "C" void app_main(void)
     bsp_display_lock(0);
 
     watch_ui_create();
+    watch_ui_set_notification_dismiss_callback(dismiss_notification);
+    watch_ui_set_security_callbacks(watch_ble_security_confirm, watch_ble_security_forget);
+    watch_ui_set_media_callback(watch_ble_media_command);
     watch_ui_set_wifi_control_callback(ui_wifi_request);
     watch_ui_set_bluetooth_control_callback(ui_bluetooth_request);
 
@@ -757,6 +830,9 @@ extern "C" void app_main(void)
     );
 
     register_touch_handler();
+    lv_timer_create(notification_update_cb, 100, nullptr);
+    lv_timer_create(security_update_cb, 100, nullptr);
+    lv_timer_create(media_update_cb, 100, nullptr);
 
     bsp_display_unlock();
 

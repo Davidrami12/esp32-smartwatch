@@ -13,6 +13,9 @@ idf_component_register(
         watch_wifi.cpp
         watch_weather.cpp
         watch_ble.cpp
+        watch_ble_security.cpp
+        watch_media.cpp
+        watch_notifications.cpp
         ${LV_DEMOS_SOURCES}
         ../../../components/watch-ui/watch_ui.cpp
     INCLUDE_DIRS

@@ -6,6 +6,8 @@
 enum class watch_ble_state_t { Disabled, Advertising, Connected };
 esp_err_t watch_ble_init(void);
 watch_ble_state_t watch_ble_get_state(void);
+// UI thread queues a bounded command; transmission and security validation run on host.
+bool watch_ble_media_command(uint8_t command, uint32_t session);
 // Runtime radio intent (defaults enabled each boot); disabling disconnects the peer.
 bool watch_ble_set_enabled(bool enabled);
 // Register before init. Called on NimBLE host: platform serializes settings/UI access.

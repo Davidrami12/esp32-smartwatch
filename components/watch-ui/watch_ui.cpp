@@ -17,9 +17,24 @@ constexpr uint32_t kWhite = design::Primary;
 constexpr uint32_t kWarning = design::Warning;
 constexpr uint32_t kTimeouts[] = {5000, 10000, 30000, 60000, 0};
 
-enum class WatchScreen { Home, Launcher, Activity, Settings, Wifi, Bluetooth, Brightness, Timeout, Timer, Stopwatch, Weather };
+enum class WatchScreen { Home, Launcher, Activity, Settings, Wifi, Bluetooth, Brightness, Timeout, Timer, Stopwatch, Weather, Notification, Pairing, ForgetPhone, Media };
 static WatchScreen current_screen = WatchScreen::Home;
-static lv_obj_t *screens[11] = {};
+static lv_obj_t *screens[15] = {};
+static lv_obj_t *media_title, *media_artist, *media_status, *media_previous, *media_toggle, *media_next;
+static lv_obj_t *media_volume_down, *media_volume_up;
+static lv_obj_t *media_record = nullptr;
+static bool media_playing = false, media_record_spinning = false;
+static void refresh_media_record();
+static watch_ui_media_command_cb_t media_callback = nullptr;
+static uint32_t media_session = 0;
+static lv_obj_t *pairing_code, *pairing_accept, *pairing_reject, *security_label, *forget_phone_button;
+static uint32_t pairing_token;
+static WatchScreen pairing_return = WatchScreen::Home;
+static watch_ui_pairing_cb_t pairing_callback = nullptr;
+static watch_ui_forget_phone_cb_t forget_callback = nullptr;
+static lv_obj_t *notification_app, *notification_title, *notification_body;
+static WatchScreen notification_return = WatchScreen::Home;
+static watch_ui_notification_dismiss_cb_t notification_dismiss_callback = nullptr;
 static lv_obj_t *forecast_status, *forecast_names[7], *forecast_values[7], *forecast_icons[7];
 static watch_ui_forecast_day_t forecast_days[7] = {};
 static bool forecast_online = false;
@@ -94,6 +109,7 @@ static void navigate_to(WatchScreen screen)
     if (screen == current_screen) return;
     lv_screen_load_anim(screen_for(screen), navigation_animation(current_screen, screen), design::TransitionMs, 0, false);
     current_screen = screen;
+    refresh_media_record();
     refresh_time_tools();
     if (screen == WatchScreen::Weather) render_forecast();
 }
@@ -108,6 +124,7 @@ static void open_timeout_cb(lv_event_t *) { navigate_to(WatchScreen::Timeout); }
 static void open_timer_cb(lv_event_t *) { navigate_to(WatchScreen::Timer); }
 static void open_stopwatch_cb(lv_event_t *) { navigate_to(WatchScreen::Stopwatch); }
 static void open_weather_cb(lv_event_t *) { navigate_to(WatchScreen::Weather); }
+static void open_media_cb(lv_event_t *) { navigate_to(WatchScreen::Media); }
 static void step_goal_changed_cb(lv_event_t *event)
 {
     const bool increase = lv_event_get_target(event) == goal_plus;
@@ -142,6 +159,16 @@ static void wifi_action_cb(lv_event_t *)
 }
 static void back_cb(lv_event_t *)
 {
+    if (current_screen == WatchScreen::Pairing) {
+        if (pairing_callback) pairing_callback(pairing_token, false);
+        return;
+    }
+    if (current_screen == WatchScreen::ForgetPhone) { navigate_to(WatchScreen::Bluetooth); return; }
+    if (current_screen == WatchScreen::Notification) {
+        if (notification_dismiss_callback) notification_dismiss_callback();
+        else watch_ui_hide_notification();
+        return;
+    }
     const bool settings_child = current_screen == WatchScreen::Wifi || current_screen == WatchScreen::Bluetooth ||
         current_screen == WatchScreen::Brightness || current_screen == WatchScreen::Timeout;
     navigate_to(current_screen == WatchScreen::Launcher || current_screen == WatchScreen::Settings ?
@@ -222,7 +249,7 @@ static lv_obj_t *create_screen(WatchScreen id, const char *title)
         lv_obj_t *heading_label = label(screen, heading, design::title(), kWhite, LV_ALIGN_TOP_MID, 0, design::HeaderY);
         lv_obj_set_style_text_letter_space(heading_label, 2, 0);
         const bool parent_screen = id == WatchScreen::Launcher || id == WatchScreen::Settings;
-        button(screen, parent_screen ? LV_SYMBOL_HOME "  HOME" : LV_SYMBOL_LEFT "  BACK",
+        button(screen, id == WatchScreen::Notification ? LV_SYMBOL_CLOSE "  DISMISS" : parent_screen ? LV_SYMBOL_HOME "  HOME" : LV_SYMBOL_LEFT "  BACK",
                240, design::TouchHeight, LV_ALIGN_BOTTOM_MID, 0, -design::BackInset, back_cb);
     }
     return screen;
@@ -442,12 +469,16 @@ static lv_obj_t *app_tile(lv_obj_t *screen, const char *text, const char *symbol
 static void create_launcher_screen()
 {
     lv_obj_t *screen = create_screen(WatchScreen::Launcher, "Apps");
-    lv_obj_t *activity = app_tile(screen, "ACTIVITY", "", -design::TileOffset, design::TileFirstY, design::Activity, open_activity_cb);
+    lv_obj_t *activity = app_tile(screen, "ACTIVITY", "", -design::TileOffset, 84, design::Activity, open_activity_cb);
+    lv_obj_set_height(activity, 116);
     lv_obj_t *activity_icon = footprints_icon(activity, 36, design::Activity);
     lv_obj_align(activity_icon, LV_ALIGN_TOP_MID, 0, 26);
-    app_tile(screen, "TIMER", LV_SYMBOL_BELL, design::TileOffset, design::TileFirstY, design::Timer, open_timer_cb);
-    app_tile(screen, "STOPWATCH", LV_SYMBOL_PLAY, -design::TileOffset, design::TileSecondY, design::Stopwatch, open_stopwatch_cb);
-    lv_obj_t *weather = app_tile(screen, "WEATHER", "", design::TileOffset, design::TileSecondY, design::Weather, open_weather_cb);
+    lv_obj_set_height(app_tile(screen, "TIMER", LV_SYMBOL_BELL, design::TileOffset, 84, design::Timer, open_timer_cb), 116);
+    lv_obj_set_height(app_tile(screen, "STOPWATCH", LV_SYMBOL_PLAY, -design::TileOffset, 216, design::Stopwatch, open_stopwatch_cb), 116);
+    lv_obj_t *weather = app_tile(screen, "WEATHER", "", design::TileOffset, 216, design::Weather, open_weather_cb);
+    lv_obj_set_height(weather, 116);
+    auto *media = button(screen, LV_SYMBOL_AUDIO "  MEDIA", design::ContentWidth, 56, LV_ALIGN_TOP_MID, 0, 348, open_media_cb);
+    lv_obj_set_style_text_color(lv_obj_get_child(media, 0), lv_color_hex(design::Timeout), 0);
     lv_obj_t *icon = lv_obj_create(weather);
     lv_obj_remove_style_all(icon);
     lv_obj_set_size(icon, 36, 36);
@@ -531,12 +562,15 @@ static void create_bluetooth_screen()
           LV_ALIGN_TOP_MID, 0, 130);
     bluetooth_detail_label = label(screen, "Disabled", &lv_font_montserrat_26, kMuted,
                                    LV_ALIGN_TOP_MID, 0, 192);
-    label(screen, "ESP32 Smartwatch", &lv_font_montserrat_18, kMuted,
-          LV_ALIGN_TOP_MID, 0, 244);
+    security_label = label(screen, "No paired phone", &lv_font_montserrat_16, kMuted,
+          LV_ALIGN_TOP_MID, 0, 236);
     bluetooth_action = button(screen, "Enable Bluetooth", 300, 64, LV_ALIGN_TOP_MID, 0, 314,
                               bluetooth_action_cb);
     bluetooth_action_label = lv_obj_get_child(bluetooth_action, 0);
     lv_obj_add_state(bluetooth_action, LV_STATE_DISABLED);
+    forget_phone_button = button(screen, "Forget paired phone", 300, 48, LV_ALIGN_TOP_MID, 0, 388,
+        [](lv_event_t *) { navigate_to(WatchScreen::ForgetPhone); });
+    lv_obj_add_state(forget_phone_button, LV_STATE_DISABLED);
 }
 
 static void create_activity_screen()
@@ -822,6 +856,113 @@ static void create_time_tools()
     lv_timer_create(time_tools_tick, 100, nullptr);
 }
 
+static void create_notification_screen()
+{
+    lv_obj_t *screen = create_screen(WatchScreen::Notification, "Notification");
+    notification_app = label(screen, "PHONE", design::body(), kMuted, LV_ALIGN_TOP_LEFT, design::Margin, 82);
+    lv_obj_set_width(notification_app, design::ContentWidth);
+    lv_label_set_long_mode(notification_app, LV_LABEL_LONG_DOT);
+    lv_obj_t *content = lv_obj_create(screen);
+    lv_obj_remove_style_all(content);
+    lv_obj_set_size(content, design::ContentWidth, 298);
+    lv_obj_align(content, LV_ALIGN_TOP_LEFT, design::Margin, 114);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(content, 16, 0);
+    lv_obj_set_scroll_dir(content, LV_DIR_VER);
+    notification_title = label(content, "", design::title(), kWhite, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_set_width(notification_title, design::ContentWidth);
+    lv_label_set_long_mode(notification_title, LV_LABEL_LONG_WRAP);
+    notification_body = label(content, "", design::body(), kWhite, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_set_width(notification_body, design::ContentWidth);
+    lv_label_set_long_mode(notification_body, LV_LABEL_LONG_WRAP);
+}
+static void create_security_screens()
+{
+    auto *screen = create_screen(WatchScreen::Pairing, "Pair phone");
+    auto *info = label(screen, "Compare this code with the phone.\nAccept only if both codes match.", design::body(), kWhite, LV_ALIGN_TOP_MID, 0, 110);
+    lv_obj_set_width(info, design::ContentWidth); lv_obj_set_style_text_align(info, LV_TEXT_ALIGN_CENTER, 0);
+    pairing_code = label(screen, "000000", &lv_font_montserrat_48, design::Bluetooth, LV_ALIGN_TOP_MID, 0, 210);
+    auto respond = [](lv_event_t *event) {
+        if (pairing_callback && pairing_callback(pairing_token, lv_event_get_target(event) == pairing_accept)) {
+            lv_obj_add_state(pairing_accept, LV_STATE_DISABLED); lv_obj_add_state(pairing_reject, LV_STATE_DISABLED);
+        }
+    };
+    pairing_accept = button(screen, "ACCEPT", 148, 64, LV_ALIGN_TOP_MID, -84, 320, respond);
+    pairing_reject = button(screen, "REJECT", 148, 64, LV_ALIGN_TOP_MID, 84, 320, respond);
+    screen = create_screen(WatchScreen::ForgetPhone, "Forget phone?");
+    info = label(screen, "Remove the trusted phone and keys?\n\nAlso forget ESP32 Smartwatch in\nAndroid Bluetooth settings before\npairing again.", design::body(), kWhite, LV_ALIGN_TOP_MID, 0, 114);
+    lv_obj_set_width(info, design::ContentWidth); lv_obj_set_style_text_align(info, LV_TEXT_ALIGN_CENTER, 0);
+    button(screen, "FORGET", 148, 64, LV_ALIGN_TOP_MID, -84, 320, [](lv_event_t *) {
+        if (forget_callback && forget_callback()) navigate_to(WatchScreen::Bluetooth);
+    });
+    button(screen, "CANCEL", 148, 64, LV_ALIGN_TOP_MID, 84, 320, [](lv_event_t *) { navigate_to(WatchScreen::Bluetooth); });
+}
+static void rotate_media_record(void *object, int32_t angle)
+{
+    lv_arc_set_rotation(static_cast<lv_obj_t *>(object), static_cast<uint16_t>(angle));
+}
+static void refresh_media_record()
+{
+    if (!media_record) return;
+    const bool spin = media_playing && display_active && current_screen == WatchScreen::Media;
+    if (spin == media_record_spinning) return;
+    media_record_spinning = spin;
+    lv_anim_delete(media_record, rotate_media_record);
+    if (!spin) return; // Keep current record position when paused/hidden/asleep.
+    lv_anim_t animation;
+    lv_anim_init(&animation);
+    lv_anim_set_var(&animation, media_record);
+    lv_anim_set_exec_cb(&animation, rotate_media_record);
+    lv_anim_set_values(&animation, 0, 360);
+    lv_anim_set_duration(&animation, 4000);
+    lv_anim_set_repeat_count(&animation, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_start(&animation);
+}
+static void create_media_screen()
+{
+    auto *screen = create_screen(WatchScreen::Media, "Media");
+    media_status = label(screen, "MEDIA UNAVAILABLE", design::caption(), kMuted, LV_ALIGN_TOP_MID, 0, 86);
+    media_title = label(screen, "Media unavailable", &lv_font_montserrat_30, kWhite, LV_ALIGN_TOP_MID, 0, 150);
+    lv_obj_set_size(media_title, design::ContentWidth, LV_SIZE_CONTENT);
+    lv_obj_set_style_max_height(media_title, 80, 0);
+    lv_obj_set_style_text_align(media_title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(media_title, LV_LABEL_LONG_DOT);
+    media_artist = label(screen, "", design::body(), kMuted, LV_ALIGN_TOP_MID, 0, 252);
+    lv_obj_set_size(media_artist, design::ContentWidth, LV_SIZE_CONTENT);
+    lv_obj_set_style_max_height(media_artist, 48, 0);
+    lv_obj_set_style_text_align(media_artist, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(media_artist, LV_LABEL_LONG_DOT);
+    auto command = [](lv_event_t *event) {
+        const auto *target = lv_event_get_target(event);
+        const uint8_t value = target == media_previous ? 1 : target == media_toggle ? 2 : target == media_next ? 3 : target == media_volume_down ? 4 : 5;
+        if (media_callback && !media_callback(value, media_session)) lv_label_set_text(media_status, "COMMAND UNAVAILABLE / RETRY");
+    };
+    media_previous = button(screen, LV_SYMBOL_PREV, 64, 64, LV_ALIGN_TOP_MID, -112, 266, command);
+    media_toggle = button(screen, LV_SYMBOL_PLAY, 80, 80, LV_ALIGN_TOP_MID, 0, 258, command);
+    media_next = button(screen, LV_SYMBOL_NEXT, 64, 64, LV_ALIGN_TOP_MID, 112, 266, command);
+    lv_obj_t *playback_controls[] = {media_previous, media_toggle, media_next};
+    for (auto *control : playback_controls)
+        lv_obj_set_style_radius(control, LV_RADIUS_CIRCLE, 0);
+    // Original lightweight record groove/highlight; no artwork or image rotation.
+    media_record = lv_arc_create(media_toggle);
+    lv_obj_set_size(media_record, 68, 68);
+    lv_obj_center(media_record);
+    lv_arc_set_bg_angles(media_record, 0, 360);
+    lv_arc_set_angles(media_record, 0, 52);
+    lv_obj_set_style_arc_width(media_record, 2, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(media_record, lv_color_hex(design::Border), LV_PART_MAIN);
+    lv_obj_set_style_arc_width(media_record, 3, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(media_record, lv_color_hex(design::Timeout), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(media_record, LV_OPA_TRANSP, LV_PART_KNOB);
+    lv_obj_remove_flag(media_record, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(media_record, LV_OBJ_FLAG_SCROLLABLE);
+    media_volume_down = button(screen, "-", 56, 56, LV_ALIGN_TOP_MID, -100, 346, command);
+    media_volume_up = button(screen, "+", 56, 56, LV_ALIGN_TOP_MID, 100, 346, command);
+    lv_obj_set_style_radius(media_volume_down, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_radius(media_volume_up, LV_RADIUS_CIRCLE, 0);
+    label(screen, LV_SYMBOL_VOLUME_MID "  VOLUME", design::caption(), kMuted, LV_ALIGN_TOP_MID, 0, 364);
+    watch_ui_set_media(0, 0, 0, "", "");
+}
 } // namespace
 
 void watch_ui_create(void)
@@ -835,6 +976,9 @@ void watch_ui_create(void)
     create_bluetooth_screen();
     create_time_tools();
     create_forecast_screen();
+    create_notification_screen();
+    create_security_screens();
+    create_media_screen();
     current_screen = WatchScreen::Home;
 }
 
@@ -842,9 +986,67 @@ void watch_ui_set_display_active(bool active)
 {
     const bool changed = display_active != active;
     display_active = active;
+    refresh_media_record();
     if (changed && active) {
         time_tools_tick(nullptr);
         refresh_time_tools(); // IDLE may have consumed the last changed second without drawing.
+    }
+}
+
+void watch_ui_set_notification_dismiss_callback(watch_ui_notification_dismiss_cb_t callback) { notification_dismiss_callback = callback; }
+void watch_ui_show_notification(const char *app, const char *title, const char *body)
+{
+    if (current_screen != WatchScreen::Notification) notification_return = current_screen;
+    lv_label_set_text(notification_app, app && *app ? app : "Phone");
+    lv_label_set_text(notification_title, title ? title : "");
+    lv_label_set_text(notification_body, body ? body : "");
+    lv_obj_scroll_to_y(lv_obj_get_parent(notification_body), 0, LV_ANIM_OFF);
+    navigate_to(WatchScreen::Notification);
+}
+void watch_ui_hide_notification(void)
+{
+    if (current_screen == WatchScreen::Notification) navigate_to(notification_return);
+}
+void watch_ui_set_security_callbacks(watch_ui_pairing_cb_t pairing, watch_ui_forget_phone_cb_t forget)
+{
+    pairing_callback = pairing; forget_callback = forget;
+}
+void watch_ui_show_pairing(uint32_t token, uint32_t code)
+{
+    if (current_screen != WatchScreen::Pairing) pairing_return = current_screen;
+    pairing_token = token;
+    lv_label_set_text_fmt(pairing_code, "%06lu", static_cast<unsigned long>(code));
+    lv_obj_remove_state(pairing_accept, LV_STATE_DISABLED); lv_obj_remove_state(pairing_reject, LV_STATE_DISABLED);
+    navigate_to(WatchScreen::Pairing);
+}
+void watch_ui_hide_pairing(void) { if (current_screen == WatchScreen::Pairing) navigate_to(pairing_return); }
+void watch_ui_set_security_status(const char *text, bool has_phone)
+{
+    lv_label_set_text(security_label, text ? text : "No paired phone");
+    if (has_phone && forget_callback) lv_obj_remove_state(forget_phone_button, LV_STATE_DISABLED);
+    else lv_obj_add_state(forget_phone_button, LV_STATE_DISABLED);
+}
+void watch_ui_set_media_callback(watch_ui_media_command_cb_t callback) { media_callback = callback; }
+void watch_ui_set_media(uint8_t state, uint8_t actions, uint32_t session, const char *title, const char *artist)
+{
+    media_session = session;
+    media_playing = state == 1 && session != 0;
+    refresh_media_record();
+    lv_label_set_text(media_status, state == 1 ? "PLAYING" : state == 2 ? "PAUSED" : "MEDIA UNAVAILABLE");
+    lv_label_set_text(media_title, state && title && *title ? title : state ? "Unknown track" : "Media unavailable");
+    if (state) lv_label_set_text_fmt(media_artist, "Artist: %s", artist && *artist ? artist : "Unknown artist");
+    else lv_label_set_text(media_artist, "");
+    lv_obj_update_layout(media_title);
+    lv_obj_update_layout(media_artist);
+    const int title_height = lv_obj_get_height(media_title), artist_height = lv_obj_get_height(media_artist);
+    const int text_y = 110 + (140 - title_height - 8 - artist_height) / 2;
+    lv_obj_align(media_title, LV_ALIGN_TOP_MID, 0, text_y);
+    lv_obj_align(media_artist, LV_ALIGN_TOP_MID, 0, text_y + title_height + 8);
+    lv_label_set_text(lv_obj_get_child(media_toggle, 0), state == 1 ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+    lv_obj_t *buttons[] = {media_previous, media_toggle, media_next, media_volume_down, media_volume_up};
+    for (unsigned i=0; i<5; ++i) {
+        if (state && session && (actions & (1 << i))) lv_obj_remove_state(buttons[i], LV_STATE_DISABLED);
+        else lv_obj_add_state(buttons[i], LV_STATE_DISABLED);
     }
 }
 
