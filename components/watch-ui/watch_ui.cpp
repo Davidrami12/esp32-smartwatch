@@ -922,7 +922,7 @@ static void create_media_screen()
 {
     auto *screen = create_screen(WatchScreen::Media, "Media");
     media_status = label(screen, "MEDIA UNAVAILABLE", design::caption(), kMuted, LV_ALIGN_TOP_MID, 0, 86);
-    media_title = label(screen, "Media unavailable", &lv_font_montserrat_30, kWhite, LV_ALIGN_TOP_MID, 0, 150);
+    media_title = label(screen, "Media unavailable", watch_font_30(), kWhite, LV_ALIGN_TOP_MID, 0, 150);
     lv_obj_set_size(media_title, design::ContentWidth, LV_SIZE_CONTENT);
     lv_obj_set_style_max_height(media_title, 80, 0);
     lv_obj_set_style_text_align(media_title, LV_TEXT_ALIGN_CENTER, 0);

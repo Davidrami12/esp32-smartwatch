@@ -122,6 +122,20 @@ int main()
     lv_init();
     lv_display_create(410, 502);
     watch_ui_create();
+    const uint32_t spanish_glyphs[] = {0x00a1, 0x00bf, 0x00c1, 0x00c9, 0x00cd, 0x00d1, 0x00d3, 0x00da,
+        0x00dc, 0x00e1, 0x00e9, 0x00ed, 0x00f1, 0x00f3, 0x00fa, 0x00fc};
+    const lv_font_t *spanish_fonts[] = {watch_font_18(), watch_font_26(), watch_font_30()};
+    for (const auto *font : spanish_fonts) {
+        for (const auto codepoint : spanish_glyphs) {
+            lv_font_glyph_dsc_t glyph = {};
+            assert(lv_font_get_glyph_dsc(font, &glyph, codepoint, 0));
+            assert(!glyph.is_placeholder && glyph.box_w > 0 && glyph.box_h > 0);
+        }
+        lv_font_glyph_dsc_t ascii = {};
+        assert(lv_font_get_glyph_dsc(font, &ascii, 'A', 0) && !ascii.is_placeholder);
+        lv_font_glyph_dsc_t icon = {};
+        assert(lv_font_get_glyph_dsc(font, &icon, 0xf04b, 0) && !icon.is_placeholder);
+    }
     watch_ui_set_media(1, 7, 99, "A readable track", "Artist");
     static unsigned media_commands = 0;
     watch_ui_set_media_callback([](uint8_t command, uint32_t token) { assert(command == 2 && token == 99); ++media_commands; return true; });
@@ -136,7 +150,7 @@ int main()
     assert(lv_obj_get_style_text_align(media_title, LV_PART_MAIN) == LV_TEXT_ALIGN_CENTER);
     lv_obj_update_layout(media_title);
     assert(lv_obj_get_y(media_artist) == lv_obj_get_y(media_title) + lv_obj_get_height(media_title) + 8);
-    assert(lv_obj_get_style_text_font(media_title, LV_PART_MAIN) == &lv_font_montserrat_30);
+    assert(lv_obj_get_style_text_font(media_title, LV_PART_MAIN) == watch_font_30());
     watch_ui_set_media(1, 7, 99, "A deliberately long song name that spans many lines and must remain safely bounded above the playback controls even with extra descriptive words", "An artist name that is also deliberately long to exercise wrapping");
     lv_obj_update_layout(media_artist);
     assert(lv_obj_get_height(media_title) <= 80 && lv_obj_get_height(media_artist) <= 48);

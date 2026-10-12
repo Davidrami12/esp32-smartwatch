@@ -38,6 +38,12 @@ else()
 endif()
 
 # Main include files of the project
+set(WATCH_FONT_SOURCES
+    ../../components/watch-ui/watch_fonts.cpp
+    ../../components/watch-ui/fonts/watch_latin_18.c
+    ../../components/watch-ui/fonts/watch_latin_26.c
+    ../../components/watch-ui/fonts/watch_latin_30.c
+)
 include_directories(${PROJECT_SOURCE_DIR}/main/inc)
 
 # Define options for LVGL with default values (OFF)
@@ -74,11 +80,12 @@ set(
     src/mouse_cursor_icon.c
     src/hal/hal.c
     ../../components/watch-ui/watch_ui.cpp
+    ${WATCH_FONT_SOURCES}
 )
 set(MAIN_LIBS lvgl lvgl::examples lvgl::demos lvgl::thorvg ${SDL2_LIBRARIES})
 
 # Explicitly built headless integration tests; not part of normal firmware/simulator startup.
-add_executable(watch_ui_tools_tests EXCLUDE_FROM_ALL ../../tests/time_tools_ui_host.cpp)
+add_executable(watch_ui_tools_tests EXCLUDE_FROM_ALL ../../tests/time_tools_ui_host.cpp ${WATCH_FONT_SOURCES})
 target_include_directories(watch_ui_tools_tests PRIVATE ../../components/watch-ui)
 target_link_libraries(watch_ui_tools_tests PRIVATE ${MAIN_LIBS})
 

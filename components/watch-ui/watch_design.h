@@ -1,5 +1,6 @@
 #pragma once
 #include "lvgl.h"
+#include "watch_fonts.h"
 
 // One fixed AMOLED design, not a theme engine. Layout dimensions target 410 x 502.
 namespace watch_design {
@@ -25,8 +26,8 @@ constexpr int HomeGap = 32, DateHeight = 24;
 constexpr int DateY = ClockY + ClockHeight + HomeGap;
 constexpr int WeatherY = DateY + DateHeight + HomeGap, WeatherHeight = 112;
 constexpr int ActivityCountY = 98, HistoryY = 200, HistoryRow = 28;
-inline const lv_font_t *body() { return &lv_font_montserrat_18; }
+inline const lv_font_t *body() { return watch_font_18(); }
 inline const lv_font_t *caption() { return &lv_font_montserrat_14; }
-inline const lv_font_t *title() { return &lv_font_montserrat_26; }
+inline const lv_font_t *title() { return watch_font_26(); }
 inline const lv_font_t *number() { return &lv_font_montserrat_48; }
 }

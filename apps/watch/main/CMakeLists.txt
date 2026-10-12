@@ -18,6 +18,10 @@ idf_component_register(
         watch_notifications.cpp
         ${LV_DEMOS_SOURCES}
         ../../../components/watch-ui/watch_ui.cpp
+        ../../../components/watch-ui/watch_fonts.cpp
+        ../../../components/watch-ui/fonts/watch_latin_18.c
+        ../../../components/watch-ui/fonts/watch_latin_26.c
+        ../../../components/watch-ui/fonts/watch_latin_30.c
     INCLUDE_DIRS
         .
         ${LV_DEMO_DIR}

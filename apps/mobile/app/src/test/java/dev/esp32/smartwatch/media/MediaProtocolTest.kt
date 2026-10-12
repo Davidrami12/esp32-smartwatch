@@ -3,6 +3,15 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class MediaProtocolTest {
+    @Test fun spanishPrecomposedAndCombiningAccents() {
+        val title = "\u00a1Espa\u00f1a! \u00bfS\u00ed? \u00c1\u00c9\u00cd\u00d3\u00da \u00e1\u00e9\u00ed\u00f3\u00fa \u00fc \u00d1"
+        assertEquals(title, MediaProtocol.normalized(1, 7, 99, title, "Artista").title)
+        assertEquals("Espa\u00f1a, canci\u00f3n, ping\u00fcino", MediaProtocol.normalized(1, 7, 99,
+            "Espan\u0303a, cancio\u0301n, pingu\u0308ino", "Artista").title)
+        assertEquals("\u00f1", MediaProtocol.normalized(1, 7, 99, "n\u0303", "Artista").title)
+        assertEquals("", dev.esp32.smartwatch.notifications.NotificationPolicy.sanitize("n\u0303", 1))
+        assertEquals("\u00f1", dev.esp32.smartwatch.notifications.NotificationPolicy.sanitize("n\u0303", 2))
+    }
     @Test fun boundedFramesAndUnavailable() {
         val value = MediaProtocol.normalized(1, 7, 0xffffffffL, "é".repeat(200), "a".repeat(200))
         assertEquals(144, value.title.toByteArray().size); assertEquals(96, value.artist.toByteArray().size)

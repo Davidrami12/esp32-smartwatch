@@ -1,5 +1,7 @@
 package dev.esp32.smartwatch.notifications
 
+import java.text.Normalizer
+
 data class PhoneNotification(val packageName: String, val appLabel: String, val title: String, val body: String, val timestamp: Long)
 
 object NotificationPolicy {
@@ -13,7 +15,7 @@ object NotificationPolicy {
         return PhoneNotification(pkg, sanitize(label, 48).ifEmpty { sanitize(packageName, 48) }, heading, text, timestamp.coerceAtLeast(0))
     }
     fun sanitize(value: String?, maxBytes: Int): String {
-        val clean = value.orEmpty().take(4096).codePoints().toArray().asSequence().mapNotNull { cp ->
+        val clean = Normalizer.normalize(value.orEmpty().take(4096), Normalizer.Form.NFC).codePoints().toArray().asSequence().mapNotNull { cp ->
             when {
                 Character.isWhitespace(cp) -> ' '
                 cp in 32..126 || cp in 160..255 -> cp.toChar()
