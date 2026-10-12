@@ -1,5 +1,18 @@
 # Android companion — secure background BLE, controls, notifications and media
 
+## Health Connect steps (TFM)
+
+Official Health Connect SDK, write-steps-only permission, explicit Sync now and
+optional batched automatic sync in the existing companion service. Grant access
+from the new Health Connect card; inspect records in Health Connect, not a new
+health-reading API in this app. Today and existing seven-day recorded history need
+the secured dated-activity `000d` firmware extension; older undated telemetry is
+never assigned a guessed phone date. Daily aggregates retain watch offsets and do
+not represent precise walking timestamps. Stable watch/date IDs and durable versions
+upsert the watch's records without adding the entire total again on each refresh.
+Privacy rationale is accessible both in the app and from Health Connect permissions.
+Full strategy, limitations and validation: `../../docs/mobile-health-connect.md`.
+
 Kotlin / Compose / native Android BLE, designed for the Google Pixel 10 Pro.
 `../../docs/ble-protocol.md` remains the protocol authority. Media requires the
 additive media-enabled firmware; older secured v1 firmware retains existing features.

@@ -59,6 +59,8 @@ class WatchRepository(context: Context) {
     private var mediaCommandHandler: ((MediaCommand) -> Unit)? = null
     private var mediaSequence: Int? = null
     private var mediaVolumeSupported = false
+    private var activitySnapshotHandler: (() -> Unit)? = null
+    fun setActivitySnapshotHandler(handler: (() -> Unit)?) { activitySnapshotHandler = handler }
     fun setMediaCommandHandler(handler: ((MediaCommand) -> Unit)?) { mediaCommandHandler = handler }
     fun updateMedia(value: PhoneMedia) {
         latestMedia = value
@@ -366,6 +368,10 @@ class WatchRepository(context: Context) {
             if (supportsMedia) { characteristics[media!!.uuid] = media; characteristics[command!!.uuid] = command }
             mutableState.value = state.value.copy(mediaAvailable = supportsMedia)
             val mediaCapabilities = watch?.getCharacteristic(WatchBleProtocol.MEDIA_CAPABILITIES)
+            val activity = watch?.getCharacteristic(WatchBleProtocol.ACTIVITY)
+            val activityAvailable = activity != null && activity.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0
+            if (activityAvailable) characteristics[WatchBleProtocol.ACTIVITY] = activity!!
+            mutableState.value = state.value.copy(activityAvailable = activityAvailable)
             mediaVolumeSupported = false
             if (supportsMedia && mediaCapabilities != null && mediaCapabilities.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0) {
                 characteristics[mediaCapabilities.uuid] = mediaCapabilities
@@ -412,6 +418,17 @@ class WatchRepository(context: Context) {
                     pending = null
                     nextOperation()
                     return@onSession
+                }
+                if (c.uuid == WatchBleProtocol.ACTIVITY) {
+                    try {
+                        require(status == BluetoothGatt.GATT_SUCCESS)
+                        val activity = dev.esp32.smartwatch.activity.WatchActivityProtocol.decode(source.device.address, snapshot)
+                        mutableState.value = state.value.copy(activity = activity, activityError = if (activity.days.isEmpty()) "Watch calendar is not ready." else null)
+                        activitySnapshotHandler?.invoke()
+                    } catch (_: Exception) {
+                        mutableState.value = state.value.copy(activity = null, activityError = "Dated watch activity unavailable or malformed ($status).")
+                    }
+                    pending = null; nextOperation(); return@onSession
                 }
                 // Firmware intentionally returns ATT Unlikely Error when PMIC data is unavailable.
                 if (c.uuid == WatchBleProtocol.BATTERY && status == 0x0e) {
@@ -618,6 +635,12 @@ class WatchRepository(context: Context) {
     }
 
     fun setBrightness(value: Int) = writeControl(WatchBleProtocol.BRIGHTNESS) { WatchBleProtocol.encodeBrightness(value) }
+    fun requestActivitySnapshot() = safely {
+        if (!state.value.secureLink || state.value.connectionState != ConnectionState.CONNECTED || !state.value.activityAvailable) return@safely
+        if (pending?.uuid == WatchBleProtocol.ACTIVITY || operations.any { it.uuid == WatchBleProtocol.ACTIVITY }) return@safely
+        operations.add(Operation(WatchBleProtocol.ACTIVITY))
+        if (pending == null) nextOperation()
+    }
     fun setScreenTimeout(value: Long) = writeControl(WatchBleProtocol.TIMEOUT) { WatchBleProtocol.encodeTimeout(value) }
     fun setWifiEnabled(value: Boolean) = writeControl(WatchBleProtocol.WIFI_ENABLED) { WatchBleProtocol.encodeWifiEnabled(value) }
 

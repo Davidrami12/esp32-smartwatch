@@ -7,5 +7,8 @@ import dev.esp32.smartwatch.notifications.PhoneNotification
 // Process-local boundary; no GATT object exposed to the listener or Compose.
 class SmartwatchApplication : Application() {
     val companion: CompanionConnection by lazy { CompanionConnection(this) }
+    val health: dev.esp32.smartwatch.health.HealthConnectSyncManager by lazy {
+        dev.esp32.smartwatch.health.HealthConnectSyncManager(this, { companion.state.value }, { companion.repository.requestActivitySnapshot() })
+    }
     fun forwardNotification(item: PhoneNotification) = companion.forwardNotification(item)
 }

@@ -2,6 +2,7 @@
 #include "watch_notifications.h"
 #include "watch_ble_security.h"
 #include "watch_media.h"
+#include "watch_activity.h"
 
 #include <atomic>
 #include <string.h>
@@ -53,7 +54,13 @@ const ble_uuid128_t media_command_uuid = BLE_UUID128_INIT(
     0x00,0x10,0x2f,0x3e,0x4d,0x6c,0x2a,0x9f,0x6d,0x4b,0x7a,0x8e,0x0b,0x00,0x57,0x7e);
 const ble_uuid128_t media_capabilities_uuid = BLE_UUID128_INIT(
     0x00,0x10,0x2f,0x3e,0x4d,0x6c,0x2a,0x9f,0x6d,0x4b,0x7a,0x8e,0x0c,0x00,0x57,0x7e);
-enum class Value { Battery, Version, Steps, Wifi, Brightness, Timeout, WifiEnabled, Notification, Security, Media, MediaCommand, MediaCapabilities };
+const ble_uuid128_t activity_uuid = BLE_UUID128_INIT(
+    0x00,0x10,0x2f,0x3e,0x4d,0x6c,0x2a,0x9f,0x6d,0x4b,0x7a,0x8e,0x0d,0x00,0x57,0x7e);
+enum class Value { Battery, Version, Steps, Wifi, Brightness, Timeout, WifiEnabled, Notification, Security, Media, MediaCommand, MediaCapabilities, Activity };
+Value activity_id = Value::Activity;
+uint8_t activity_bytes[170];
+size_t activity_size = 0;
+int64_t activity_cached_at = 0;
 Value battery_id = Value::Battery, version_id = Value::Version, steps_id = Value::Steps, wifi_id = Value::Wifi;
 Value brightness_id = Value::Brightness, timeout_id = Value::Timeout, wifi_enabled_id = Value::WifiEnabled;
 Value notification_id = Value::Notification;
@@ -99,6 +106,15 @@ int read_value(uint16_t conn_handle, uint16_t, ble_gatt_access_ctxt *context, vo
     // NimBLE reads locally (NONE) to build notifications; only a secure peer can trigger them.
     if (!watch_ble_security_ready(conn_handle == BLE_HS_CONN_HANDLE_NONE ? connection : conn_handle)) return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
     const auto id = *static_cast<Value *>(arg);
+    if (id == Value::Activity) {
+        if (context->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
+        const int64_t now = esp_timer_get_time();
+        // Immutable across Read/Read Blob fragments, even at minimum ATT MTU.
+        if (!activity_size || now-activity_cached_at >= 10'000'000) {
+            activity_size = watch_activity_export(activity_bytes); activity_cached_at = now;
+        }
+        return os_mbuf_append(context->om, activity_bytes, activity_size) ? BLE_ATT_ERR_INSUFFICIENT_RES : 0;
+    }
     if (id == Value::MediaCapabilities) {
         if (context->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
         const uint8_t capability = 1; // Snapshot schema 2 + relative-volume commands.
@@ -180,7 +196,7 @@ int read_value(uint16_t conn_handle, uint16_t, ble_gatt_access_ctxt *context, vo
 }
 
 ble_gatt_chr_def battery_characteristics[2] = {};
-ble_gatt_chr_def watch_characteristics[12] = {};
+ble_gatt_chr_def watch_characteristics[13] = {};
 ble_gatt_svc_def services[3] = {};
 
 void define_characteristic(ble_gatt_chr_def &definition, const ble_uuid_t *uuid, Value *id,
@@ -311,6 +327,7 @@ int gap_event(ble_gap_event *event, void *)
         case BLE_GAP_EVENT_CONNECT:
             if (event->connect.status == 0) {
                 connection = event->connect.conn_handle;
+                activity_size = 0;
                 service_changed_sent = false;
                 if (!enabled.load()) { process_updates(nullptr); break; }
                 state = watch_ble_state_t::Advertising; // ON only after authenticated encryption.
@@ -449,6 +466,7 @@ esp_err_t watch_ble_init(void)
     watch_characteristics[8].flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_ENC | BLE_GATT_CHR_F_WRITE_AUTHEN;
     define_characteristic(watch_characteristics[9], &media_command_uuid.u, &media_command_id, &media_command_handle, true);
     define_characteristic(watch_characteristics[10], &media_capabilities_uuid.u, &media_capabilities_id, nullptr, false);
+    define_characteristic(watch_characteristics[11], &activity_uuid.u, &activity_id, nullptr, false);
     services[0].type = services[1].type = BLE_GATT_SVC_TYPE_PRIMARY;
     services[0].uuid = &battery_service.u;
     services[0].characteristics = battery_characteristics;

@@ -32,6 +32,11 @@ import dev.esp32.smartwatch.ble.WifiState
 import dev.esp32.smartwatch.ble.WatchBleProtocol
 import java.text.NumberFormat
 import kotlin.math.roundToInt
+import androidx.health.connect.client.HealthConnectClient
+import androidx.health.connect.client.PermissionController
+import dev.esp32.smartwatch.health.HealthConnectRepository
+import dev.esp32.smartwatch.health.HealthConnectState
+import dev.esp32.smartwatch.health.HealthPrivacyActivity
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -45,6 +50,11 @@ class MainActivity : ComponentActivity() {
             )) {
                 val model: WatchViewModel = viewModel()
                 val state by model.state.collectAsStateWithLifecycle()
+                val health by model.healthState.collectAsStateWithLifecycle()
+                val healthPermissions = rememberLauncherForActivityResult(PermissionController.createRequestPermissionResultContract()) {
+                    model.healthPermissionResult(it.containsAll(HealthConnectRepository.PERMISSIONS))
+                }
+                LaunchedEffect(model) { model.refreshHealthPermissions() }
                 var permitted by remember { mutableStateOf(model.hasPermissions()) }
                 var notificationAllowed by remember { mutableStateOf(checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) }
                 val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
@@ -61,6 +71,7 @@ class MainActivity : ComponentActivity() {
                         if (event == Lifecycle.Event.ON_START) {
                             permitted = model.hasPermissions()
                             model.refreshNotificationAccess()
+                            model.refreshHealthPermissions()
                             notificationAllowed = checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
                             model.setForeground(true)
                         } else if (event == Lifecycle.Event.ON_STOP) model.setForeground(false)
@@ -77,7 +88,11 @@ class MainActivity : ComponentActivity() {
                     model::setBrightness, model::setScreenTimeout, model::setWifiEnabled,
                     model::resumeCompanion, notificationAllowed,
                     { notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS) },
-                    { startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) }) {
+                    { startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) }, health,
+                    { healthPermissions.launch(HealthConnectRepository.PERMISSIONS) }, model::syncHealthNow,
+                    model::setHealthAutomatic,
+                    { startActivity(Intent(this, HealthPrivacyActivity::class.java)) },
+                    { runCatching { startActivity(Intent(HealthConnectClient.ACTION_HEALTH_CONNECT_SETTINGS)) } }) {
                     startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
                 }
             }
@@ -92,6 +107,8 @@ private fun SmartwatchScreen(
     brightnessChanged: (Int) -> Unit, timeoutChanged: (Long) -> Unit, wifiChanged: (Boolean) -> Unit,
     resumeCompanion: () -> Unit, notificationAllowed: Boolean, notificationPermission: () -> Unit,
     notificationSettings: () -> Unit,
+    health: HealthConnectState, healthPermission: () -> Unit, syncHealth: () -> Unit,
+    healthAutomatic: (Boolean) -> Unit, healthPrivacy: () -> Unit, healthSettings: () -> Unit,
     appSettings: () -> Unit,
 ) {
     val busy = state.connectionState in listOf(ConnectionState.CONNECTING, ConnectionState.PAIRING, ConnectionState.DISCOVERING_SERVICES, ConnectionState.RECONNECTING)
@@ -99,6 +116,7 @@ private fun SmartwatchScreen(
         LazyColumn(modifier = Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(24.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)) {
             item { Text("Smartwatch", fontSize = 34.sp, fontWeight = FontWeight.Bold) }
+            item { HealthConnectCard(health, state, healthPermission, syncHealth, healthAutomatic, healthPrivacy, healthSettings) }
             item {
                 Text(when (state.connectionState) {
                     ConnectionState.DISCONNECTED -> "Disconnected"
@@ -193,6 +211,38 @@ private fun SmartwatchScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant) }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun HealthConnectCard(health: HealthConnectState, watch: WatchState, permission: () -> Unit,
+                              sync: () -> Unit, automatic: (Boolean) -> Unit, privacy: () -> Unit, settings: () -> Unit) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Health Connect", style = MaterialTheme.typography.titleLarge)
+            Text(when (health.availability) {
+                HealthConnectClient.SDK_AVAILABLE -> if (health.permissionGranted) "Write steps · allowed" else "Write steps · not granted"
+                HealthConnectClient.SDK_UNAVAILABLE_PROVIDER_UPDATE_REQUIRED -> "Install or update Health Connect. On Android 14+, check system updates."
+                else -> "Health Connect unavailable on this device/profile."
+            })
+            Text("Watch daily aggregates, not precise walking times. Today and recorded dates in the last 7 days use the watch's timezone.", style = MaterialTheme.typography.bodySmall)
+            Text("Last successful sync: " + (health.lastSyncMillis?.let { java.text.DateFormat.getDateTimeInstance().format(java.util.Date(it)) } ?: "Never"))
+            if (watch.connectionState == ConnectionState.CONNECTED && !watch.activityAvailable) Text("Install activity-enabled firmware to sync dated totals.")
+            if (health.availability == HealthConnectClient.SDK_AVAILABLE && !health.permissionGranted)
+                OutlinedButton(onClick = permission) { Text("Allow Write steps") }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text("Automatic sync", modifier = Modifier.padding(top = 12.dp))
+                Switch(checked = health.automatic, onCheckedChange = automatic)
+            }
+            Text("Batched every 5 minutes while the companion is enabled. Permissions are requested only here.", style = MaterialTheme.typography.bodySmall)
+            Button(onClick = sync, enabled = health.permissionGranted && !health.syncing && watch.secureLink &&
+                watch.connectionState == ConnectionState.CONNECTED && watch.activityAvailable) { Text("Sync now") }
+            if (health.syncing) LinearProgressIndicator(Modifier.fillMaxWidth())
+            health.message?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+            health.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+            TextButton(onClick = privacy) { Text("Privacy & permission rationale") }
+            TextButton(onClick = settings) { Text("Open Health Connect settings") }
         }
     }
 }

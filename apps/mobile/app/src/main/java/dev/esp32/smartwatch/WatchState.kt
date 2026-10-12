@@ -1,6 +1,7 @@
 package dev.esp32.smartwatch
 
 import dev.esp32.smartwatch.ble.WifiState
+import dev.esp32.smartwatch.activity.WatchActivitySnapshot
 
 enum class ConnectionState { DISCONNECTED, SCANNING, CONNECTING, PAIRING, DISCOVERING_SERVICES, CONNECTED, RECONNECTING, ERROR }
 enum class DisconnectReason { NONE, USER_DISCONNECTED, UNEXPECTED_DISCONNECT, SERVICE_STOPPED, SECURITY_FAILURE }
@@ -18,6 +19,9 @@ data class WatchState(
     val devices: List<NearbyWatch> = emptyList(),
     val battery: Int? = null,
     val steps: Long? = null,
+    val activityAvailable: Boolean = false,
+    val activity: WatchActivitySnapshot? = null,
+    val activityError: String? = null,
     val wifiState: WifiState? = null,
     val protocolVersion: Int? = null,
     val brightness: Int? = null,

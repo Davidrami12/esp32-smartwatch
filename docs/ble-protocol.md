@@ -4,8 +4,50 @@ This is the source of truth for the ESP32 firmware and future Android companion.
 The Android companion consumes telemetry and the additive v1 controls extension below.
 Text-only Android notification forwarding is an additional optional v1 extension.
 Native Android media metadata/playback controls are another optional additive v1 extension.
-Credentials, accounts, DFU, weather and history transfer remain excluded.
+Credentials, accounts, DFU and weather transfer remain excluded. Optional dated activity
+history is exposed by the secured read-only extension below.
 All application values are complete snapshots, not increments.
+
+## Dated watch activity extension (`000d`)
+
+Optional `7e57000d-8e7a-4b6d-9f2a-6c4d3e2f1000` is **read-only**, with the same
+trusted-phone, authenticated/encrypted SC, MITM and 16-byte-key checks as existing
+telemetry. Existing `0003` steps and all other payloads remain unchanged. Older
+firmware remains compatible but cannot export Health Connect records: undated
+`0003` must never be assigned the phone's date.
+
+Little-endian payload: byte 0 schema **1**, byte 1 record count **0–7**, followed by
+that many fixed **24-byte** records, newest recorded date first:
+
+| Record offset | Type | Meaning |
+|---|---|---|
+| 0 | uint32 | Watch local calendar date YYYYMMDD |
+| 4 | uint32 | Full watch-owned daily step count, not a delta |
+| 8 | uint32 | Local midnight start, expressed as UTC epoch seconds |
+| 12 | uint32 | Today: snapshot time; completed date: next local midnight, UTC epoch seconds |
+| 16 | int32 | UTC offset seconds at start |
+| 20 | int32 | UTC offset seconds at end |
+
+Length is exactly `2 + 24*count`, maximum 170 bytes. GATT Read/Read Blob supports
+minimum MTU; firmware freezes the snapshot for 10 seconds across fragments and
+resets the cache on connection. Reads can consequently be up to 10 seconds old.
+No writes, CCCD, app credentials or Health Connect SDK exist in firmware.
+
+`watch_activity` exports only records actually present in its bounded current-day/
+six-prior-day window. This intentionally differs from zero-filled UI history.
+Count 0 means unavailable/unreconciled calendar or no exportable records, **not**
+seven zero-step days. Dates outside the window are omitted; zero totals with a real
+stored date are legitimate. A reconciled local date must match the system date;
+midnight transitions wait for the activity worker rather than relabel yesterday.
+The source calendar is currently the firmware's CET/CEST configuration, not the
+phone timezone. DST days use calendar midnight boundaries (23/25 hours as needed).
+
+These are **daily aggregates**, not individual walking timestamps. Android strictly
+validates schema, length, date order/uniqueness, calendar boundaries and offsets.
+It reads after secure connection, once/minute while the existing companion runs,
+and on explicit Sync now, always through the serialized GATT queue. Read failures
+disable that snapshot only; they do not weaken BLE security or disconnect unrelated
+media/notification features. No synthetic data is substituted.
 
 ## Native Android media extension
 
