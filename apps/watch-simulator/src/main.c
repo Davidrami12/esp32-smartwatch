@@ -143,6 +143,8 @@ int main(int argc, char **argv)
   sdl_hal_init(410, 502);
 
   watch_ui_create();
+  // Same game module as firmware; simulator best stays process-local (no NVS).
+  watch_ui_configure_2048(0, (uint32_t)time(NULL), NULL);
 
   watch_ui_set_brightness_callback(
       brightness_changed

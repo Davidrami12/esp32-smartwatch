@@ -48,6 +48,9 @@ void watch_ui_set_security_status(const char *text, bool has_phone);
 typedef bool (*watch_ui_media_command_cb_t)(uint8_t command, uint32_t session);
 void watch_ui_set_media_callback(watch_ui_media_command_cb_t callback);
 void watch_ui_set_media(uint8_t state, uint8_t actions, uint32_t session, const char *title, const char *artist);
+// Game remains RAM-only. Platform callback batches only high-score writes.
+typedef bool (*watch_ui_2048_best_cb_t)(uint32_t best, bool force);
+void watch_ui_configure_2048(uint32_t best, uint32_t random_seed, watch_ui_2048_best_cb_t callback);
 // Daily goal: 1,000-30,000 in increments of 1,000. Callback rejects failed saves.
 typedef bool (*watch_ui_step_goal_cb_t)(uint32_t goal);
 void watch_ui_set_step_goal(uint32_t goal);

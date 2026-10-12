@@ -1,6 +1,7 @@
 #include "watch_ui.h"
 #include "watch_design.h"
 #include "watch_time_tools.h"
+#include "watch_2048.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -17,9 +18,23 @@ constexpr uint32_t kWhite = design::Primary;
 constexpr uint32_t kWarning = design::Warning;
 constexpr uint32_t kTimeouts[] = {5000, 10000, 30000, 60000, 0};
 
-enum class WatchScreen { Home, Launcher, Activity, Settings, Wifi, Bluetooth, Brightness, Timeout, Timer, Stopwatch, Weather, Notification, Pairing, ForgetPhone, Media };
+enum class WatchScreen { Home, Launcher, Activity, Settings, Wifi, Bluetooth, Brightness, Timeout, Timer, Stopwatch, Weather, Notification, Pairing, ForgetPhone, Media, Game2048 };
 static WatchScreen current_screen = WatchScreen::Home;
-static lv_obj_t *screens[15] = {};
+static lv_obj_t *screens[16] = {};
+static Watch2048 game_2048;
+static watch_ui_2048_best_cb_t game_best_callback = nullptr;
+static lv_obj_t *game_score, *game_best, *game_board, *game_tiles[16], *game_values[16];
+static lv_obj_t *game_overlay, *game_dialog_title, *game_dialog_body, *game_dialog_left, *game_dialog_right;
+enum class GameDialog { None, NewGame, Win, Over };
+static GameDialog game_dialog = GameDialog::None;
+static bool game_save_failed = false;
+static void render_game();
+static void game_swipe(lv_dir_t direction);
+static void save_game_best(bool force)
+{
+    if (game_best_callback && game_2048.started)
+        game_save_failed = !game_best_callback(game_2048.best, force);
+}
 static lv_obj_t *media_title, *media_artist, *media_status, *media_previous, *media_toggle, *media_next;
 static lv_obj_t *media_volume_down, *media_volume_up;
 static lv_obj_t *media_record = nullptr;
@@ -107,11 +122,13 @@ static lv_screen_load_anim_t navigation_animation(WatchScreen from, WatchScreen 
 static void navigate_to(WatchScreen screen)
 {
     if (screen == current_screen) return;
+    if (current_screen == WatchScreen::Game2048) save_game_best(true);
     lv_screen_load_anim(screen_for(screen), navigation_animation(current_screen, screen), design::TransitionMs, 0, false);
     current_screen = screen;
     refresh_media_record();
     refresh_time_tools();
     if (screen == WatchScreen::Weather) render_forecast();
+    if (screen == WatchScreen::Game2048) render_game();
 }
 
 static void open_launcher_cb(lv_event_t *) { navigate_to(WatchScreen::Launcher); }
@@ -125,6 +142,11 @@ static void open_timer_cb(lv_event_t *) { navigate_to(WatchScreen::Timer); }
 static void open_stopwatch_cb(lv_event_t *) { navigate_to(WatchScreen::Stopwatch); }
 static void open_weather_cb(lv_event_t *) { navigate_to(WatchScreen::Weather); }
 static void open_media_cb(lv_event_t *) { navigate_to(WatchScreen::Media); }
+static void open_game_cb(lv_event_t *)
+{
+    if (!game_2048.started) game_2048.new_game();
+    navigate_to(WatchScreen::Game2048);
+}
 static void step_goal_changed_cb(lv_event_t *event)
 {
     const bool increase = lv_event_get_target(event) == goal_plus;
@@ -175,18 +197,20 @@ static void back_cb(lv_event_t *)
                 WatchScreen::Home : settings_child ? WatchScreen::Settings : WatchScreen::Launcher);
 }
 
-static void navigation_gesture_cb(lv_event_t *)
+static void process_swipe(lv_dir_t direction)
+{
+    if (current_screen == WatchScreen::Game2048) { game_swipe(direction); return; }
+    if (current_screen == WatchScreen::Home && direction == LV_DIR_LEFT) navigate_to(WatchScreen::Launcher);
+    else if (current_screen != WatchScreen::Home && direction == LV_DIR_RIGHT) back_cb(nullptr);
+}
+static void navigation_gesture_cb(lv_event_t *event)
 {
     lv_indev_t *input = lv_indev_active();
     if (input == nullptr) return;
     const lv_dir_t direction = lv_indev_get_gesture_dir(input);
-    if (current_screen == WatchScreen::Home && direction == LV_DIR_LEFT) {
-        lv_indev_wait_release(input);
-        navigate_to(WatchScreen::Launcher);
-    } else if (current_screen != WatchScreen::Home && direction == LV_DIR_RIGHT) {
-        lv_indev_wait_release(input);
-        back_cb(nullptr);
-    }
+    lv_indev_wait_release(input); // Exactly one game move per touch gesture.
+    if (current_screen == WatchScreen::Game2048 && event) lv_event_stop_bubbling(event);
+    process_swipe(direction);
 }
 
 static void style_surface(lv_obj_t *object)
@@ -477,8 +501,20 @@ static void create_launcher_screen()
     lv_obj_set_height(app_tile(screen, "STOPWATCH", LV_SYMBOL_PLAY, -design::TileOffset, 216, design::Stopwatch, open_stopwatch_cb), 116);
     lv_obj_t *weather = app_tile(screen, "WEATHER", "", design::TileOffset, 216, design::Weather, open_weather_cb);
     lv_obj_set_height(weather, 116);
-    auto *media = button(screen, LV_SYMBOL_AUDIO "  MEDIA", design::ContentWidth, 56, LV_ALIGN_TOP_MID, 0, 348, open_media_cb);
+    auto *media = button(screen, LV_SYMBOL_AUDIO "  MEDIA", design::TileWidth, 56, LV_ALIGN_TOP_MID, -design::TileOffset, 348, open_media_cb);
     lv_obj_set_style_text_color(lv_obj_get_child(media, 0), lv_color_hex(design::Timeout), 0);
+    auto *game = button(screen, "2048", design::TileWidth, 56, LV_ALIGN_TOP_MID, design::TileOffset, 348, open_game_cb);
+    lv_obj_align(lv_obj_get_child(game, 0), LV_ALIGN_CENTER, 14, 0);
+    for (unsigned i = 0; i < 4; ++i) {
+        auto *square = lv_obj_create(game);
+        lv_obj_remove_style_all(square);
+        lv_obj_set_size(square, 8, 8);
+        lv_obj_set_pos(square, 22 + (i % 2) * 12, 18 + (i / 2) * 12);
+        lv_obj_set_style_bg_color(square, lv_color_hex(design::Activity), 0);
+        lv_obj_set_style_bg_opa(square, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(square, 2, 0);
+        lv_obj_remove_flag(square, LV_OBJ_FLAG_CLICKABLE);
+    }
     lv_obj_t *icon = lv_obj_create(weather);
     lv_obj_remove_style_all(icon);
     lv_obj_set_size(icon, 36, 36);
@@ -901,6 +937,123 @@ static void rotate_media_record(void *object, int32_t angle)
 {
     lv_arc_set_rotation(static_cast<lv_obj_t *>(object), static_cast<uint16_t>(angle));
 }
+static void show_game_dialog(GameDialog dialog)
+{
+    game_dialog = dialog;
+    if (dialog == GameDialog::None) { lv_obj_add_flag(game_overlay, LV_OBJ_FLAG_HIDDEN); return; }
+    const bool confirm = dialog == GameDialog::NewGame, win = dialog == GameDialog::Win;
+    lv_label_set_text(game_dialog_title, confirm ? "NEW GAME?" : win ? "2048!" : "GAME OVER");
+    if (confirm) lv_label_set_text(game_dialog_body, "Current progress will be lost.\nBest score will be kept.");
+    else lv_label_set_text_fmt(game_dialog_body, "Score: %lu\nBest: %lu", static_cast<unsigned long>(game_2048.score),
+                               static_cast<unsigned long>(game_2048.best));
+    lv_label_set_text(lv_obj_get_child(game_dialog_left, 0), confirm ? "CANCEL" : win ? "CONTINUE" : "NEW GAME");
+    lv_label_set_text(lv_obj_get_child(game_dialog_right, 0), dialog == GameDialog::Over ? "BACK" : "NEW GAME");
+    lv_obj_remove_flag(game_overlay, LV_OBJ_FLAG_HIDDEN);
+}
+static void render_game()
+{
+    if (!game_score) return;
+    lv_label_set_text_fmt(game_score, "SCORE %lu", static_cast<unsigned long>(game_2048.score));
+    lv_label_set_text_fmt(game_best, "BEST %lu%s", static_cast<unsigned long>(game_2048.best), game_save_failed ? " *" : "");
+    const uint32_t colors[] = {0xBABABA, 0xFFE59A, 0xFFBE75, 0xFFAA55, 0xFF887A, 0xFF6655,
+                              0xFFD166, 0x74DCC8, 0x68D9EF, 0x67A9FF, 0xB8A1FF};
+    for (unsigned i = 0; i < 16; ++i) {
+        const uint32_t tile = game_2048.board[i];
+        unsigned shade = 0; for (uint32_t n = tile; n > 2 && shade < 10; n >>= 1) ++shade;
+        if (tile) lv_label_set_text_fmt(game_values[i], "%lu", static_cast<unsigned long>(tile));
+        else lv_label_set_text(game_values[i], "");
+        const lv_font_t *font = tile <= 64 ? design::title() : tile <= 1024 ? &lv_font_montserrat_22 :
+                                tile <= 65536 ? design::body() : design::caption();
+        lv_obj_set_style_text_font(game_values[i], font, 0);
+        lv_obj_set_style_text_color(game_values[i], lv_color_hex(colors[shade]), 0);
+        lv_obj_set_style_border_color(game_tiles[i], lv_color_hex(tile ? colors[shade] : design::Border), 0);
+        lv_obj_set_style_bg_color(game_tiles[i], lv_color_hex(tile ? 0x151515 : 0x080808), 0);
+    }
+    if (game_dialog == GameDialog::NewGame) return;
+    if (game_2048.win_pending) show_game_dialog(GameDialog::Win);
+    else if (game_2048.game_over) show_game_dialog(GameDialog::Over);
+    else show_game_dialog(GameDialog::None);
+}
+static void game_swipe(lv_dir_t direction)
+{
+    if (!display_active || game_dialog != GameDialog::None) return;
+    Watch2048Direction move;
+    switch (direction) {
+    case LV_DIR_LEFT: move = Watch2048Direction::Left; break;
+    case LV_DIR_RIGHT: move = Watch2048Direction::Right; break;
+    case LV_DIR_TOP: move = Watch2048Direction::Up; break;
+    case LV_DIR_BOTTOM: move = Watch2048Direction::Down; break;
+    default: return;
+    }
+    const uint32_t best = game_2048.best;
+    game_2048.move(move);
+    if (game_2048.best != best) save_game_best(false);
+    if (game_2048.game_over || game_2048.win_pending) save_game_best(true);
+    render_game();
+}
+static void game_reset()
+{
+    save_game_best(true);
+    game_2048.new_game();
+    show_game_dialog(GameDialog::None);
+    render_game();
+}
+static void game_new_cb(lv_event_t *)
+{
+    if (game_2048.moves && !game_2048.game_over) show_game_dialog(GameDialog::NewGame);
+    else game_reset();
+}
+static void game_dialog_left_cb(lv_event_t *)
+{
+    if (game_dialog == GameDialog::NewGame) { show_game_dialog(GameDialog::None); render_game(); }
+    else if (game_dialog == GameDialog::Win) { game_2048.continue_game(); show_game_dialog(GameDialog::None); render_game(); }
+    else if (game_dialog == GameDialog::Over) game_reset();
+}
+static void game_dialog_right_cb(lv_event_t *)
+{
+    if (game_dialog == GameDialog::Over) back_cb(nullptr);
+    else game_reset();
+}
+static void create_game_screen()
+{
+    auto *screen = create_screen(WatchScreen::Game2048, nullptr);
+    label(screen, "2048", design::title(), kWhite, LV_ALIGN_TOP_LEFT, design::Margin, 24);
+    game_best = label(screen, "BEST 0", design::caption(), kMuted, LV_ALIGN_TOP_RIGHT, -design::Margin, 34);
+    game_score = label(screen, "SCORE 0", design::body(), kWhite, LV_ALIGN_TOP_LEFT, design::Margin, 60);
+    game_board = lv_obj_create(screen);
+    lv_obj_remove_style_all(game_board);
+    lv_obj_set_size(game_board, 306, 306);
+    lv_obj_align(game_board, LV_ALIGN_TOP_MID, 0, 98);
+    lv_obj_remove_flag(game_board, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(game_board, static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_GESTURE_BUBBLE));
+    for (unsigned i = 0; i < 16; ++i) {
+        game_tiles[i] = lv_obj_create(game_board);
+        style_surface(game_tiles[i]);
+        lv_obj_set_size(game_tiles[i], 72, 72);
+        lv_obj_set_pos(game_tiles[i], (i % 4) * 78, (i / 4) * 78);
+        lv_obj_remove_flag(game_tiles[i], static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+        lv_obj_add_flag(game_tiles[i], LV_OBJ_FLAG_GESTURE_BUBBLE);
+        game_values[i] = label(game_tiles[i], "", design::title(), kWhite, LV_ALIGN_CENTER, 0, 0);
+    }
+    button(screen, "NEW GAME", 160, 56, LV_ALIGN_TOP_MID, -88, 422, game_new_cb);
+    button(screen, LV_SYMBOL_LEFT "  BACK", 160, 56, LV_ALIGN_TOP_MID, 88, 422, back_cb);
+    // Full-screen input shield; all game dialogs survive notification interruption.
+    game_overlay = lv_obj_create(screen);
+    lv_obj_remove_style_all(game_overlay);
+    lv_obj_set_size(game_overlay, 410, 502);
+    lv_obj_set_style_bg_color(game_overlay, lv_color_hex(design::Black), 0);
+    lv_obj_set_style_bg_opa(game_overlay, LV_OPA_90, 0);
+    lv_obj_remove_flag(game_overlay, static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_GESTURE_BUBBLE));
+    lv_obj_add_flag(game_overlay, LV_OBJ_FLAG_CLICKABLE);
+    game_dialog_title = label(game_overlay, "", design::title(), kWhite, LV_ALIGN_TOP_MID, 0, 132);
+    game_dialog_body = label(game_overlay, "", design::body(), kMuted, LV_ALIGN_TOP_MID, 0, 198);
+    lv_obj_set_width(game_dialog_body, design::ContentWidth);
+    lv_obj_set_style_text_align(game_dialog_body, LV_TEXT_ALIGN_CENTER, 0);
+    game_dialog_left = button(game_overlay, "CANCEL", 160, 56, LV_ALIGN_TOP_MID, -88, 300, game_dialog_left_cb);
+    game_dialog_right = button(game_overlay, "NEW GAME", 160, 56, LV_ALIGN_TOP_MID, 88, 300, game_dialog_right_cb);
+    show_game_dialog(GameDialog::None);
+    render_game();
+}
 static void refresh_media_record()
 {
     if (!media_record) return;
@@ -979,6 +1132,7 @@ void watch_ui_create(void)
     create_notification_screen();
     create_security_screens();
     create_media_screen();
+    create_game_screen();
     current_screen = WatchScreen::Home;
 }
 
@@ -986,6 +1140,7 @@ void watch_ui_set_display_active(bool active)
 {
     const bool changed = display_active != active;
     display_active = active;
+    if (changed && !active) save_game_best(true);
     refresh_media_record();
     if (changed && active) {
         time_tools_tick(nullptr);
@@ -1027,6 +1182,13 @@ void watch_ui_set_security_status(const char *text, bool has_phone)
     else lv_obj_add_state(forget_phone_button, LV_STATE_DISABLED);
 }
 void watch_ui_set_media_callback(watch_ui_media_command_cb_t callback) { media_callback = callback; }
+void watch_ui_configure_2048(uint32_t best, uint32_t random_seed, watch_ui_2048_best_cb_t callback)
+{
+    if (best > game_2048.best) game_2048.best = best;
+    game_2048.random_state = random_seed ? random_seed : 0x20482048;
+    game_best_callback = callback;
+    render_game();
+}
 void watch_ui_set_media(uint8_t state, uint8_t actions, uint32_t session, const char *title, const char *artist)
 {
     media_session = session;

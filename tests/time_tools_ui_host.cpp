@@ -59,6 +59,12 @@ static void notification_protocol_tests()
 static unsigned brightness_calls, commit_calls;
 static uint8_t committed;
 static unsigned goal_calls;
+static unsigned game_save_calls, game_force_calls;
+static uint32_t game_saved_best;
+static bool game_best_test(uint32_t best, bool force)
+{
+    ++game_save_calls; if (force) ++game_force_calls; game_saved_best = best; return true;
+}
 static bool goal_save_ok = true;
 static bool goal_test(uint32_t) { ++goal_calls; return goal_save_ok; }
 static void brightness_test(uint8_t) { ++brightness_calls; }
@@ -136,6 +142,50 @@ int main()
         lv_font_glyph_dsc_t icon = {};
         assert(lv_font_get_glyph_dsc(font, &icon, 0xf04b, 0) && !icon.is_placeholder);
     }
+    watch_ui_configure_2048(100, 42, game_best_test);
+    open_game_cb(nullptr); assert(current_screen == WatchScreen::Game2048);
+    assert(game_2048.started && game_2048.best == 100 && !game_2048.score);
+    assert(lv_obj_has_flag(game_board, LV_OBJ_FLAG_GESTURE_BUBBLE));
+    assert(!lv_obj_has_flag(game_tiles[0], LV_OBJ_FLAG_SCROLLABLE));
+    memset(game_2048.board, 0, sizeof(game_2048.board)); game_2048.board[0] = game_2048.board[1] = 2;
+    process_swipe(LV_DIR_LEFT); assert(game_2048.score == 4 && game_2048.board[0] == 4);
+    const lv_dir_t directions[] = {LV_DIR_RIGHT, LV_DIR_TOP, LV_DIR_BOTTOM};
+    for (auto direction : directions) {
+        memset(game_2048.board, 0, sizeof(game_2048.board)); game_2048.board[5] = 2;
+        const uint32_t moves = game_2048.moves;
+        process_swipe(direction); assert(current_screen == WatchScreen::Game2048 && game_2048.moves == moves + 1);
+    }
+    uint32_t preserved[16]; memcpy(preserved, game_2048.board, sizeof(preserved));
+    watch_ui_set_display_active(false); process_swipe(LV_DIR_LEFT);
+    assert(!memcmp(preserved, game_2048.board, sizeof(preserved)));
+    watch_ui_set_display_active(true);
+    watch_ui_show_notification("Phone", "Incoming", "While playing"); assert(current_screen == WatchScreen::Notification);
+    watch_ui_hide_notification(); assert(current_screen == WatchScreen::Game2048);
+    assert(!memcmp(preserved, game_2048.board, sizeof(preserved)));
+    lv_obj_send_event(find_button(screen_for(WatchScreen::Game2048), "NEW GAME"), LV_EVENT_CLICKED, nullptr);
+    assert(game_dialog == GameDialog::NewGame);
+    process_swipe(LV_DIR_RIGHT); assert(current_screen == WatchScreen::Game2048);
+    assert(!memcmp(preserved, game_2048.board, sizeof(preserved)));
+    watch_ui_show_notification("Phone", "Incoming", "During confirmation"); watch_ui_hide_notification();
+    assert(game_dialog == GameDialog::NewGame);
+    lv_obj_send_event(game_dialog_left, LV_EVENT_CLICKED, nullptr);
+    assert(game_dialog == GameDialog::None && !memcmp(preserved, game_2048.board, sizeof(preserved)));
+    game_new_cb(nullptr); lv_obj_send_event(game_dialog_right, LV_EVENT_CLICKED, nullptr);
+    assert(game_2048.score == 0 && game_2048.best == 100 && game_2048.moves == 0);
+    memset(game_2048.board, 0, sizeof(game_2048.board)); game_2048.board[0] = game_2048.board[1] = 1024;
+    process_swipe(LV_DIR_LEFT); assert(game_dialog == GameDialog::Win && game_saved_best == 2048);
+    lv_obj_send_event(game_dialog_left, LV_EVENT_CLICKED, nullptr);
+    assert(game_dialog == GameDialog::None && game_2048.won && !game_2048.win_pending);
+    const uint32_t no_moves[16] = {2,4,2,4,4,2,4,2,2,4,2,4,4,2,4,2};
+    memcpy(game_2048.board, no_moves, sizeof(no_moves));
+    process_swipe(LV_DIR_RIGHT); assert(game_dialog == GameDialog::Over && current_screen == WatchScreen::Game2048);
+    lv_obj_send_event(game_dialog_right, LV_EVENT_CLICKED, nullptr); assert(current_screen == WatchScreen::Launcher);
+    assert(game_save_calls && game_force_calls && game_saved_best == 2048);
+    open_game_cb(nullptr); assert(game_dialog == GameDialog::Over); // Opening does not reset.
+    lv_obj_send_event(game_dialog_left, LV_EVENT_CLICKED, nullptr);
+    assert(!game_2048.game_over && game_2048.best == 2048 && game_2048.score == 0);
+    back_cb(nullptr); assert(current_screen == WatchScreen::Launcher);
+    back_cb(nullptr); assert(current_screen == WatchScreen::Home);
     watch_ui_set_media(1, 7, 99, "A readable track", "Artist");
     static unsigned media_commands = 0;
     watch_ui_set_media_callback([](uint8_t command, uint32_t token) { assert(command == 2 && token == 99); ++media_commands; return true; });
@@ -365,5 +415,5 @@ int main()
     assert(strcmp(lv_label_get_text(weather_range_label), "H -- / L --") == 0);
     assert(strcmp(lv_label_get_text(forecast_values[0]), "-- / --") == 0);
     back_cb(nullptr); assert(current_screen == WatchScreen::Launcher);
-    puts("PASS: UI +/- callbacks/bounds, navigation, countdown expiry, simultaneous stopwatch, IDLE/wake refresh");
+    puts("PASS: UI controls/navigation/time tools, 2048 swipes/dialogs/notification/IDLE preservation, Spanish glyphs and media layout/animation");
 }

@@ -12,6 +12,9 @@
 #include "watch_notifications.h"
 #include "watch_ble_security.h"
 #include "watch_media.h"
+#include "watch_2048_store.h"
+#include "watch_display_start.h"
+#include "esp_random.h"
 #include <stdio.h>
 #include <time.h>
 #include <stdlib.h>
@@ -703,7 +706,7 @@ extern "C" void app_main(void)
     /* Initialize display */
 
     lv_display_t *display =
-        bsp_display_start();
+        watch_display_start();
 
     if (display == NULL) {
         printf(
@@ -765,6 +768,7 @@ extern "C" void app_main(void)
     watch_ui_set_notification_dismiss_callback(dismiss_notification);
     watch_ui_set_security_callbacks(watch_ble_security_confirm, watch_ble_security_forget);
     watch_ui_set_media_callback(watch_ble_media_command);
+    watch_ui_configure_2048(watch_2048_store_load(), esp_random(), watch_2048_store_best);
     watch_ui_set_wifi_control_callback(ui_wifi_request);
     watch_ui_set_bluetooth_control_callback(ui_bluetooth_request);
 
@@ -833,6 +837,7 @@ extern "C" void app_main(void)
     lv_timer_create(notification_update_cb, 100, nullptr);
     lv_timer_create(security_update_cb, 100, nullptr);
     lv_timer_create(media_update_cb, 100, nullptr);
+    lv_timer_create([](lv_timer_t *) { watch_2048_store_tick(); }, 1000, nullptr);
 
     bsp_display_unlock();
 
