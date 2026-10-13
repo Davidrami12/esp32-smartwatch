@@ -26,6 +26,7 @@ std::atomic<bool> request_pending{false};
 std::atomic<bool> enabled{true}; // Serialized writes by worker; safe snapshot for BLE init.
 nvs_handle_t handle = 0;
 bool storage_ready = false;
+std::atomic<esp_err_t> last_request_result{ESP_OK};
 
 void set_state(watch_wifi_state_t next)
 {
@@ -48,12 +49,13 @@ void event_handler(void *, esp_event_base_t base, int32_t id, void *)
     xQueueSend(queue, &event, portMAX_DELAY);
 }
 
-void persist_intent()
+esp_err_t persist_intent(bool value)
 {
-    if (!storage_ready) return;
-    esp_err_t error = nvs_set_u8(handle, "enabled", enabled ? 1 : 0);
+    if (!storage_ready) return ESP_ERR_INVALID_STATE;
+    esp_err_t error = nvs_set_u8(handle, "enabled", value ? 1 : 0);
     if (error == ESP_OK) error = nvs_commit(handle);
     if (error != ESP_OK) ESP_LOGW(kTag, "Intent persistence failed: %s", esp_err_to_name(error));
+    return error;
 }
 
 void worker(void *)
@@ -64,6 +66,16 @@ void worker(void *)
     while (true) {
         Event event;
         if (xQueueReceive(queue, &event, pdMS_TO_TICKS(500)) == pdTRUE) {
+            if (event == Event::Enable || event == Event::Disable) {
+                // Persist first: rejected requests must not change intent or suppress recovery.
+                const esp_err_t result = persist_intent(event == Event::Enable);
+                last_request_result = result;
+                if (result != ESP_OK) {
+                    if (event == Event::Enable) set_state(watch_wifi_state_t::Disconnected);
+                    request_pending = false;
+                    continue;
+                }
+            }
             switch (event) {
                 case Event::Disable:
                     enabled = false; // Set BEFORE disconnect, so its event cannot reconnect.
@@ -76,7 +88,6 @@ void worker(void *)
                             ESP_LOGW(kTag, "Disconnect failed: %s", esp_err_to_name(error));
                         }
                     }
-                    persist_intent();
                     request_pending = false;
                     break;
                 case Event::Enable:
@@ -84,7 +95,6 @@ void worker(void *)
                     set_state(watch_wifi_state_t::Connecting);
                     attempts = 0;
                     retry_at = esp_timer_get_time();
-                    persist_intent();
                     request_pending = false;
                     break;
                 case Event::Start:
@@ -171,6 +181,19 @@ bool watch_wifi_request_enabled(bool value)
     if (xQueueSend(queue, &event, 0) != pdTRUE) { request_pending = false; return false; }
     if (value) set_state(watch_wifi_state_t::Connecting);
     return true;
+}
+
+esp_err_t watch_wifi_request_enabled_confirmed(bool value)
+{
+    if (request_pending.load()) return ESP_ERR_INVALID_STATE;
+    if (enabled.load() == value) return ESP_OK;
+    if (!watch_wifi_request_enabled(value)) return ESP_ERR_INVALID_STATE;
+    const int64_t deadline = esp_timer_get_time() + 2'000'000;
+    while (request_pending.load()) {
+        if (esp_timer_get_time() >= deadline) return ESP_ERR_TIMEOUT;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    return last_request_result.load();
 }
 
 watch_wifi_state_t watch_wifi_get_state(void) { return state.load(); }

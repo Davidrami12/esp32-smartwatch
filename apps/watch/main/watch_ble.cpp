@@ -1,4 +1,7 @@
 #include "watch_ble.h"
+#include "watch_notifications.h"
+#include "watch_ble_security.h"
+#include "watch_media.h"
 
 #include <atomic>
 #include <string.h>
@@ -34,10 +37,35 @@ const ble_uuid128_t steps_uuid = BLE_UUID128_INIT(
     0x00,0x10,0x2f,0x3e,0x4d,0x6c,0x2a,0x9f,0x6d,0x4b,0x7a,0x8e,0x03,0x00,0x57,0x7e);
 const ble_uuid128_t wifi_uuid = BLE_UUID128_INIT(
     0x00,0x10,0x2f,0x3e,0x4d,0x6c,0x2a,0x9f,0x6d,0x4b,0x7a,0x8e,0x04,0x00,0x57,0x7e);
-enum class Value { Battery, Version, Steps, Wifi };
+const ble_uuid128_t brightness_uuid = BLE_UUID128_INIT(
+    0x00,0x10,0x2f,0x3e,0x4d,0x6c,0x2a,0x9f,0x6d,0x4b,0x7a,0x8e,0x05,0x00,0x57,0x7e);
+const ble_uuid128_t timeout_uuid = BLE_UUID128_INIT(
+    0x00,0x10,0x2f,0x3e,0x4d,0x6c,0x2a,0x9f,0x6d,0x4b,0x7a,0x8e,0x06,0x00,0x57,0x7e);
+const ble_uuid128_t wifi_enabled_uuid = BLE_UUID128_INIT(
+    0x00,0x10,0x2f,0x3e,0x4d,0x6c,0x2a,0x9f,0x6d,0x4b,0x7a,0x8e,0x07,0x00,0x57,0x7e);
+const ble_uuid128_t notification_uuid = BLE_UUID128_INIT(
+    0x00,0x10,0x2f,0x3e,0x4d,0x6c,0x2a,0x9f,0x6d,0x4b,0x7a,0x8e,0x08,0x00,0x57,0x7e);
+const ble_uuid128_t security_uuid = BLE_UUID128_INIT(
+    0x00,0x10,0x2f,0x3e,0x4d,0x6c,0x2a,0x9f,0x6d,0x4b,0x7a,0x8e,0x09,0x00,0x57,0x7e);
+const ble_uuid128_t media_uuid = BLE_UUID128_INIT(
+    0x00,0x10,0x2f,0x3e,0x4d,0x6c,0x2a,0x9f,0x6d,0x4b,0x7a,0x8e,0x0a,0x00,0x57,0x7e);
+const ble_uuid128_t media_command_uuid = BLE_UUID128_INIT(
+    0x00,0x10,0x2f,0x3e,0x4d,0x6c,0x2a,0x9f,0x6d,0x4b,0x7a,0x8e,0x0b,0x00,0x57,0x7e);
+const ble_uuid128_t media_capabilities_uuid = BLE_UUID128_INIT(
+    0x00,0x10,0x2f,0x3e,0x4d,0x6c,0x2a,0x9f,0x6d,0x4b,0x7a,0x8e,0x0c,0x00,0x57,0x7e);
+enum class Value { Battery, Version, Steps, Wifi, Brightness, Timeout, WifiEnabled, Notification, Security, Media, MediaCommand, MediaCapabilities };
 Value battery_id = Value::Battery, version_id = Value::Version, steps_id = Value::Steps, wifi_id = Value::Wifi;
-struct Snapshot { int battery; uint32_t steps; uint8_t wifi; };
-Snapshot values = {-1, 0, 0};
+Value brightness_id = Value::Brightness, timeout_id = Value::Timeout, wifi_enabled_id = Value::WifiEnabled;
+Value notification_id = Value::Notification;
+Value security_id = Value::Security;
+Value media_id = Value::Media, media_command_id = Value::MediaCommand;
+Value media_capabilities_id = Value::MediaCapabilities;
+uint16_t media_command_handle;
+bool media_command_subscribed = false;
+int64_t last_media_command = 0;
+struct Snapshot { int battery; uint32_t steps; uint8_t wifi; uint8_t brightness; uint32_t timeout; };
+Snapshot values = {-1, 0, 0, 60, 10000};
+watch_ble_control_cb_t control_callback = nullptr;
 portMUX_TYPE values_lock = portMUX_INITIALIZER_UNLOCKED;
 std::atomic<watch_ble_state_t> state{watch_ble_state_t::Disabled};
 std::atomic<bool> ready{false};
@@ -45,9 +73,14 @@ std::atomic<bool> enabled{true};
 bool disconnect_requested = false;
 uint8_t address_type;
 uint16_t battery_handle, steps_handle, wifi_handle;
+uint16_t brightness_handle, timeout_handle, wifi_enabled_handle;
+uint16_t service_changed_handle;
+bool service_changed_sent = false;
 uint16_t connection = BLE_HS_CONN_HANDLE_NONE;
 bool battery_subscribed = false, steps_subscribed = false, wifi_subscribed = false;
-Snapshot last_notified = {-1, 0, 0};
+bool brightness_subscribed = false, timeout_subscribed = false, wifi_enabled_subscribed = false;
+Snapshot last_notified = {-1, 0, 0, 60, 10000};
+bool last_wifi_enabled = true;
 int64_t last_step_notify = 0;
 ble_npl_event update_event;
 ble_npl_callout step_callout;
@@ -61,8 +94,70 @@ Snapshot snapshot()
     return result;
 }
 
-int read_value(uint16_t, uint16_t, ble_gatt_access_ctxt *context, void *arg)
+int read_value(uint16_t conn_handle, uint16_t, ble_gatt_access_ctxt *context, void *arg)
 {
+    // NimBLE reads locally (NONE) to build notifications; only a secure peer can trigger them.
+    if (!watch_ble_security_ready(conn_handle == BLE_HS_CONN_HANDLE_NONE ? connection : conn_handle)) return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
+    const auto id = *static_cast<Value *>(arg);
+    if (id == Value::MediaCapabilities) {
+        if (context->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
+        const uint8_t capability = 1; // Snapshot schema 2 + relative-volume commands.
+        return os_mbuf_append(context->om, &capability, 1) ? BLE_ATT_ERR_INSUFFICIENT_RES : 0;
+    }
+    if (id == Value::MediaCommand) {
+        if (context->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
+        const uint8_t noop[8] = {1, 0}; // Reading/subscribing never replays a command.
+        return os_mbuf_append(context->om, noop, sizeof(noop)) ? BLE_ATT_ERR_INSUFFICIENT_RES : 0;
+    }
+    if (id == Value::Media) {
+        if (context->op != BLE_GATT_ACCESS_OP_WRITE_CHR) return BLE_ATT_ERR_READ_NOT_PERMITTED;
+        const size_t length = OS_MBUF_PKTLEN(context->om);
+        if (length < 9 || length > 20) { watch_media_reset(); return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN; }
+        uint8_t bytes[20];
+        if (os_mbuf_copydata(context->om, 0, length, bytes)) return BLE_ATT_ERR_UNLIKELY;
+        return watch_media_receive(bytes, length) < 0 ? BLE_ATT_ERR_VALUE_NOT_ALLOWED : 0;
+    }
+    if (id == Value::Security) {
+        if (context->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
+        const uint8_t bytes[] = {1, 0x0f, 16}; // Schema, encrypted/authenticated/SC/trusted, key bytes.
+        return os_mbuf_append(context->om, bytes, sizeof(bytes)) ? BLE_ATT_ERR_INSUFFICIENT_RES : 0;
+    }
+    if (id == Value::Notification) {
+        if (context->op != BLE_GATT_ACCESS_OP_WRITE_CHR) return BLE_ATT_ERR_READ_NOT_PERMITTED;
+        const size_t length = OS_MBUF_PKTLEN(context->om);
+        if (length < 9 || length > 20) {
+            watch_notifications_reset_transport();
+            ESP_LOGW(kTag, "Rejected notification frame length=%u", static_cast<unsigned>(length));
+            return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        }
+        uint8_t frame[20];
+        if (os_mbuf_copydata(context->om, 0, length, frame)) return BLE_ATT_ERR_UNLIKELY;
+        return watch_notifications_receive(frame, length) < 0 ? BLE_ATT_ERR_VALUE_NOT_ALLOWED : 0;
+    }
+    if (context->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
+        watch_ble_control_t control;
+        if (id == Value::Brightness) control = watch_ble_control_t::Brightness;
+        else if (id == Value::Timeout) control = watch_ble_control_t::ScreenTimeout;
+        else if (id == Value::WifiEnabled) control = watch_ble_control_t::WifiEnabled;
+        else return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
+        const size_t length = OS_MBUF_PKTLEN(context->om);
+        if (length != watch_ble_control_length(control)) {
+            ESP_LOGW(kTag, "Rejected control=%u length=%u", static_cast<unsigned>(control), static_cast<unsigned>(length));
+            return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        }
+        uint8_t bytes[4]; uint32_t value;
+        if (os_mbuf_copydata(context->om, 0, length, bytes) || !watch_ble_decode_control(control, bytes, length, value)) {
+            ESP_LOGW(kTag, "Rejected control=%u value", static_cast<unsigned>(control));
+            return BLE_ATT_ERR_VALUE_NOT_ALLOWED;
+        }
+        const esp_err_t result = control_callback ? control_callback(control, value) : ESP_ERR_INVALID_STATE;
+        if (result != ESP_OK) {
+            ESP_LOGW(kTag, "Control=%u failed: %s", static_cast<unsigned>(control), esp_err_to_name(result));
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+        ESP_LOGI(kTag, "Applied control=%u", static_cast<unsigned>(control));
+        return 0;
+    }
     if (context->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
     const auto current = snapshot();
     uint32_t value;
@@ -74,6 +169,9 @@ int read_value(uint16_t, uint16_t, ble_gatt_access_ctxt *context, void *arg)
         case Value::Version: value = kProtocolVersion; length = 2; break;
         case Value::Steps: value = current.steps; length = 4; break;
         case Value::Wifi: value = current.wifi; length = 1; break;
+        case Value::Brightness: value = current.brightness; length = 1; break;
+        case Value::Timeout: value = current.timeout; length = 4; break;
+        case Value::WifiEnabled: value = current.wifi != 3; length = 1; break;
         default: return BLE_ATT_ERR_UNLIKELY;
     }
     uint8_t bytes[4];
@@ -82,16 +180,19 @@ int read_value(uint16_t, uint16_t, ble_gatt_access_ctxt *context, void *arg)
 }
 
 ble_gatt_chr_def battery_characteristics[2] = {};
-ble_gatt_chr_def watch_characteristics[4] = {};
+ble_gatt_chr_def watch_characteristics[12] = {};
 ble_gatt_svc_def services[3] = {};
 
 void define_characteristic(ble_gatt_chr_def &definition, const ble_uuid_t *uuid, Value *id,
-                           uint16_t *handle, bool notify)
+                           uint16_t *handle, bool notify, bool writable = false)
 {
     definition.uuid = uuid;
     definition.access_cb = read_value;
     definition.arg = id;
-    definition.flags = BLE_GATT_CHR_F_READ | (notify ? BLE_GATT_CHR_F_NOTIFY : 0);
+    definition.flags = BLE_GATT_CHR_F_READ | (notify ? BLE_GATT_CHR_F_NOTIFY : 0) | (writable ? BLE_GATT_CHR_F_WRITE : 0);
+    definition.flags |= BLE_GATT_CHR_F_READ_ENC | BLE_GATT_CHR_F_READ_AUTHEN;
+    if (writable) definition.flags |= BLE_GATT_CHR_F_WRITE_ENC | BLE_GATT_CHR_F_WRITE_AUTHEN;
+    definition.min_key_size = 16;
     definition.val_handle = handle;
 }
 
@@ -117,7 +218,27 @@ void process_updates(ble_npl_event *)
         return;
     }
     if (connection == BLE_HS_CONN_HANDLE_NONE) { advertise(nullptr); return; }
+    if (!watch_ble_security_ready(connection)) return;
+    uint8_t media_command[8];
+    if (watch_media_take_command(media_command)) {
+        const int64_t now = esp_timer_get_time();
+        if (media_command_subscribed && now-last_media_command >= 350000) {
+            auto *payload = ble_hs_mbuf_from_flat(media_command, sizeof(media_command));
+            const int rc = payload ? ble_gatts_notify_custom(connection, media_command_handle, payload) : BLE_HS_ENOMEM;
+            last_media_command = now;
+            ESP_LOGI(kTag, "Media command=%u sent rc=%d", media_command[1], rc);
+        }
+    }
     const auto current = snapshot();
+    if (brightness_subscribed && current.brightness != last_notified.brightness) {
+        ble_gatts_chr_updated(brightness_handle); last_notified.brightness = current.brightness;
+    }
+    if (timeout_subscribed && current.timeout != last_notified.timeout) {
+        ble_gatts_chr_updated(timeout_handle); last_notified.timeout = current.timeout;
+    }
+    if (wifi_enabled_subscribed && (current.wifi != 3) != last_wifi_enabled) {
+        ble_gatts_chr_updated(wifi_enabled_handle); last_wifi_enabled = current.wifi != 3;
+    }
     if (battery_subscribed && current.battery >= 0 && current.battery != last_notified.battery) {
         ble_gatts_chr_updated(battery_handle);
         last_notified.battery = current.battery;
@@ -185,13 +306,16 @@ void advertise(ble_npl_event *)
 
 int gap_event(ble_gap_event *event, void *)
 {
+    watch_ble_security_gap(event);
     switch (event->type) {
         case BLE_GAP_EVENT_CONNECT:
             if (event->connect.status == 0) {
                 connection = event->connect.conn_handle;
+                service_changed_sent = false;
                 if (!enabled.load()) { process_updates(nullptr); break; }
-                state = watch_ble_state_t::Connected;
+                state = watch_ble_state_t::Advertising; // ON only after authenticated encryption.
                 last_notified = snapshot();
+                last_wifi_enabled = last_notified.wifi != 3;
                 last_step_notify = esp_timer_get_time();
                 ESP_LOGI(kTag, "CONNECTED handle=%u", connection);
                 // Central may choose different parameters; request a modest interval and latency.
@@ -206,18 +330,39 @@ int gap_event(ble_gap_event *event, void *)
             }
             break;
         case BLE_GAP_EVENT_DISCONNECT:
+            watch_media_reset(); media_command_subscribed = false;
+            watch_notifications_reset_transport();
             connection = BLE_HS_CONN_HANDLE_NONE;
             disconnect_requested = false;
             battery_subscribed = steps_subscribed = wifi_subscribed = false;
+            brightness_subscribed = timeout_subscribed = wifi_enabled_subscribed = false;
             ble_npl_callout_stop(&step_callout);
             ESP_LOGI(kTag, "DISCONNECTED reason=%d", event->disconnect.reason);
             advertise(nullptr);
             break;
         case BLE_GAP_EVENT_ADV_COMPLETE: advertise(nullptr); break;
+        case BLE_GAP_EVENT_REPEAT_PAIRING: return BLE_GAP_REPEAT_PAIRING_IGNORE;
+        case BLE_GAP_EVENT_ENC_CHANGE:
+            if (watch_ble_security_ready(connection)) { state = watch_ble_state_t::Connected; process_updates(nullptr); }
+            break;
         case BLE_GAP_EVENT_SUBSCRIBE:
+            if (!watch_ble_security_ready(connection)) break;
+            if (event->subscribe.attr_handle == media_command_handle) {
+                media_command_subscribed = event->subscribe.cur_notify;
+                if (!media_command_subscribed) watch_media_reset();
+                break;
+            }
+            if (event->subscribe.attr_handle == service_changed_handle && event->subscribe.cur_indicate && !service_changed_sent) {
+                service_changed_sent = true;
+                ble_svc_gatt_changed(1, UINT16_MAX);
+                ESP_LOGI(kTag, "Standard GATT Service Changed queued");
+            }
             if (event->subscribe.attr_handle == battery_handle) battery_subscribed = event->subscribe.cur_notify;
             if (event->subscribe.attr_handle == steps_handle) steps_subscribed = event->subscribe.cur_notify;
             if (event->subscribe.attr_handle == wifi_handle) wifi_subscribed = event->subscribe.cur_notify;
+            if (event->subscribe.attr_handle == brightness_handle) brightness_subscribed = event->subscribe.cur_notify;
+            if (event->subscribe.attr_handle == timeout_handle) timeout_subscribed = event->subscribe.cur_notify;
+            if (event->subscribe.attr_handle == wifi_enabled_handle) wifi_enabled_subscribed = event->subscribe.cur_notify;
             if (event->subscribe.cur_notify) {
                 const auto current = snapshot();
                 if (event->subscribe.attr_handle != battery_handle || current.battery >= 0) {
@@ -225,6 +370,9 @@ int gap_event(ble_gap_event *event, void *)
                 }
                 if (event->subscribe.attr_handle == battery_handle) last_notified.battery = current.battery;
                 if (event->subscribe.attr_handle == wifi_handle) last_notified.wifi = current.wifi;
+                if (event->subscribe.attr_handle == brightness_handle) last_notified.brightness = current.brightness;
+                if (event->subscribe.attr_handle == timeout_handle) last_notified.timeout = current.timeout;
+                if (event->subscribe.attr_handle == wifi_enabled_handle) last_wifi_enabled = current.wifi != 3;
                 if (event->subscribe.attr_handle == steps_handle) {
                     last_notified.steps = current.steps;
                     last_step_notify = esp_timer_get_time();
@@ -242,16 +390,21 @@ void host_sync()
     if (!result) result = ble_hs_id_infer_auto(0, &address_type);
     if (result) { ESP_LOGE(kTag, "Address initialization failed rc=%d", result); return; }
     ready = true;
+    ESP_LOGI(kTag, "Controls registered: brightness=%u timeout=%u wifi_enabled=%u", brightness_handle, timeout_handle, wifi_enabled_handle);
     advertise(nullptr);
 }
 
 void host_reset(int reason)
 {
+    watch_media_reset(); media_command_subscribed = false;
+    watch_ble_security_reset();
+    watch_notifications_reset_transport();
     ready = false;
     state = watch_ble_state_t::Disabled;
     connection = BLE_HS_CONN_HANDLE_NONE;
     disconnect_requested = false;
     battery_subscribed = steps_subscribed = wifi_subscribed = false;
+    brightness_subscribed = timeout_subscribed = wifi_enabled_subscribed = false;
     ble_npl_callout_stop(&step_callout);
     ble_npl_callout_stop(&advertise_callout);
     ESP_LOGW(kTag, "Host reset reason=%d", reason);
@@ -264,6 +417,11 @@ void host_task(void *)
     state = watch_ble_state_t::Disabled;
     nimble_port_freertos_deinit();
 }
+void register_attribute(ble_gatt_register_ctxt *context, void *)
+{
+    if (context->op == BLE_GATT_REGISTER_OP_CHR && ble_uuid_u16(context->chr.chr_def->uuid) == 0x2a05)
+        service_changed_handle = context->chr.val_handle;
+}
 } // namespace
 
 esp_err_t watch_ble_init(void)
@@ -272,18 +430,25 @@ esp_err_t watch_ble_init(void)
     if (error != ESP_OK) { ESP_LOGE(kTag, "NimBLE init: %s", esp_err_to_name(error)); return error; }
     ble_hs_cfg.sync_cb = host_sync;
     ble_hs_cfg.reset_cb = host_reset;
-    // Explicit foundation policy: no automatic pairing/bonding, no MITM, no credentials.
-    // Secure Connections supported for a central-requested Just Works pairing, not required for reads.
-    ble_hs_cfg.sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT;
-    ble_hs_cfg.sm_bonding = 0;
-    ble_hs_cfg.sm_mitm = 0;
-    ble_hs_cfg.sm_sc = 1;
+    ble_hs_cfg.gatts_register_cb = register_attribute;
+    error = watch_ble_security_init();
+    if (error != ESP_OK) { nimble_port_deinit(); return error; }
     ble_svc_gap_init();
     ble_svc_gatt_init();
     define_characteristic(battery_characteristics[0], &battery_uuid.u, &battery_id, &battery_handle, true);
     define_characteristic(watch_characteristics[0], &version_uuid.u, &version_id, nullptr, false);
     define_characteristic(watch_characteristics[1], &steps_uuid.u, &steps_id, &steps_handle, true);
     define_characteristic(watch_characteristics[2], &wifi_uuid.u, &wifi_id, &wifi_handle, true);
+    define_characteristic(watch_characteristics[3], &brightness_uuid.u, &brightness_id, &brightness_handle, true, true);
+    define_characteristic(watch_characteristics[4], &timeout_uuid.u, &timeout_id, &timeout_handle, true, true);
+    define_characteristic(watch_characteristics[5], &wifi_enabled_uuid.u, &wifi_enabled_id, &wifi_enabled_handle, true, true);
+    define_characteristic(watch_characteristics[6], &notification_uuid.u, &notification_id, nullptr, false, true);
+    watch_characteristics[6].flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_ENC | BLE_GATT_CHR_F_WRITE_AUTHEN;
+    define_characteristic(watch_characteristics[7], &security_uuid.u, &security_id, nullptr, false);
+    define_characteristic(watch_characteristics[8], &media_uuid.u, &media_id, nullptr, false, true);
+    watch_characteristics[8].flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_ENC | BLE_GATT_CHR_F_WRITE_AUTHEN;
+    define_characteristic(watch_characteristics[9], &media_command_uuid.u, &media_command_id, &media_command_handle, true);
+    define_characteristic(watch_characteristics[10], &media_capabilities_uuid.u, &media_capabilities_id, nullptr, false);
     services[0].type = services[1].type = BLE_GATT_SVC_TYPE_PRIMARY;
     services[0].uuid = &battery_service.u;
     services[0].characteristics = battery_characteristics;
@@ -301,7 +466,7 @@ esp_err_t watch_ble_init(void)
     ble_npl_callout_init(&step_callout, nimble_port_get_dflt_eventq(), process_updates, nullptr);
     ble_npl_callout_init(&advertise_callout, nimble_port_get_dflt_eventq(), advertise, nullptr);
     nimble_port_freertos_init(host_task);
-    ESP_LOGI(kTag, "NimBLE initialized: protocol=%u, unencrypted read/notify, no bonding", kProtocolVersion);
+    ESP_LOGI(kTag, "NimBLE initialized: protocol=%u, authenticated/encrypted GATT, persistent bonding", kProtocolVersion);
     ESP_LOGI(kTag, "DMA heap after BLE init: free=%u largest=%u",
              static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
              static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)));
@@ -309,6 +474,20 @@ esp_err_t watch_ble_init(void)
 }
 
 watch_ble_state_t watch_ble_get_state(void) { return state.load(); }
+bool watch_ble_media_command(uint8_t command, uint32_t session)
+{
+    if (state.load() != watch_ble_state_t::Connected || !watch_media_queue_command(command, session)) return false;
+    queue_update(); return true;
+}
+void watch_ble_set_control_callback(watch_ble_control_cb_t callback) { control_callback = callback; }
+void watch_ble_update_settings(uint8_t brightness, uint32_t timeout_ms)
+{
+    portENTER_CRITICAL(&values_lock);
+    const bool changed = values.brightness != brightness || values.timeout != timeout_ms;
+    values.brightness = brightness; values.timeout = timeout_ms;
+    portEXIT_CRITICAL(&values_lock);
+    if (changed) queue_update();
+}
 bool watch_ble_set_enabled(bool value)
 {
     if (!ready.load()) return false;

@@ -5,6 +5,9 @@ enum class watch_wifi_state_t { Disconnected, Connecting, Connected };
 esp_err_t watch_wifi_init(void);
 // Non-blocking UI request; networking and persistence run on the connectivity worker.
 bool watch_wifi_request_enabled(bool enabled);
+// For BLE only: reuse worker, wait at most 2s for persisted intent, not association/IP.
+// Caller serializes against UI requests. Timeout is ambiguous; always read back.
+esp_err_t watch_wifi_request_enabled_confirmed(bool enabled);
 watch_wifi_state_t watch_wifi_get_state(void);
 int watch_wifi_get_rssi(void);
 bool watch_wifi_is_enabled(void);

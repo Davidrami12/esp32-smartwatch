@@ -1,12 +1,20 @@
 #pragma once
 #include <stdint.h>
 #include "esp_err.h"
+#include "watch_ble_control_protocol.h"
 
 enum class watch_ble_state_t { Disabled, Advertising, Connected };
 esp_err_t watch_ble_init(void);
 watch_ble_state_t watch_ble_get_state(void);
+// UI thread queues a bounded command; transmission and security validation run on host.
+bool watch_ble_media_command(uint8_t command, uint32_t session);
 // Runtime radio intent (defaults enabled each boot); disabling disconnects the peer.
 bool watch_ble_set_enabled(bool enabled);
+// Register before init. Called on NimBLE host: platform serializes settings/UI access.
+// ESP_OK means persistence/application completed, NOT merely queued.
+typedef esp_err_t (*watch_ble_control_cb_t)(watch_ble_control_t control, uint32_t value);
+void watch_ble_set_control_callback(watch_ble_control_cb_t callback);
+void watch_ble_update_settings(uint8_t brightness, uint32_t timeout_ms);
 
 // Thread-safe data inputs only. PMIC/activity/network acquisition remains elsewhere.
 // Safe before init; notifications are dispatched on the NimBLE host event queue.

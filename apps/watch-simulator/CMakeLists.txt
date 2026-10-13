@@ -38,6 +38,12 @@ else()
 endif()
 
 # Main include files of the project
+set(WATCH_FONT_SOURCES
+    ../../components/watch-ui/watch_fonts.cpp
+    ../../components/watch-ui/fonts/watch_latin_18.c
+    ../../components/watch-ui/fonts/watch_latin_26.c
+    ../../components/watch-ui/fonts/watch_latin_30.c
+)
 include_directories(${PROJECT_SOURCE_DIR}/main/inc)
 
 # Define options for LVGL with default values (OFF)
@@ -74,13 +80,26 @@ set(
     src/mouse_cursor_icon.c
     src/hal/hal.c
     ../../components/watch-ui/watch_ui.cpp
+    ../../components/watch-ui/watch_2048.cpp
+    ${WATCH_FONT_SOURCES}
 )
 set(MAIN_LIBS lvgl lvgl::examples lvgl::demos lvgl::thorvg ${SDL2_LIBRARIES})
 
 # Explicitly built headless integration tests; not part of normal firmware/simulator startup.
-add_executable(watch_ui_tools_tests EXCLUDE_FROM_ALL ../../tests/time_tools_ui_host.cpp)
+add_executable(watch_ui_tools_tests EXCLUDE_FROM_ALL ../../tests/time_tools_ui_host.cpp
+    ../../components/watch-ui/watch_2048.cpp ${WATCH_FONT_SOURCES})
 target_include_directories(watch_ui_tools_tests PRIVATE ../../components/watch-ui)
 target_link_libraries(watch_ui_tools_tests PRIVATE ${MAIN_LIBS})
+add_executable(watch_2048_tests EXCLUDE_FROM_ALL
+    ../../tests/watch_2048_test.cpp ../../components/watch-ui/watch_2048.cpp)
+target_include_directories(watch_2048_tests PRIVATE ../../components/watch-ui)
+enable_testing()
+add_test(NAME watch_2048_logic COMMAND watch_2048_tests)
+add_test(NAME watch_ui_integration COMMAND watch_ui_tools_tests)
+add_executable(watch_2048_store_tests EXCLUDE_FROM_ALL ../../tests/watch_2048_store_test.cpp
+    ../watch/main/watch_2048_store.cpp)
+target_include_directories(watch_2048_store_tests PRIVATE ../../tests/2048-stubs ../watch/main)
+add_test(NAME watch_2048_store COMMAND watch_2048_store_tests)
 
 # Create the main executable, depending on the FreeRTOS option
 if(USE_FREERTOS)
