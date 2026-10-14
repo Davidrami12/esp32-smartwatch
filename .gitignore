@@ -149,3 +149,4 @@ apps/watch/sdkconfig
 apps/watch/sdkconfig.old
 
 .vscode/
+apps/mobile/ai.local.properties

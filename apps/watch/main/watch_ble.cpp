@@ -3,8 +3,10 @@
 #include "watch_ble_security.h"
 #include "watch_media.h"
 #include "watch_activity.h"
+#include "watch_voice.h"
 
 #include <atomic>
+#include <algorithm>
 #include <string.h>
 #include "esp_log.h"
 #include "esp_heap_caps.h"
@@ -58,7 +60,20 @@ const ble_uuid128_t activity_uuid = BLE_UUID128_INIT(
     0x00,0x10,0x2f,0x3e,0x4d,0x6c,0x2a,0x9f,0x6d,0x4b,0x7a,0x8e,0x0d,0x00,0x57,0x7e);
 const ble_uuid128_t step_goal_uuid = BLE_UUID128_INIT(
     0x00,0x10,0x2f,0x3e,0x4d,0x6c,0x2a,0x9f,0x6d,0x4b,0x7a,0x8e,0x0e,0x00,0x57,0x7e);
-enum class Value { Battery, Version, Steps, Wifi, Brightness, Timeout, WifiEnabled, Notification, Security, Media, MediaCommand, MediaCapabilities, Activity, StepGoal };
+const ble_uuid128_t voice_meta_uuid = BLE_UUID128_INIT(0x00,0x10,0x2f,0x3e,0x4d,0x6c,0x2a,0x9f,0x6d,0x4b,0x7a,0x8e,0x0f,0x00,0x57,0x7e);
+const ble_uuid128_t voice_data_uuid = BLE_UUID128_INIT(0x00,0x10,0x2f,0x3e,0x4d,0x6c,0x2a,0x9f,0x6d,0x4b,0x7a,0x8e,0x10,0x00,0x57,0x7e);
+const ble_uuid128_t voice_control_uuid = BLE_UUID128_INIT(0x00,0x10,0x2f,0x3e,0x4d,0x6c,0x2a,0x9f,0x6d,0x4b,0x7a,0x8e,0x11,0x00,0x57,0x7e);
+const ble_uuid128_t voice_result_uuid = BLE_UUID128_INIT(0x00,0x10,0x2f,0x3e,0x4d,0x6c,0x2a,0x9f,0x6d,0x4b,0x7a,0x8e,0x12,0x00,0x57,0x7e);
+const ble_uuid128_t voice_caps_uuid = BLE_UUID128_INIT(0x00,0x10,0x2f,0x3e,0x4d,0x6c,0x2a,0x9f,0x6d,0x4b,0x7a,0x8e,0x13,0x00,0x57,0x7e);
+const ble_uuid128_t voice_stream_uuid = BLE_UUID128_INIT(0x00,0x10,0x2f,0x3e,0x4d,0x6c,0x2a,0x9f,0x6d,0x4b,0x7a,0x8e,0x14,0x00,0x57,0x7e);
+enum class Value { Battery, Version, Steps, Wifi, Brightness, Timeout, WifiEnabled, Notification, Security, Media, MediaCommand, MediaCapabilities, Activity, StepGoal, VoiceMeta, VoiceData, VoiceControl, VoiceResult, VoiceCaps, VoiceStream };
+Value voice_caps_id = Value::VoiceCaps, voice_stream_id = Value::VoiceStream;
+uint16_t voice_stream_handle;
+bool voice_stream_subscribed = false;
+unsigned voice_send_failures = 0;
+ble_npl_callout voice_callout;
+Value voice_result_id = Value::VoiceResult;
+Value voice_meta_id = Value::VoiceMeta, voice_data_id = Value::VoiceData, voice_control_id = Value::VoiceControl;
 Value step_goal_id = Value::StepGoal;
 std::atomic<uint32_t> step_goal{0};
 Value activity_id = Value::Activity;
@@ -105,11 +120,91 @@ Snapshot snapshot()
     return result;
 }
 
+void voice_pump(ble_npl_event *)
+{
+    // One notification per host event; at most four unacknowledged frames.
+    if (!enabled || !voice_stream_subscribed || connection == BLE_HS_CONN_HANDLE_NONE ||
+        !watch_ble_security_ready(connection)) { watch_voice_stop_stream(); return; }
+    uint8_t bytes[512];
+    const size_t count = watch_voice_stream_chunk(bytes,std::min<size_t>(sizeof(bytes),ble_att_mtu(connection)-3));
+    if (!count) return;
+    auto *payload = ble_hs_mbuf_from_flat(bytes,count);
+    // NimBLE consumes the mbuf on both success and failure; never double-free.
+    const int rc = payload ? ble_gatts_notify_custom(connection,voice_stream_handle,payload) : BLE_HS_ENOMEM;
+    if (!rc) {
+        uint32_t session = 0, epoch = 0;
+        for (unsigned i = 0; i < 4; ++i) { session |= uint32_t(bytes[1+i])<<(i*8); epoch |= uint32_t(bytes[5+i])<<(i*8); }
+        watch_voice_stream_sent(session,epoch,count-15); voice_send_failures = 0;
+    }
+    volatile uint8_t *scratch = bytes; for (size_t i = 0; i < sizeof(bytes); ++i) scratch[i] = 0;
+    if (rc && ++voice_send_failures >= 20) {
+        watch_voice_stop_stream(); ESP_LOGW(kTag,"Voice notification enqueue stalled; waiting for bounded peer retry"); return;
+    }
+    ble_npl_callout_reset(&voice_callout,ble_npl_time_ms_to_ticks32(rc ? 25 : 10));
+}
+
 int read_value(uint16_t conn_handle, uint16_t, ble_gatt_access_ctxt *context, void *arg)
 {
     // NimBLE reads locally (NONE) to build notifications; only a secure peer can trigger them.
     if (!watch_ble_security_ready(conn_handle == BLE_HS_CONN_HANDLE_NONE ? connection : conn_handle)) return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
     const auto id = *static_cast<Value *>(arg);
+    if (id == Value::VoiceResult) {
+        if (context->op != BLE_GATT_ACCESS_OP_WRITE_CHR) return BLE_ATT_ERR_READ_NOT_PERMITTED;
+        uint8_t bytes[244]; const size_t length = OS_MBUF_PKTLEN(context->om);
+        if (length < 11 || length > sizeof(bytes)) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        if (os_mbuf_copydata(context->om,0,length,bytes)) return BLE_ATT_ERR_UNLIKELY;
+        return watch_voice_result(bytes,length) ? 0 : BLE_ATT_ERR_VALUE_NOT_ALLOWED;
+    }
+    if (id == Value::VoiceCaps || id == Value::VoiceStream) {
+        if (context->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
+        const uint8_t caps[] = {2,1,4,15,0,2}; // v2, PCM, credits, header, max frame LE512.
+        const uint8_t noop = 2;
+        return os_mbuf_append(context->om,id == Value::VoiceCaps ? caps : &noop,
+            id == Value::VoiceCaps ? sizeof(caps) : 1) ? BLE_ATT_ERR_INSUFFICIENT_RES : 0;
+    }
+    if (id == Value::VoiceMeta || id == Value::VoiceData) {
+        if (context->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
+        // Stay below MTU-1 so Android needs no Read Blob continuation.
+        // Larger secure reads amortize the serialized select-write/read round trips.
+        uint8_t bytes[512];
+        const size_t capacity = std::min<size_t>(sizeof(bytes),ble_att_mtu(conn_handle)-3);
+        const size_t length = id == Value::VoiceMeta ? watch_voice_metadata(bytes) : watch_voice_chunk(bytes,capacity);
+        return length && !os_mbuf_append(context->om,bytes,length) ? 0 : BLE_ATT_ERR_UNLIKELY;
+    }
+    if (id == Value::VoiceControl) {
+        if (context->op != BLE_GATT_ACCESS_OP_WRITE_CHR) return BLE_ATT_ERR_READ_NOT_PERMITTED;
+        if (OS_MBUF_PKTLEN(context->om) == 15) {
+            uint8_t grant[15];
+            if (os_mbuf_copydata(context->om,0,sizeof(grant),grant) || grant[0] != 2 || grant[1] != 4 ||
+                !voice_stream_subscribed) return BLE_ATT_ERR_VALUE_NOT_ALLOWED;
+            uint32_t session = 0, epoch = 0, offset = 0;
+            for (unsigned i = 0; i < 4; ++i) { session |= uint32_t(grant[2+i])<<(8*i); epoch |= uint32_t(grant[6+i])<<(8*i); offset |= uint32_t(grant[10+i])<<(8*i); }
+            if (!watch_voice_grant(session,epoch,offset,grant[14])) return BLE_ATT_ERR_VALUE_NOT_ALLOWED;
+            voice_send_failures = 0;
+            if (!offset) {
+                ble_gap_upd_params fast = {}; fast.itvl_min = 12; fast.itvl_max = 24;
+                fast.latency = 0; fast.supervision_timeout = 600;
+                const int rc = ble_gap_update_params(conn_handle,&fast);
+                ESP_LOGI(kTag,"Voice notification fast connection requested: rc=%d",rc);
+            }
+            ble_npl_callout_reset(&voice_callout,ble_npl_time_ms_to_ticks32(10));
+            return 0;
+        }
+        if (OS_MBUF_PKTLEN(context->om) != 10) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        uint8_t bytes[10];
+        if (os_mbuf_copydata(context->om,0,10,bytes) || bytes[0] != 1 || bytes[1] < 1 || bytes[1] > 3) return BLE_ATT_ERR_VALUE_NOT_ALLOWED;
+        uint32_t session = 0, offset = 0;
+        for (unsigned i = 0; i < 4; ++i) { session |= uint32_t(bytes[2+i]) << (8*i); offset |= uint32_t(bytes[6+i]) << (8*i); }
+        if (!watch_voice_select(session,offset,bytes[1])) return BLE_ATT_ERR_VALUE_NOT_ALLOWED;
+        if (bytes[1] == 1 && offset == 0) {
+            ble_gap_upd_params parameters = {};
+            parameters.itvl_min = 12; parameters.itvl_max = 24;
+            parameters.latency = 0; parameters.supervision_timeout = 600;
+            const int result = ble_gap_update_params(conn_handle, &parameters);
+            ESP_LOGI("watch_ble", "Voice fast connection requested: result=%d", result);
+        }
+        return 0;
+    }
     if (id == Value::StepGoal) {
         if (context->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
         const uint32_t goal = step_goal.load();
@@ -208,7 +303,7 @@ int read_value(uint16_t conn_handle, uint16_t, ble_gatt_access_ctxt *context, vo
 }
 
 ble_gatt_chr_def battery_characteristics[2] = {};
-ble_gatt_chr_def watch_characteristics[14] = {};
+ble_gatt_chr_def watch_characteristics[20] = {};
 ble_gatt_svc_def services[3] = {};
 
 void define_characteristic(ble_gatt_chr_def &definition, const ble_uuid_t *uuid, Value *id,
@@ -230,6 +325,7 @@ void process_updates(ble_npl_event *)
 {
     if (!ready) return;
     if (!enabled.load()) {
+        ble_npl_callout_stop(&voice_callout); watch_voice_stop_stream();
         ble_npl_callout_stop(&advertise_callout);
         ble_npl_callout_stop(&step_callout);
         if (ble_gap_adv_active()) ble_gap_adv_stop();
@@ -359,6 +455,8 @@ int gap_event(ble_gap_event *event, void *)
             }
             break;
         case BLE_GAP_EVENT_DISCONNECT:
+            voice_stream_subscribed = false; ble_npl_callout_stop(&voice_callout);
+            watch_voice_disconnected();
             watch_media_reset(); media_command_subscribed = false;
             watch_notifications_reset_transport();
             connection = BLE_HS_CONN_HANDLE_NONE;
@@ -370,12 +468,23 @@ int gap_event(ble_gap_event *event, void *)
             advertise(nullptr);
             break;
         case BLE_GAP_EVENT_ADV_COMPLETE: advertise(nullptr); break;
+        case BLE_GAP_EVENT_CONN_UPDATE: {
+            ble_gap_conn_desc descriptor = {};
+            if (!event->conn_update.status && !ble_gap_conn_find(event->conn_update.conn_handle,&descriptor))
+                ESP_LOGI(kTag,"Voice link parameters: interval_units=%u latency=%u supervision_units=%u",descriptor.conn_itvl,descriptor.conn_latency,descriptor.supervision_timeout);
+            break;
+        }
         case BLE_GAP_EVENT_REPEAT_PAIRING: return BLE_GAP_REPEAT_PAIRING_IGNORE;
         case BLE_GAP_EVENT_ENC_CHANGE:
             if (watch_ble_security_ready(connection)) { state = watch_ble_state_t::Connected; process_updates(nullptr); }
             break;
         case BLE_GAP_EVENT_SUBSCRIBE:
             if (!watch_ble_security_ready(connection)) break;
+            if (event->subscribe.attr_handle == voice_stream_handle) {
+                voice_stream_subscribed = event->subscribe.cur_notify;
+                if (!voice_stream_subscribed) { ble_npl_callout_stop(&voice_callout); watch_voice_stop_stream(); }
+                break; // No audio replay: the peer must explicitly grant credits.
+            }
             if (event->subscribe.attr_handle == media_command_handle) {
                 media_command_subscribed = event->subscribe.cur_notify;
                 if (!media_command_subscribed) watch_media_reset();
@@ -425,6 +534,8 @@ void host_sync()
 
 void host_reset(int reason)
 {
+    voice_stream_subscribed = false; ble_npl_callout_stop(&voice_callout);
+    watch_voice_stop_stream(); watch_voice_disconnected();
     watch_media_reset(); media_command_subscribed = false;
     watch_ble_security_reset();
     watch_notifications_reset_transport();
@@ -480,6 +591,14 @@ esp_err_t watch_ble_init(void)
     define_characteristic(watch_characteristics[10], &media_capabilities_uuid.u, &media_capabilities_id, nullptr, false);
     define_characteristic(watch_characteristics[11], &activity_uuid.u, &activity_id, nullptr, false);
     define_characteristic(watch_characteristics[12], &step_goal_uuid.u, &step_goal_id, nullptr, false);
+    define_characteristic(watch_characteristics[13], &voice_meta_uuid.u, &voice_meta_id, nullptr, false);
+    define_characteristic(watch_characteristics[14], &voice_data_uuid.u, &voice_data_id, nullptr, false);
+    define_characteristic(watch_characteristics[15], &voice_control_uuid.u, &voice_control_id, nullptr, false, true);
+    watch_characteristics[15].flags &= ~BLE_GATT_CHR_F_READ;
+    define_characteristic(watch_characteristics[16], &voice_result_uuid.u, &voice_result_id, nullptr, false, true);
+    watch_characteristics[16].flags &= ~BLE_GATT_CHR_F_READ;
+    define_characteristic(watch_characteristics[17], &voice_caps_uuid.u, &voice_caps_id, nullptr, false);
+    define_characteristic(watch_characteristics[18], &voice_stream_uuid.u, &voice_stream_id, &voice_stream_handle, true);
     services[0].type = services[1].type = BLE_GATT_SVC_TYPE_PRIMARY;
     services[0].uuid = &battery_service.u;
     services[0].characteristics = battery_characteristics;
@@ -496,6 +615,7 @@ esp_err_t watch_ble_init(void)
     ble_npl_event_init(&update_event, process_updates, nullptr);
     ble_npl_callout_init(&step_callout, nimble_port_get_dflt_eventq(), process_updates, nullptr);
     ble_npl_callout_init(&advertise_callout, nimble_port_get_dflt_eventq(), advertise, nullptr);
+    ble_npl_callout_init(&voice_callout, nimble_port_get_dflt_eventq(), voice_pump, nullptr);
     nimble_port_freertos_init(host_task);
     ESP_LOGI(kTag, "NimBLE initialized: protocol=%u, authenticated/encrypted GATT, persistent bonding", kProtocolVersion);
     ESP_LOGI(kTag, "DMA heap after BLE init: free=%u largest=%u",

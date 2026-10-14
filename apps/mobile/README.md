@@ -1,5 +1,70 @@
 # Android companion — secure background BLE, controls, notifications and media
 
+## AI Assistant — deployed Firebase/Cloud Run configuration
+
+- Firebase project: `esp32-smartwatch-511417`.
+- Backend: `https://watch-ai-backend-z5stegdulq-no.a.run.app` (fixed deployed URL).
+- Open **AI Assistant · configure / sign in**. Enter the Firebase public **Web API
+  key** for that project and your Firebase Email/Password account. Never enter an
+  OpenAI key. Only the backend's allowlisted UID is authorized; email alone is not
+  authorization. The phone checks returned token audience/issuer/UID consistency;
+  the backend remains responsible for signature, expiry, revocation and UID checks.
+- Optional build-local setup: copy `ai.local.properties.example` to
+  `ai.local.properties` and supply `firebase.webApiKey` privately. That file is
+  ignored by Git; never add passwords, bearer/refresh tokens or an OpenAI key.
+  When supplied, the public project-identifying key is included in BuildConfig/APK:
+  it is **not a secret** and is not trusted as backend authorization. Otherwise,
+  enter it on the phone; only this public key is saved in private app preferences.
+- Passwords, ID tokens and rotating refresh tokens are memory-only, never logged
+  or persisted. Near expiry (last 60 seconds), the next authenticated operation
+  uses the official Secure Token REST endpoint to refresh. Re-login after process
+  death/restart. Disabled/revoked/invalid refresh sessions clear authentication;
+  transient network errors allow a retry. Logout cancels active AI HTTP calls and
+  prevents a queued/in-flight login or refresh from restoring a signed-out session.
+- **Sign in & enable paid AI** POSTs an empty `audio/wav` body with the ID token.
+  The known backend authenticates/allowlists first, then returns its specific 400
+  invalid-WAV response before Firestore quota reservation or OpenAI. 403 means
+  non-allowlisted UID; 401 means rejected authentication; 503 is service/configuration
+  failure. HTTP redirects are disabled. No audio is submitted by login verification.
+- **Allow paid AI requests** is OFF initially, after logout and after process
+  restart. Successful sign-in AND backend UID verification automatically enable
+  it for new hold-to-talk questions (except transfer-test builds). The sign-in UI
+  explains this authorization and potential charges. Manually switching it off
+  keeps it off until explicitly enabled or another successful sign-in. For unpaid
+  transfer tests, sign out or switch it off before recording. Firebase/Cloud Run networking itself can
+  still have ordinary service charges, but the login probe cannot call OpenAI.
+- Consent is captured when the phone claims a recording. If OFF then, enabling it
+  later cannot authorize that old clip: record a new question. Any consent change
+  revokes queued tickets and cancels active HTTP calls. Cancellation cannot undo a
+  request already accepted remotely or guarantee a refund.
+- Optional v2 lossless PCM notification windows are negotiated via protected
+  capabilities/CCCD; missing/unsupported peers retain legacy pull. For offline A/B
+  APK builds use `-PvoiceNotify=false` (pull) or `-PvoiceNotify=true` (default).
+  Physical validation/approval is still required; no measured speedup yet. See
+  `../../docs/voice-ble-window-optimization.md` for the protocol and test plan.
+
+### Firebase registration/key prerequisites
+
+This integration uses native HTTPS **Firebase REST**, not the Firebase Android SDK
+or Google Services Gradle plugin. Android app registration and `google-services.json`
+are **not required for this Email/Password REST flow**. Firebase Auth must be enabled
+in the correct project; a Web app registration is useful to obtain its public Web
+API key/configuration. The backend requires its authorized UID and existing IAM;
+this Android change does not create users, alter IAM, Firestore or backend settings.
+
+Use a Web API key with API restrictions compatible with both Identity Toolkit
+sign-in and Secure Token refresh. Browser-referrer or Android application-restricted
+keys may reject these REST calls. This client does not send Android package/cert
+restriction headers. Do not silently weaken an existing key: use the appropriate
+approved Web key. If adopting Android-restricted credentials/native Firebase SDK
+later, register package `dev.esp32.smartwatch` and its actual debug/release signing
+certificate fingerprints, then implement matching headers/SDK configuration.
+
+Mock session tests cover login, wrong project, refresh/rotation, transient/fatal
+refresh failures, logout races and disabled paid-request gate. They do not prove
+real Firebase login/UID access or token refresh. Real setup is unverified without
+the project's actual Web key and authorized user's privately entered credentials.
+
 ## Activity dashboard (TFM)
 
 Open **Activity dashboard** for today's watch steps, watch-owned goal/progress,

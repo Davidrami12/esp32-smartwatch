@@ -52,6 +52,7 @@ class MainActivity : ComponentActivity() {
                 onSurface = Color(0xFFF2F2F2), onSurfaceVariant = Color(0xFFAAAAAA),
             )) {
                 val model: WatchViewModel = viewModel()
+                // Configuration is deliberately runtime-only; no embedded service credential.
                 val state by model.state.collectAsStateWithLifecycle()
                 val health by model.healthState.collectAsStateWithLifecycle()
                 val activity by model.activityState.collectAsStateWithLifecycle()
@@ -102,7 +103,8 @@ class MainActivity : ComponentActivity() {
                     model::setHealthAutomatic,
                     { startActivity(Intent(this, HealthPrivacyActivity::class.java)) },
                     { runCatching { startActivity(Intent(HealthConnectClient.ACTION_HEALTH_CONNECT_SETTINGS)) } },
-                    { showActivity = true; model.refreshActivity() }) {
+                    { showActivity = true; model.refreshActivity() },
+                    { startActivity(Intent(this, dev.esp32.smartwatch.ai.VoiceAiSettingsActivity::class.java)) }) {
                     startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
                 }
             }
@@ -120,6 +122,7 @@ private fun SmartwatchScreen(
     health: HealthConnectState, healthPermission: () -> Unit, syncHealth: () -> Unit,
     healthAutomatic: (Boolean) -> Unit, healthPrivacy: () -> Unit, healthSettings: () -> Unit,
     openActivity: () -> Unit,
+    openAi: () -> Unit,
     appSettings: () -> Unit,
 ) {
     val busy = state.connectionState in listOf(ConnectionState.CONNECTING, ConnectionState.PAIRING, ConnectionState.DISCOVERING_SERVICES, ConnectionState.RECONNECTING)
@@ -128,6 +131,7 @@ private fun SmartwatchScreen(
             verticalArrangement = Arrangement.spacedBy(16.dp)) {
             item { Text("Smartwatch", fontSize = 34.sp, fontWeight = FontWeight.Bold) }
             item { OutlinedButton(onClick = openActivity, modifier = Modifier.fillMaxWidth()) { Text("Activity dashboard") } }
+            item { OutlinedButton(onClick = openAi, modifier = Modifier.fillMaxWidth()) { Text("AI Assistant · configure / sign in") } }
             item { HealthConnectCard(health, state, healthPermission, syncHealth, healthAutomatic, healthPrivacy, healthSettings) }
             item {
                 Text(when (state.connectionState) {

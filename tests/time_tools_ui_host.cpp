@@ -7,6 +7,7 @@
 #include "../apps/watch/main/watch_ble_security_policy.h"
 #include "../apps/watch/main/watch_media_protocol.h"
 #include <vector>
+#include "../components/watch-ui/watch_voice_result.h"
 
 static void notification_protocol_tests()
 {
@@ -59,6 +60,8 @@ static void notification_protocol_tests()
 static unsigned brightness_calls, commit_calls;
 static uint8_t committed;
 static unsigned goal_calls;
+static unsigned voice_calls[5];
+static bool voice_test_action(uint8_t action) { assert(action >= 1 && action <= 4); ++voice_calls[action]; return true; }
 static unsigned game_save_calls, game_force_calls;
 static uint32_t game_saved_best;
 static bool game_best_test(uint32_t best, bool force)
@@ -415,5 +418,38 @@ int main()
     assert(strcmp(lv_label_get_text(weather_range_label), "H -- / L --") == 0);
     assert(strcmp(lv_label_get_text(forecast_values[0]), "-- / --") == 0);
     back_cb(nullptr); assert(current_screen == WatchScreen::Launcher);
-    puts("PASS: UI controls/navigation/time tools, 2048 swipes/dialogs/notification/IDLE preservation, Spanish glyphs and media layout/animation");
+    watch_ui_set_voice_callback(voice_test_action);
+    open_voice_cb(nullptr); assert(current_screen == WatchScreen::Voice);
+    lv_obj_send_event(voice_hold,LV_EVENT_PRESSED,nullptr); assert(voice_held && voice_calls[1] == 1);
+    lv_obj_send_event(voice_hold,LV_EVENT_RELEASED,nullptr); assert(!voice_held && voice_calls[2] == 1);
+    watch_ui_set_voice(3,2500,50,nullptr); assert(!lv_obj_has_state(voice_preview,LV_STATE_DISABLED));
+    lv_obj_send_event(voice_preview,LV_EVENT_CLICKED,nullptr); assert(voice_calls[4] == 1);
+    watch_ui_set_voice(4,2500,0,nullptr); assert(lv_obj_has_state(voice_hold,LV_STATE_DISABLED));
+    watch_ui_set_voice(0,0,0,nullptr);
+    lv_obj_send_event(voice_hold,LV_EVENT_PRESSED,nullptr);
+    const unsigned cancels = voice_calls[3];
+    lv_obj_send_event(voice_hold,LV_EVENT_PRESS_LOST,nullptr); assert(!voice_held && voice_calls[3] == cancels+1);
+    lv_obj_send_event(voice_hold,LV_EVENT_PRESSED,nullptr); watch_ui_set_display_active(false);
+    assert(!voice_held && voice_calls[3] == cancels+2); watch_ui_set_display_active(true);
+    lv_obj_send_event(voice_hold,LV_EVENT_PRESSED,nullptr); watch_ui_show_notification("Phone","Test","Interrupt capture");
+    assert(!voice_held && voice_calls[3] == cancels+3);
+    watch_ui_hide_notification(); assert(current_screen == WatchScreen::Voice);
+    lv_obj_send_event(voice_hold,LV_EVENT_PRESSED,nullptr); back_cb(nullptr);
+    assert(!voice_held && voice_calls[3] == cancels+4 && current_screen == WatchScreen::Launcher);
+    watch_ui_set_voice_callback(nullptr);
+    WatchVoiceResult ai_result;
+    const char *spanish = "¿Qué tal?";
+    assert(ai_result.accept(1,0,strlen(spanish),reinterpret_cast<const uint8_t *>(spanish),3));
+    assert(!ai_result.accept(1,4,strlen(spanish),reinterpret_cast<const uint8_t *>(spanish)+3,1));
+    assert(ai_result.accept(1,3,strlen(spanish),reinterpret_cast<const uint8_t *>(spanish)+3,strlen(spanish)-3));
+    assert(ai_result.complete() && strcmp(ai_result.transcription,spanish) == 0);
+    const uint8_t malformed[] = {0xc0,0x80};
+    assert(!ai_result.accept(2,0,2,malformed,2));
+    assert(!ai_result.accept(2,0,3073,reinterpret_cast<const uint8_t *>("x"),1));
+    watch_ui_set_voice_text(spanish,"Una respuesta larga\ncon varias líneas.");
+    watch_ui_set_voice(8,0,0,nullptr);
+    assert(strcmp(lv_label_get_text(voice_transcription),spanish) == 0);
+    assert(!lv_obj_has_flag(static_cast<lv_obj_t *>(lv_obj_get_user_data(voice_answer)),LV_OBJ_FLAG_HIDDEN));
+    ai_result.clear(); assert(!ai_result.transcription[0] && !ai_result.answer[0]);
+    puts("PASS: UI/navigation/time tools, 2048, media, Spanish fonts, voice privacy routing and bounded Spanish AI results");
 }

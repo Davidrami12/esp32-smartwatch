@@ -14,6 +14,7 @@
 #include "watch_media.h"
 #include "watch_2048_store.h"
 #include "watch_display_start.h"
+#include "watch_voice.h"
 #include "esp_random.h"
 #include <stdio.h>
 #include <time.h>
@@ -673,6 +674,29 @@ static void media_update_cb(lv_timer_t *)
     if (watch_media_snapshot(media, revision))
         watch_ui_set_media(media.state, media.actions, media.session, media.title, media.artist);
 }
+static bool voice_action(uint8_t action)
+{
+    if (action == 1) return watch_power_is_active() && watch_voice_start();
+    if (action == 2) { watch_voice_release(); return true; }
+    if (action == 3) { watch_voice_cancel(); return true; }
+    if (action == 4) return watch_voice_preview();
+    return false;
+}
+static void voice_update_cb(lv_timer_t *)
+{
+    const auto status = watch_voice_status();
+    if (status.state == WatchVoiceState::Starting || status.state == WatchVoiceState::Recording || status.state == WatchVoiceState::Playing ||
+        status.state == WatchVoiceState::Transferring || status.state == WatchVoiceState::Processing)
+        last_activity = lv_tick_get(); // Bounded explicit interaction; normal timeout resumes afterwards.
+    watch_ui_set_voice(static_cast<uint8_t>(status.state),status.duration_ms,status.level,status.error);
+    static uint32_t revision = UINT32_MAX;
+    static char transcription[513], answer[3073];
+    if (watch_voice_copy_text(&revision,transcription,answer)) {
+        const auto started = esp_timer_get_time();
+        watch_ui_set_voice_text(transcription,answer);
+        ESP_LOGI("watch_voice","VoiceLatency stage=ui_labels_updated revision=%lu duration_us=%lld",static_cast<unsigned long>(revision),esp_timer_get_time()-started);
+    }
+}
 
 
 /* ---------------- MAIN ---------------- */
@@ -767,6 +791,9 @@ extern "C" void app_main(void)
     bsp_display_lock(0);
 
     watch_ui_create();
+    if (watch_voice_init() != ESP_OK) ESP_LOGW("watch_voice","Capture task unavailable");
+    watch_ui_set_voice_callback(voice_action);
+    lv_timer_create(voice_update_cb,100,nullptr);
     watch_ui_set_notification_dismiss_callback(dismiss_notification);
     watch_ui_set_security_callbacks(watch_ble_security_confirm, watch_ble_security_forget);
     watch_ui_set_media_callback(watch_ble_media_command);
