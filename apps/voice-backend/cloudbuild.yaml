@@ -1,0 +1,12 @@
+# Manual invocation only. No deployment, secrets or Firebase credentials in builds.
+substitutions:
+  _IMAGE: 'europe-southwest1-docker.pkg.dev/esp32-smartwatch-511417/watch-ai-backend/backend:manual-build'
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    env: ['DOCKER_BUILDKIT=1']
+    args: ['build', '--pull', '-t', '${_IMAGE}', '.']
+images:
+  - '${_IMAGE}'
+timeout: '900s'
+options:
+  logging: CLOUD_LOGGING_ONLY
