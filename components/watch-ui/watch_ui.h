@@ -51,6 +51,11 @@ void watch_ui_set_media(uint8_t state, uint8_t actions, uint32_t session, const 
 // Game remains RAM-only. Platform callback batches only high-score writes.
 typedef bool (*watch_ui_2048_best_cb_t)(uint32_t best, bool force);
 void watch_ui_configure_2048(uint32_t best, uint32_t random_seed, watch_ui_2048_best_cb_t callback);
+// Phase 1 local microphone validation; no upload or AI requests.
+typedef bool (*watch_ui_voice_cb_t)(uint8_t action); // 1 start, 2 release, 3 cancel, 4 preview
+void watch_ui_set_voice_callback(watch_ui_voice_cb_t callback);
+void watch_ui_set_voice(uint8_t state, uint32_t duration_ms, uint8_t level, const char *error);
+void watch_ui_set_voice_text(const char *transcription, const char *answer);
 // Daily goal: 1,000-30,000 in increments of 1,000. Callback rejects failed saves.
 typedef bool (*watch_ui_step_goal_cb_t)(uint32_t goal);
 void watch_ui_set_step_goal(uint32_t goal);
