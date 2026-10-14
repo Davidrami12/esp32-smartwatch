@@ -8,6 +8,102 @@ Credentials, accounts, DFU and weather transfer remain excluded. Optional dated 
 history is exposed by the secured read-only extension below.
 All application values are complete snapshots, not increments.
 
+## AI voice extension (`000f`–`0012`)
+
+All characteristics share the service UUID suffix and the existing trusted-phone,
+authenticated/encrypted LE SC/MITM/128-bit key access gate. No API key, login token,
+password or cloud credential travels over BLE. Values below are little-endian.
+
+- `000f` read: 18 bytes `[version=1, state, session:u32, pcmBytes:u32, crc32:u32,
+  sampleRate:u16, bits:u8, channels:u8]`. State 0 absent, 1 ready, 2 claimed,
+  3 processing. Processing retains only session; audio size/format/CRC fields are
+  zero after RAM audio cleanup. PCM format: 16000 Hz, 16 bits, mono; size 8000–256000.
+- `0010` read: `[version=1, session:u32, byteOffset:u32, PCM…]`. Cap total frame
+  at min(512, MTU−3); even PCM payload, contiguous receiver offset required.
+  Legacy 244-byte reads remain supported. Preferred MTU is 517; result writes
+  retain their independent 244-byte cap.
+  Reads never advance offset. Re-selecting an offset is protocol-safe; automatic
+  retry is not implemented. Receiver verifies IEEE CRC32 of the complete PCM.
+- `0011` write-with-response: `[version=1, opcode:u8, session:u32, offset:u32]`.
+  1 selects/claims, 2 finishes/cancels local transfer, 3 accepts full audio into AI
+  processing (requires final offset equal to PCM size). Processing releases PCM,
+  retains request session and starts a 90-second response deadline. Capture is
+   eight seconds maximum; ready/transfer deadlines remain 30/180 seconds (Android
+  ends transfer at 175 seconds). Disconnect/Clear/Back/notification interruption
+  cancels the request. Late result frames are rejected, not displayed.
+- `0012` write-with-response: `[version=1, kind:u8, session:u32, offset:u16,
+  totalUtf8Bytes:u16, text…]`, frame cap min(244, MTU−3). Kind 1 transcription
+  (1–512 bytes), 2 answer (1–3072), 3 sanitized error (1–160). Contiguous offsets,
+  constant kind/total within a message, nonzero payload and matching active request
+  are required; complete strings must be valid UTF-8 without NUL. UTF-8 codepoints
+  can span chunk boundaries. First offset zero begins a message. Transcription is
+  displayed when assembled; answer/error terminates the request. State 8 in the
+  internal UI is Complete, not a metadata wire state.
+
+The companion converts CRC-verified PCM to WAV and calls the HTTPS authenticated
+backend using a runtime Firebase ID token. Result frames use the same serialized
+GATT queue; pending media/notification traffic gets a turn between pull operations.
+MTU is negotiated before discovery; below 64 audio remains local. Unsupported
+older firmware remains local capture/preview only. See `apps/voice-backend/README.md`
+for deployment/authentication and `docs/watch-ai-voice-assistant.md` for evidence.
+
+## Optional voice notification transport v2 (`0013`–`0014`)
+
+Base service protocol remains 1. Existing `000f`–`0012` PCM metadata, pull reads,
+v1 controls and result frames are unchanged. New characteristics have the same
+trusted encrypted/authenticated bond gate; no credentials travel over BLE.
+
+- `0013` protected read: six-byte capability snapshot `[2,1,4,15,0,2]`: transport
+  version 2, codec 1 (unchanged PCM16 mono 16kHz), maximum four credits, 15-byte
+  notification header, maximum 512-byte frame little-endian. This Android version
+  requires an exact match; missing/unknown capabilities fall back to pull.
+- `0014` protected notify + read: read returns `[2]` (no audio replay). Subscribe
+  before transferring; no notification is emitted by subscribing alone. After
+  capability verification and CCCD acknowledgement, explicitly grant credits.
+- `0011` additional **15-byte** write-with-response: `[2,4,session:u32,
+  epoch:u32,offset:u32,credits:u8]`. Nonzero session/epoch, strictly increasing
+  epoch within a clip, even offset less than PCM size, and 1–4 credits required.
+  Android requests four credits. The first grant requires offset zero and claims
+  READY audio with the same 180-second expiry. Subsequent grants acknowledge the
+  contiguous received prefix and grant the next window, or retry from that prefix
+  with a fresh epoch. Grants do not extend the transfer deadline.
+- `0014` notification: `[2,session:u32,epoch:u32,offset:u32,sequence:u8,
+  flags:u8,PCM...]`. `sequence` starts at zero for each grant and increments after
+  successful NimBLE enqueue. Flag bit 0 marks the final credit or clip end; all
+  other bits must be zero. Frame cap `min(512,MTU-3)`, even PCM payload: 496 bytes
+  at MTU 517, 228 at MTU 247. Offsets, not sequence alone, identify audio bytes.
+
+The firmware emits at most one notification per 10ms host callout and pauses
+after four enqueues until the next grant. Enqueue failures do not advance the
+cursor; at most 20 attempts/window, paced 25ms. NimBLE owns its mbuf on either
+success or failure. No separate audio copy/window allocation is retained on the
+watch. Security, cancellation and expiry are checked before every payload copy
+and notification send. Unsubscribe/disable/reset stops push; disconnect cancels.
+
+Android accepts only contiguous offset/sequence for the active session/epoch.
+Old epochs/sessions and duplicate frames are ignored, gaps are not buffered.
+After five seconds without progress, retransmit the contiguous prefix with a new
+epoch; at most three retries without prefix progress, within the unchanged
+175-second Android deadline. A failed grant or exhausted retry budget switches
+to v1 select/read from the same verified prefix (which stops push on the watch).
+CRC mismatch, invalid frame or expiry discards the clip; only whole-clip
+CRC-verified PCM may enter WAV/backend processing. Final v1 opcode 3 is still
+required and authenticated before invoking the existing AI path.
+
+Android bounds pending audio callback snapshots to 16 (8KiB maximum); excess
+frames are dropped and recovered by the prefix retry mechanism. Snapshots are
+wiped after handling, including stale callbacks. GATT grant/result/media/control
+writes remain serialized. Normal companion traffic gets a scheduling turn
+between windows; the watch host queue yields between notifications. No burst of
+unbounded application writes or unacknowledged audio is allowed.
+
+Old Android + new watch: unchanged pull protocol. New Android + old watch:
+capability absent → unchanged pull. Unknown capabilities or subscription failure:
+pull. A/B build switch: `-PvoiceNotify=false` (default is true). No codec change,
+sample-rate reduction, ADPCM, silence trimming or backend change in this extension.
+See `voice-ble-window-optimization.md` for offline evidence and the approved-only
+physical A/B plan. Notification speed/reliability is not physically validated yet.
+
 ## Dated watch activity extension (`000d`)
 
 Optional `7e57000d-8e7a-4b6d-9f2a-6c4d3e2f1000` is **read-only**, with the same
@@ -538,3 +634,16 @@ soak retained the process/foreground service, and a new text notification comple
 all ten secure BLE writes with status 0. Visual watch/UI reopening confirmation,
 recents removal, power-off/on recovery and manual-disconnect checks were skipped by
 user request. Reconnect policy unit tests are not claimed as a physical reconnect PASS.
+# Current bonding policy (supersedes historical single-phone admission below)
+
+The custom NVS trusted-phone slot, reserved-pairing lock and extra stored-key
+verification gate have been permanently removed at the owner's request.
+NimBLE owns persistent bonds. Protected application operations still require a
+bonded, authenticated, encrypted connection with a 16-byte key, and new pairing
+still requires numeric comparison confirmed on both devices. Any successfully
+bonded phone can access the watch; there is no separate single-phone allowlist.
+The legacy Security Status `01 0F 10` remains wire-compatible; its admission bit
+now means the current platform-authenticated bonded session is admitted, not
+that a separate persistent trusted identity was verified. Paid-AI consent and
+backend authentication are unchanged. Historical test results below do not
+validate this changed policy.
