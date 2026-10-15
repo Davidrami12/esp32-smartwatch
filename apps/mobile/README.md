@@ -15,22 +15,31 @@
   When supplied, the public project-identifying key is included in BuildConfig/APK:
   it is **not a secret** and is not trusted as backend authorization. Otherwise,
   enter it on the phone; only this public key is saved in private app preferences.
-- Passwords, ID tokens and rotating refresh tokens are memory-only, never logged
-  or persisted. Near expiry (last 60 seconds), the next authenticated operation
-  uses the official Secure Token REST endpoint to refresh. Re-login after process
-  death/restart. Disabled/revoked/invalid refresh sessions clear authentication;
+- Passwords and ID tokens are memory-only and never logged. After a first manual
+  sign-in, only the refresh token, public Firebase key and UID are saved as
+  AES-256-GCM ciphertext under `noBackupFilesDir`, using an Android Keystore key.
+  No passwords/tokens belong in `.env`, Gradle properties, Git or the APK. At app
+  startup and watch-ready reconnect, saved credentials are refreshed and backend
+  UID access verified automatically before admitting paid recordings. Near expiry
+  (last 60 seconds), the next authenticated operation refreshes the token.
+  Disabled/revoked/invalid refresh sessions clear authentication;
   transient network errors allow a retry. Logout cancels active AI HTTP calls and
   prevents a queued/in-flight login or refresh from restoring a signed-out session.
-- **Sign in & enable paid AI** POSTs an empty `audio/wav` body with the ID token.
+- **Sign in / save automatic session** and automatic restoration POST an empty `audio/wav` body with the ID token.
   The known backend authenticates/allowlists first, then returns its specific 400
   invalid-WAV response before Firestore quota reservation or OpenAI. 403 means
   non-allowlisted UID; 401 means rejected authentication; 503 is service/configuration
   failure. HTTP redirects are disabled. No audio is submitted by login verification.
-- **Allow paid AI requests** is OFF initially, after logout and after process
-  restart. Successful sign-in AND backend UID verification automatically enable
-  it for new hold-to-talk questions (except transfer-test builds). The sign-in UI
-  explains this authorization and potential charges. Manually switching it off
-  keeps it off until explicitly enabled or another successful sign-in. For unpaid
+- Paid AI preference defaults ON, but requests remain blocked until successful
+  sign-in/restoration AND backend UID verification (and always in transfer-test
+  builds). Turning it OFF is persisted across restarts, reconnects and sign-in;
+  only an explicit toggle turns it back ON. The sign-in UI explains charges.
+  Sign out removes the encrypted session and Keystore key and cancels calls;
+  it does not automatically sign back in. A new manual login is then required.
+  Transient network errors keep the saved session for retry on a later reconnect
+  or AI-settings resume (minimum 30 seconds between automatic attempts).
+  Clearing app data, uninstalling, key invalidation or revoked refresh credentials
+  require manual login. For unpaid
   transfer tests, sign out or switch it off before recording. Firebase/Cloud Run networking itself can
   still have ordinary service charges, but the login probe cannot call OpenAI.
 - Consent is captured when the phone claims a recording. If OFF then, enabling it

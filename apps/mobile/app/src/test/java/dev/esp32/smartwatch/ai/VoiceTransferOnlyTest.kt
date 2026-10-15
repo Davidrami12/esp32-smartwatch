@@ -7,8 +7,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 class VoiceTransferOnlyTest {
-    @Test fun productionBuildRequiresLoginAndConsentAndDiscardsRejectedAudio() {
-        assertFalse(BuildConfig.VOICE_TRANSFER_ONLY)
+    @Test fun unsignedOrTransferOnlyBuildBlocksRequestsAndDiscardsAudio() {
         VoiceAiClient.signOut()
         VoiceAiClient.enablePaidRequests(true)
         assertFalse(VoiceAiClient.paidRequestsEnabled)
@@ -20,7 +19,8 @@ class VoiceTransferOnlyTest {
         VoiceAiClient.ask(audio,0x1234abcd,{ diagnostics.add(it) }) { value, failure -> result = value; error = failure; done.countDown() }
         assertTrue(done.await(5,TimeUnit.SECONDS))
         assertNull(result)
-        assertEquals("Configure AI and sign in on phone",error)
+        assertEquals(if (BuildConfig.VOICE_TRANSFER_ONLY) "Audio transfer test mode. Backend requests blocked"
+                     else "Configure AI and sign in on phone",error)
         assertTrue(audio.all { it == 0.toByte() })
         assertTrue(diagnostics.isNotEmpty())
         assertTrue(diagnostics.all { it.matches(Regex("VoiceLatency trace=1234abcd stage=executor_queue duration_us=[0-9]+")) })

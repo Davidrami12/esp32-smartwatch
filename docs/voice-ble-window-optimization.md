@@ -163,3 +163,27 @@ by these isolated policy/transport tests; hardware tests remain mandatory.
 7. Only after this passes, propose one separately approved short live Spanish test
    with fresh consent and a new recording, then turn consent off. Backend remains
    untouched; models/limits/secrets/quotas stay unchanged.
+# 2026-10-15: measured baseline and expanded-window experiment
+
+Physical MTU-517 baseline: legacy pull transferred 67,200 bytes in 26.652 s
+(2,521 bytes/s). Four-credit notifications transferred 74,880 bytes in 5.198 s,
+88,320 in 6.758 s, 70,400 in 4.987 s and 206,080 in 12.712 s, all CRC PASS.
+The long clip was 6.44 s of PCM; release-to-result was 17.463 s, including
+2.546 s HTTP round trip and 1.479 s result delivery. Grant writes accumulated
+5.692 s during that transfer (not a separately additive end-to-end stage).
+These are different recordings, not a controlled identical-audio A/B.
+
+Current experiment advertises 16 credits and negotiates four with older watches.
+PCM, header, whole-clip CRC, epoch/prefix retries, fallback, deadlines and
+10-ms single-notification pacing remain unchanged to isolate window size.
+The sender still has no extra PCM buffer; Android callback snapshots are capped
+at 32 (16 KiB). Media gets turns between windows and host events between frames.
+Old exact-four-credit apps fall back to pull with the new capability snapshot.
+The 82,560-byte host fixture still needs 167 frames, now 11 grants instead of 42.
+That is a protocol-count reduction, not a measured speedup of this experiment.
+
+Physical validation pending: install with `-PvoiceNotify=true
+-PvoiceTransferOnly=true`, reconnect without bond removal, then measure short and
+long recordings; verify CRC, negotiated credits, retries/fallback, cancellation
+and responsiveness. No paid request is needed. Do not change bonding policy or
+enable the new mode by default based solely on compilation or synthetic tests.

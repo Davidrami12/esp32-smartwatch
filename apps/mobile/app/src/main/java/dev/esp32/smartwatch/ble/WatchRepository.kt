@@ -75,6 +75,7 @@ class WatchRepository(context: Context) {
     private var aiConsent: dev.esp32.smartwatch.ai.PaidVoiceConsent.Ticket? = null
     private var voiceStream: VoiceProtocol.StreamReceiver? = null
     private var streamCapable = false
+    private var streamCredits = 4
     private var streamSubscribed = false
     private var voiceLastProgress = 0L
     private var streamNeedsGrant = false
@@ -549,8 +550,9 @@ class WatchRepository(context: Context) {
                 }
                 Log.d(TAG, "Characteristic read: ${c.uuid}, status=$status")
                 if (c.uuid == VoiceProtocol.CAPS) {
-                    streamCapable = status == BluetoothGatt.GATT_SUCCESS && VoiceProtocol.supportsStream(snapshot)
-                    Log.i(TAG,"Voice notification capability supported=$streamCapable")
+                    streamCredits = if (status == BluetoothGatt.GATT_SUCCESS) VoiceProtocol.streamCredits(snapshot) else 0
+                    streamCapable = streamCredits != 0
+                    Log.i(TAG,"Voice notification capability supported=$streamCapable credits=$streamCredits")
                     snapshot.fill(0); pending = null; nextOperation(); return@onSession
                 }
                 if (c.uuid == VoiceProtocol.META || c.uuid == VoiceProtocol.DATA) {
@@ -580,7 +582,7 @@ class WatchRepository(context: Context) {
                                 voiceDeadline = voiceStarted + 175_000
                                 Log.i(TAG, "Voice transfer started: bytes=${metadata.size} mtu=$negotiatedMtu")
                                 if (streamCapable && streamSubscribed) {
-                                    voiceStream = VoiceProtocol.StreamReceiver(requireNotNull(voiceReceiver),negotiatedMtu)
+                                    voiceStream = VoiceProtocol.StreamReceiver(requireNotNull(voiceReceiver),negotiatedMtu,streamCredits)
                                     // Poll callback owns the current GATT read; queue its grant after clearing pending.
                                     operations.add(Operation(VoiceProtocol.CONTROL,writeValue=requireNotNull(voiceStream).nextGrant()))
                                     voiceLastProgress = voiceStarted
@@ -789,7 +791,7 @@ class WatchRepository(context: Context) {
                 // Bound audio callback copies even if Handler is busy. Missing frames are
                 // recovered from the contiguous prefix with a fresh grant epoch.
                 if (value.size !in 17..512) return
-                if (streamCallbacks.incrementAndGet() > 16) { streamCallbacks.decrementAndGet(); return }
+                if (streamCallbacks.incrementAndGet() > 32) { streamCallbacks.decrementAndGet(); return }
                 val frame = value.copyOf()
                 handler.post {
                     try {
@@ -873,6 +875,7 @@ class WatchRepository(context: Context) {
                 retryCount = 0
                 preferences.edit().putString("watch_address", source.device.address).apply()
                 Log.i(TAG, "Watch ready: initial reads and all subscriptions complete")
+                dev.esp32.smartwatch.ai.VoiceAiClient.ensureAutomaticSignIn()
                 mutableState.value = state.value.copy(connectionState = ConnectionState.CONNECTED, savedWatchAvailable = true,
                     disconnectReason = DisconnectReason.NONE, retryDelayMillis = null)
                 if (state.value.mediaAvailable) { nextOperation(); return }

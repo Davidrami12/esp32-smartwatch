@@ -53,17 +53,20 @@ Base service protocol remains 1. Existing `000f`–`0012` PCM metadata, pull rea
 v1 controls and result frames are unchanged. New characteristics have the same
 trusted encrypted/authenticated bond gate; no credentials travel over BLE.
 
-- `0013` protected read: six-byte capability snapshot `[2,1,4,15,0,2]`: transport
-  version 2, codec 1 (unchanged PCM16 mono 16kHz), maximum four credits, 15-byte
+- `0013` protected read: six-byte capability snapshot `[2,1,16,15,0,2]`: transport
+  version 2, codec 1 (unchanged PCM16 mono 16kHz), maximum 16 credits, 15-byte
   notification header, maximum 512-byte frame little-endian. This Android version
-  requires an exact match; missing/unknown capabilities fall back to pull.
+  accepts the previous four-credit snapshot too; other fields must match exactly.
+  Missing/unknown capabilities fall back to pull. Older exact-four-credit apps
+  fall back to pull with the expanded-capacity watch; updated apps use four
+  credits with older watches and 16 with updated watches.
 - `0014` protected notify + read: read returns `[2]` (no audio replay). Subscribe
   before transferring; no notification is emitted by subscribing alone. After
   capability verification and CCCD acknowledgement, explicitly grant credits.
 - `0011` additional **15-byte** write-with-response: `[2,4,session:u32,
   epoch:u32,offset:u32,credits:u8]`. Nonzero session/epoch, strictly increasing
-  epoch within a clip, even offset less than PCM size, and 1–4 credits required.
-  Android requests four credits. The first grant requires offset zero and claims
+  epoch within a clip, even offset less than PCM size, and 1–16 credits required.
+  Android requests the advertised capacity (four or 16). The first grant requires offset zero and claims
   READY audio with the same 180-second expiry. Subsequent grants acknowledge the
   contiguous received prefix and grant the next window, or retry from that prefix
   with a fresh epoch. Grants do not extend the transfer deadline.
@@ -74,7 +77,7 @@ trusted encrypted/authenticated bond gate; no credentials travel over BLE.
   at MTU 517, 228 at MTU 247. Offsets, not sequence alone, identify audio bytes.
 
 The firmware emits at most one notification per 10ms host callout and pauses
-after four enqueues until the next grant. Enqueue failures do not advance the
+after the granted number of enqueues until the next grant. Enqueue failures do not advance the
 cursor; at most 20 attempts/window, paced 25ms. NimBLE owns its mbuf on either
 success or failure. No separate audio copy/window allocation is retained on the
 watch. Security, cancellation and expiry are checked before every payload copy
@@ -90,7 +93,7 @@ CRC mismatch, invalid frame or expiry discards the clip; only whole-clip
 CRC-verified PCM may enter WAV/backend processing. Final v1 opcode 3 is still
 required and authenticated before invoking the existing AI path.
 
-Android bounds pending audio callback snapshots to 16 (8KiB maximum); excess
+Android bounds pending audio callback snapshots to 32 (16KiB maximum); excess
 frames are dropped and recovered by the prefix retry mechanism. Snapshots are
 wiped after handling, including stale callbacks. GATT grant/result/media/control
 writes remain serialized. Normal companion traffic gets a scheduling turn

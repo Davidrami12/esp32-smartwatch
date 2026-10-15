@@ -8,7 +8,7 @@ int main()
     assert(!window.grant(0,1,0,4,82560));
     assert(!window.grant(77,0,0,4,82560));
     assert(!window.grant(77,1,1,4,82560));
-    assert(!window.grant(77,1,0,5,82560));
+    assert(!window.grant(77,1,0,17,82560));
     assert(window.grant(77,1,0,4,82560));
     assert(!window.grant(77,1,0,4,82560)); // Replay does not refill credits.
     assert(!window.grant(78,2,0,4,82560));
@@ -34,5 +34,20 @@ int main()
     }
     assert(frames == 167 && grants == 42 && offset == 82560);
     window.clear(); assert(window.payload(512,82560) == 0);
-    puts("PASS: bounded notification credits, session/epoch replay rejection, retry offset and 167-frame/42-grant baseline simulation");
+    offset = frames = grants = 0;
+    while (offset < 82560) {
+        assert(window.grant(77,++grants,offset,16,82560));
+        while (window.credits) {
+            const auto count = window.payload(512,82560);
+            assert(window.sequence < 16 && count && !(count & 1));
+            assert(window.last(count,82560) == (window.credits == 1 || window.offset+count == 82560));
+            window.sent(count,82560); ++frames;
+        }
+        offset = window.offset;
+    }
+    assert(frames == 167 && grants == 11 && offset == 82560);
+    assert(!window.grant(77,grants,0,16,82560));
+    assert(window.grant(77,grants+1,496,16,82560));
+    window.clear(); assert(window.payload(512,82560) == 0);
+    puts("PASS: bounded 4/16-credit windows, session/epoch replay rejection, retry offset, 167 frames with 42/11 grants");
 }

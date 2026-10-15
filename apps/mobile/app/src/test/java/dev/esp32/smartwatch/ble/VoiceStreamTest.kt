@@ -15,11 +15,14 @@ class VoiceStreamTest {
         val count = minOf(payload,bytes.size-offset)
         return ByteBuffer.allocate(15+count).order(ByteOrder.LITTLE_ENDIAN)
             .put(2.toByte()).putInt(77).putInt(stream.epoch).putInt(offset).put(sequence.toByte())
-            .put(if (sequence == 3 || offset+count == bytes.size) 1.toByte() else 0.toByte())
+            .put(if (sequence == stream.credits-1 || offset+count == bytes.size) 1.toByte() else 0.toByte())
             .put(bytes,offset,count).array()
     }
     @Test fun capabilityIsExplicitAndUnknownSchemasFallBack() {
         assertTrue(VoiceProtocol.supportsStream(byteArrayOf(2,1,4,15,0,2)))
+        assertEquals(16,VoiceProtocol.streamCredits(byteArrayOf(2,1,16,15,0,2)))
+        assertEquals(4,VoiceProtocol.streamCredits(byteArrayOf(2,1,4,15,0,2)))
+        assertFalse(VoiceProtocol.supportsStream(byteArrayOf(2,1,32,15,0,2)))
         assertFalse(VoiceProtocol.supportsStream(byteArrayOf(3,1,4,15,0,2)))
         assertFalse(VoiceProtocol.supportsStream(byteArrayOf(2,2,4,15,0,2)))
         assertFalse(VoiceProtocol.supportsStream(byteArrayOf()))
@@ -31,6 +34,39 @@ class VoiceStreamTest {
         assertTrue(VoiceProtocol.shouldYieldVoice(true,false,1,VoiceProtocol.DATA))
         assertFalse(VoiceProtocol.shouldYieldVoice(true,false,2,VoiceProtocol.CONTROL))
         assertFalse(VoiceProtocol.shouldYieldVoice(false,false,1,VoiceProtocol.CONTROL))
+    }
+    @Test fun expandedWindowsPreserveCrcAtAllMtusAndReduceGrants() {
+        for (mtu in listOf(64,247,256,517)) {
+            val r = receiver(); val s = VoiceProtocol.StreamReceiver(r,mtu,16)
+            var grants = 0; var frames = 0
+            while (r.offset < audio.size) {
+                val grant = s.nextGrant(); grants++
+                assertEquals(16,grant[14].toInt())
+                for (seq in 0 until 16) {
+                    val event = s.accept(frame(s,r.offset,seq,mtu))
+                    frames++
+                    if (event == VoiceProtocol.StreamReceiver.Event.COMPLETE) break
+                    assertEquals(if (seq == 15) VoiceProtocol.StreamReceiver.Event.WINDOW else VoiceProtocol.StreamReceiver.Event.PROGRESS,event)
+                }
+            }
+            assertArrayEquals(audio,r.takeAudio())
+            if (mtu == 517) { assertEquals(167,frames); assertEquals(11,grants) }
+        }
+    }
+    @Test fun expandedWindowLossAndCancellationStayBounded() {
+        val r = receiver(); val s = VoiceProtocol.StreamReceiver(r,517,16)
+        s.nextGrant()
+        repeat(12) { s.accept(frame(s,r.offset,it)) }
+        val lost = frame(s,r.offset,12)
+        assertEquals(VoiceProtocol.StreamReceiver.Event.GAP,s.accept(frame(s,r.offset+496,13)))
+        s.nextGrant(true)
+        assertEquals(VoiceProtocol.StreamReceiver.Event.IGNORE,s.accept(lost))
+        assertEquals(VoiceProtocol.StreamReceiver.Event.PROGRESS,s.accept(frame(s,r.offset,0)))
+        repeat(3) { s.nextGrant(true) }
+        assertThrows(IllegalArgumentException::class.java) { s.nextGrant(true) }
+        r.clear()
+        assertThrows(IllegalArgumentException::class.java) { s.nextGrant() }
+        assertThrows(IllegalArgumentException::class.java) { VoiceProtocol.StreamReceiver(receiver(),517,17) }
     }
     @Test fun grantsHaveIndependentVersionSessionEpochAndCredits() {
         val grant = VoiceProtocol.grant(77,2,496)

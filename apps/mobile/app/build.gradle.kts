@@ -23,8 +23,10 @@ android {
         versionCode = 1
         versionName = "0.1.0"
         buildConfigField("String", "FIREBASE_WEB_API_KEY", "\"$firebaseWebKey\"")
-        // Production pipeline; memory-only explicit paid-request consent still required.
-        buildConfigField("boolean", "VOICE_TRANSFER_ONLY", "false")
+        // Unpaid transport validation: -PvoiceTransferOnly=true blocks voice HTTP.
+        buildConfigField("boolean", "VOICE_TRANSFER_ONLY", providers.gradleProperty("voiceTransferOnly").getOrElse("false").also {
+            require(it == "true" || it == "false") { "voiceTransferOnly must be true or false" }
+        })
         // Offline A/B builds: -PvoiceNotify=false keeps the legacy pull transport.
         buildConfigField("boolean", "VOICE_NOTIFY_ENABLED", providers.gradleProperty("voiceNotify").getOrElse("false").also {
             require(it == "true" || it == "false") { "voiceNotify must be true or false" }

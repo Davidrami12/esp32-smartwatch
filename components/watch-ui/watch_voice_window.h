@@ -4,7 +4,7 @@
 
 // Pure protocol state; caller serializes on the audio mutex / NimBLE host queue.
 struct WatchVoiceWindow {
-    static constexpr uint8_t MaxCredits = 4, Header = 15;
+    static constexpr uint8_t MaxCredits = 16, Header = 15;
     uint32_t session = 0, epoch = 0, offset = 0;
     uint8_t credits = 0, sequence = 0;
     void clear() { session = epoch = offset = 0; credits = sequence = 0; }

@@ -13,7 +13,7 @@ object VoiceAiConfig {
 
 class VoiceAuthException(val reason: String, val fatal: Boolean = true) : Exception(reason)
 
-/** Firebase REST session: tokens stay in memory, passwords are never stored. */
+/** ID tokens stay in memory; optional store protects renewable refresh credentials. */
 class FirebaseVoiceAuth(
     private val post: (String, String, ByteArray) -> JSONObject = ::firebasePost,
     private val clock: () -> Long = System::currentTimeMillis,
@@ -21,8 +21,12 @@ class FirebaseVoiceAuth(
     private data class Session(val token: String, val refresh: String, val key: String, val uid: String, val expires: Long)
     @Volatile private var session: Session? = null
     private val generation = AtomicLong()
+    private var store: VoiceSessionStore? = null
+    @Synchronized internal fun useStore(value: VoiceSessionStore) { store = value }
     fun available() = session != null
-    @Synchronized fun logout() { generation.incrementAndGet(); session = null }
+    @Synchronized fun logout() { generation.incrementAndGet(); session = null; store?.clear() }
+    @Synchronized internal fun suspendSession() { generation.incrementAndGet(); session = null }
+    internal fun epoch() = generation.get()
     @Synchronized fun prepareLogin(): Long { logout(); return generation.get() }
     fun current(epoch: Long) = generation.get() == epoch
     fun login(key: String, email: String, password: String, epoch: Long = prepareLogin()) {
@@ -35,6 +39,7 @@ class FirebaseVoiceAuth(
         synchronized(this) {
             if (epoch != generation.get()) throw VoiceAuthException("Sign-in cancelled")
             session = candidate
+            save(candidate)
         }
     }
     fun token(): String {
@@ -49,6 +54,7 @@ class FirebaseVoiceAuth(
             synchronized(this) {
                 if (epoch != generation.get() || session !== current) throw VoiceAuthException("Session ended. Sign in again")
                 session = candidate
+                save(candidate)
             }
             return candidate.token
         } catch (error: VoiceAuthException) {
@@ -58,6 +64,27 @@ class FirebaseVoiceAuth(
             synchronized(this) { if (session === current) logout() }
             throw VoiceAuthException("Invalid Firebase response. Sign in again")
         } finally { body.fill(0) }
+    }
+    internal fun restore(epoch: Long): Boolean {
+        val saved = synchronized(this) {
+            if (!current(epoch)) throw VoiceAuthException("Sign-in cancelled")
+            store?.load()
+        } ?: return false
+        val body = ("grant_type=refresh_token&refresh_token=" + java.net.URLEncoder.encode(saved.refresh,"UTF-8")).toByteArray()
+        try {
+            require(saved.key.matches(Regex("AIza[A-Za-z0-9_-]{35}")))
+            val json = post("https://securetoken.googleapis.com/v1/token?key=${saved.key}","application/x-www-form-urlencoded",body)
+            val candidate = validated(json.getString("id_token"),json.getString("refresh_token"),saved.key,json.getString("user_id"))
+            if (candidate.uid != saved.uid) throw VoiceAuthException("Firebase account changed. Sign in again")
+            synchronized(this) {
+                if (!current(epoch)) throw VoiceAuthException("Sign-in cancelled")
+                save(candidate); session = candidate
+            }
+            return true
+        } finally { body.fill(0) }
+    }
+    private fun save(value: Session) {
+        store?.save(SavedVoiceSession(value.refresh,value.key,value.uid))
     }
     private fun validated(token: String, refresh: String, key: String, uid: String): Session {
         try {

@@ -8,13 +8,19 @@ import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
-/** Credentials are supplied at runtime, memory-only, never logged or embedded. */
+/** Passwords are runtime-only; refresh credentials use device-local Keystore storage. */
 object VoiceAiClient {
     val endpoint: String = VoiceAiConfig.BACKEND
     private val auth = FirebaseVoiceAuth()
     private val calls = java.util.concurrent.ConcurrentHashMap.newKeySet<Call>()
     private val consent = PaidVoiceConsent()
+    private var preferences: android.content.SharedPreferences? = null
+    private var restoring = false
+    private var lastRestoreAttempt = 0L
+    @Volatile private var backendVerified = false
+    @Volatile var sessionStatus = "Sign in once to enable automatic AI access"; private set
     val paidRequestsEnabled get() = consent.enabled()
+    val paidRequestsRequested get() = preferences?.getBoolean("paid_enabled",true) != false
     internal fun consentTicket() = consent.ticket()
     internal fun consentValid(ticket: PaidVoiceConsent.Ticket?) = consent.permits(ticket)
     private val executor = Executors.newSingleThreadExecutor()
@@ -24,12 +30,88 @@ object VoiceAiClient {
         fun revokeConsent() { consentRevoked = true; cancel() }
     }
     data class Result(val transcription: String, val answer: String)
-    fun configured() = auth.available()
-    internal fun paidAfterVerifiedSignIn(verified: Boolean, transferOnly: Boolean) = verified && !transferOnly
+    fun configured() = auth.available() && backendVerified
+    internal fun paidAfterVerifiedSignIn(verified: Boolean, transferOnly: Boolean, requested: Boolean = true) = verified && !transferOnly && requested
     fun enablePaidRequests(enabled: Boolean) {
-        consent.set(enabled && configured())
+        synchronized(auth) {
+            preferences?.edit()?.putBoolean("paid_enabled",enabled)?.commit()
+            applyPaidRequests(enabled)
+            if (configured()) sessionStatus = if (paidRequestsEnabled) "Signed in; paid AI enabled" else "Signed in; paid AI disabled"
+        }
+        if (enabled && !configured()) ensureAutomaticSignIn()
+    }
+    private fun applyPaidRequests(enabled: Boolean) {
+        consent.set(enabled && configured() && !dev.esp32.smartwatch.BuildConfig.VOICE_TRANSFER_ONLY)
         // Revocation affects already queued calls as well as a connected request.
         calls.forEach { it.revokeConsent() }
+    }
+    fun initialize(context: android.content.Context) {
+        synchronized(auth) {
+            if (preferences != null) return
+            preferences = context.applicationContext.getSharedPreferences("voice_ai",android.content.Context.MODE_PRIVATE)
+            auth.useStore(KeystoreVoiceSessionStore(context.applicationContext))
+        }
+        ensureAutomaticSignIn()
+    }
+    fun ensureAutomaticSignIn() {
+        val epoch: Long
+        synchronized(auth) {
+            if (preferences == null || configured() || restoring || dev.esp32.smartwatch.BuildConfig.VOICE_TRANSFER_ONLY) return
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (lastRestoreAttempt != 0L && now-lastRestoreAttempt < 30000) return
+            lastRestoreAttempt = now; restoring = true; epoch = auth.epoch()
+            sessionStatus = "Restoring saved AI session…"
+        }
+        executor.execute {
+            try {
+                if (!auth.restore(epoch)) {
+                    synchronized(auth) { if (auth.current(epoch)) sessionStatus = "Sign in once to enable automatic AI access" }
+                } else {
+                    verifyBackendAccess()
+                    synchronized(auth) {
+                        if (auth.current(epoch)) {
+                            backendVerified = true
+                            applyPaidRequests(paidAfterVerifiedSignIn(true,false,paidRequestsRequested))
+                            sessionStatus = if (paidRequestsEnabled) "Signed in automatically; paid AI enabled" else "Signed in automatically; paid AI disabled"
+                        }
+                    }
+                }
+            } catch (error: Exception) {
+                synchronized(auth) {
+                    if (auth.current(epoch)) {
+                        backendVerified = false; applyPaidRequests(false)
+                        if (error is VoiceAuthException && !error.fatal) {
+                            auth.suspendSession(); sessionStatus = "Automatic sign-in unavailable. Reconnect to retry"
+                        } else {
+                            auth.logout(); sessionStatus = "Saved AI session unavailable. Sign in again"
+                        }
+                    }
+                }
+            } finally { synchronized(auth) { restoring = false } }
+        }
+    }
+    private fun verifyBackendAccess(): String {
+        // Empty WAV is rejected before quota reservation/OpenAI by this backend.
+        val connection = URI("$endpoint/v1/voice").toURL().openConnection() as HttpURLConnection
+        try {
+            connection.requestMethod = "POST"; connection.connectTimeout = 10000; connection.readTimeout = 15000
+            connection.instanceFollowRedirects = false; connection.doOutput = true
+            connection.setRequestProperty("Authorization","Bearer ${auth.token()}")
+            connection.setRequestProperty("Content-Type","audio/wav"); connection.setFixedLengthStreamingMode(0)
+            connection.outputStream.use { }
+            val status = connection.responseCode
+            var detail = ""
+            if (status == 400) {
+                val bytes = connection.errorStream?.use { it.readNBytes(16001) } ?: ByteArray(0)
+                try { if (bytes.size <= 16000) detail = JSONObject(bytes.toString(Charsets.UTF_8)).optString("detail") }
+                finally { bytes.fill(0) }
+            }
+            val outcome = accessOutcome(status,detail,auth.available())
+            if (!outcome.first) throw VoiceAuthException(outcome.second,status == 401 || status == 403 || status == 400)
+            return outcome.second
+        } catch (error: VoiceAuthException) { throw error }
+        catch (_: Exception) { throw VoiceAuthException("Backend network error. Reconnect to retry",false) }
+        finally { connection.disconnect() }
     }
     internal fun accessOutcome(status: Int, detail: String, active: Boolean): Pair<Boolean, String> = when (status) {
         400 -> if (detail == "Invalid bounded 16 kHz mono PCM WAV" && active)
@@ -48,43 +130,29 @@ object VoiceAiClient {
     fun signIn(url: String, apiKey: String, email: String, password: String, callback: (Boolean, String) -> Unit) {
         signOut()
         val epoch = auth.prepareLogin()
+        sessionStatus = "Signing in…"
         executor.execute {
             var ok = false; var message = "Sign-in failed"
             try {
                 val target = https(url)
                 require(target == VoiceAiConfig.BACKEND)
                 auth.login(apiKey,email,password,epoch)
-                // Empty body verifies backend UID authorization but fails WAV validation
-                // before quota reservation/OpenAI. No speech or paid AI request is sent.
-                val connection = URI("$endpoint/v1/voice").toURL().openConnection() as HttpURLConnection
-                try {
-                    connection.requestMethod = "POST"; connection.connectTimeout = 10000; connection.readTimeout = 15000
-                    connection.instanceFollowRedirects = false; connection.doOutput = true
-                    connection.setRequestProperty("Authorization","Bearer ${auth.token()}")
-                    connection.setRequestProperty("Content-Type","audio/wav")
-                    connection.setFixedLengthStreamingMode(0)
-                    connection.outputStream.use { }
-                    val status = connection.responseCode
-                    var detail = ""
-                    if (status == 400) {
-                        val bytes = connection.errorStream?.use { it.readNBytes(16001) } ?: ByteArray(0)
-                        try { if (bytes.size <= 16000) detail = JSONObject(bytes.toString(Charsets.UTF_8)).optString("detail") }
-                        finally { bytes.fill(0) }
-                    }
-                    val outcome = accessOutcome(status,detail,auth.available())
-                    ok = outcome.first; message = outcome.second
-                } finally { connection.disconnect() }
+                message = verifyBackendAccess(); ok = true
             } catch (error: VoiceAuthException) { message = error.reason }
             catch (_: Exception) { message = "Sign-in or backend network error. Try again" }
             synchronized(auth) { if (auth.current(epoch)) {
                 if (!ok) auth.logout()
-                enablePaidRequests(paidAfterVerifiedSignIn(ok, dev.esp32.smartwatch.BuildConfig.VOICE_TRANSFER_ONLY))
-                if (ok) message += if (paidRequestsEnabled) " Paid AI enabled for new hold-to-talk questions." else " Paid AI blocked in transfer test mode."
-                callback(ok,message)
+                backendVerified = ok
+                applyPaidRequests(paidAfterVerifiedSignIn(ok, dev.esp32.smartwatch.BuildConfig.VOICE_TRANSFER_ONLY,paidRequestsRequested))
+                if (ok) message += if (paidRequestsEnabled) " Paid AI enabled for new hold-to-talk questions." else " Paid AI disabled."
+                sessionStatus = message; callback(ok,message)
             } else callback(false,"Sign-in cancelled") }
         }
     }
-    fun signOut() = synchronized(auth) { enablePaidRequests(false); auth.logout() }
+    fun signOut() = synchronized(auth) {
+        backendVerified = false; applyPaidRequests(false); auth.logout()
+        lastRestoreAttempt = 0L; sessionStatus = "Signed out; saved session removed"
+    }
     internal fun ask(audio: ByteArray, session: Int = 0, diagnostic: (String) -> Unit = {},
                      ticket: PaidVoiceConsent.Ticket? = consent.ticket(), callback: (Result?, String?) -> Unit): Call {
         val queued = System.nanoTime()
@@ -129,7 +197,7 @@ object VoiceAiClient {
                 trace("http_wait_headers",waiting)
                 if (httpStatus != 200) {
                     error = when (connection.responseCode) { 401,403 -> "Sign in to AI on your phone"; 429 -> "AI request limit reached"; 503 -> "AI service unavailable"; else -> "AI request failed. Hold to retry" }
-                    if (connection.responseCode == 401 || connection.responseCode == 403) { auth.logout(); enablePaidRequests(false) }
+                    if (!call.cancelled && (connection.responseCode == 401 || connection.responseCode == 403)) signOut()
                 } else {
                     val download = System.nanoTime()
                     val bytes = readBounded(connection, 16000)
@@ -141,7 +209,7 @@ object VoiceAiClient {
                     trace("result_parse",parsing)
                 }
                 trace("http_round_trip",network)
-            } catch (failure: VoiceAuthException) { error = failure.reason; if (failure.fatal) enablePaidRequests(false) }
+            } catch (failure: VoiceAuthException) { error = failure.reason; if (failure.fatal && !call.cancelled) signOut() }
             catch (_: java.net.SocketTimeoutException) { error = "AI request timed out. Hold to retry" }
             catch (_: Exception) { error = if (!configured()) "Configure AI and sign in on phone" else "AI request failed. Hold to retry" }
             finally { audio.fill(0); wav?.fill(0); call.connection?.disconnect(); call.connection = null; calls.remove(call) }

@@ -4,6 +4,7 @@
 #include "watch_media.h"
 #include "watch_activity.h"
 #include "watch_voice.h"
+#include "watch_voice_window.h"
 
 #include <atomic>
 #include <algorithm>
@@ -122,7 +123,7 @@ Snapshot snapshot()
 
 void voice_pump(ble_npl_event *)
 {
-    // One notification per host event; at most four unacknowledged frames.
+    // One notification per host event; bounded negotiated credit window.
     if (!enabled || !voice_stream_subscribed || connection == BLE_HS_CONN_HANDLE_NONE ||
         !watch_ble_security_ready(connection)) { watch_voice_stop_stream(); return; }
     uint8_t bytes[512];
@@ -157,7 +158,7 @@ int read_value(uint16_t conn_handle, uint16_t, ble_gatt_access_ctxt *context, vo
     }
     if (id == Value::VoiceCaps || id == Value::VoiceStream) {
         if (context->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
-        const uint8_t caps[] = {2,1,4,15,0,2}; // v2, PCM, credits, header, max frame LE512.
+        const uint8_t caps[] = {2,1,WatchVoiceWindow::MaxCredits,15,0,2}; // v2, PCM, max credits, header, LE512.
         const uint8_t noop = 2;
         return os_mbuf_append(context->om,id == Value::VoiceCaps ? caps : &noop,
             id == Value::VoiceCaps ? sizeof(caps) : 1) ? BLE_ATT_ERR_INSUFFICIENT_RES : 0;

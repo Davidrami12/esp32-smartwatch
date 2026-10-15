@@ -90,10 +90,63 @@ class FirebaseVoiceAuthTest {
         assertFalse(VoiceAiClient.paidAfterVerifiedSignIn(false, false))
         assertFalse(VoiceAiClient.paidAfterVerifiedSignIn(true, true))
         assertFalse(VoiceAiClient.paidAfterVerifiedSignIn(false, true))
+        assertFalse(VoiceAiClient.paidAfterVerifiedSignIn(true, false, false))
         val consent = PaidVoiceConsent()
         val olderRecording = consent.ticket()
         consent.set(VoiceAiClient.paidAfterVerifiedSignIn(true, false))
         assertFalse(consent.permits(olderRecording))
         assertTrue(consent.permits(consent.ticket()))
+    }
+    private class MemoryStore : VoiceSessionStore {
+        var value: SavedVoiceSession? = null
+        override fun load() = value
+        override fun save(session: SavedVoiceSession) { value = session }
+        override fun clear() { value = null }
+    }
+    @Test fun restartRestoresOnlyRefreshCredentialsAndPersistsRotation() {
+        val store = MemoryStore()
+        val first = FirebaseVoiceAuth({ _, _, _ -> loginResponse() },{ now })
+        first.useStore(store); first.login(key,"mock","mock-password")
+        assertEquals(SavedVoiceSession("mock-refresh",key,"user"),store.value)
+        var posts = 0
+        val restarted = FirebaseVoiceAuth({ url, _, body ->
+            posts++; assertTrue(url.startsWith("https://securetoken.googleapis.com/"))
+            assertFalse(body.toString(Charsets.UTF_8).contains("mock-password"))
+            JSONObject().put("id_token",jwt()).put("refresh_token","rotated").put("user_id","user")
+        },{ now })
+        restarted.useStore(store)
+        assertTrue(restarted.restore(restarted.epoch()))
+        assertTrue(restarted.available()); assertEquals("rotated",store.value?.refresh)
+        assertEquals(jwt(),restarted.token()); assertEquals(1,posts)
+        restarted.logout(); assertNull(store.value)
+        assertFalse(restarted.restore(restarted.epoch()))
+    }
+    @Test fun logoutDuringAutomaticRefreshCannotResurrectSavedSession() {
+        val store = MemoryStore().apply { value = SavedVoiceSession("saved",key,"user") }
+        lateinit var auth: FirebaseVoiceAuth
+        auth = FirebaseVoiceAuth({ _, _, _ ->
+            auth.logout()
+            JSONObject().put("id_token",jwt()).put("refresh_token","new").put("user_id","user")
+        },{ now })
+        auth.useStore(store)
+        assertThrows(VoiceAuthException::class.java) { auth.restore(auth.epoch()) }
+        assertFalse(auth.available()); assertNull(store.value)
+    }
+    @Test fun missingSessionNeverMakesNetworkRequestAndTransientFailurePreservesSavedRefresh() {
+        val store = MemoryStore()
+        val auth = FirebaseVoiceAuth({ _, _, _ -> throw VoiceAuthException("Network unavailable",false) },{ now })
+        auth.useStore(store); assertFalse(auth.restore(auth.epoch()))
+        store.value = SavedVoiceSession("saved",key,"user")
+        val error = assertThrows(VoiceAuthException::class.java) { auth.restore(auth.epoch()) }
+        assertFalse(error.fatal); assertFalse(auth.available()); assertEquals("saved",store.value?.refresh)
+    }
+    @Test fun savedAccountIdentityCannotChangeDuringRestore() {
+        val store = MemoryStore().apply { value = SavedVoiceSession("saved",key,"original-user") }
+        val auth = FirebaseVoiceAuth({ _, _, _ ->
+            JSONObject().put("id_token",jwt()).put("refresh_token","new").put("user_id","user")
+        },{ now })
+        auth.useStore(store)
+        assertThrows(VoiceAuthException::class.java) { auth.restore(auth.epoch()) }
+        assertFalse(auth.available()); assertEquals("original-user",store.value?.uid)
     }
 }

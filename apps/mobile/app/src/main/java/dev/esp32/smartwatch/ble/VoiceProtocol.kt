@@ -13,12 +13,20 @@ object VoiceProtocol {
     val RESULT: UUID = UUID.fromString("7e570012-8e7a-4b6d-9f2a-6c4d3e2f1000")
     val CAPS: UUID = UUID.fromString("7e570013-8e7a-4b6d-9f2a-6c4d3e2f1000")
     val STREAM: UUID = UUID.fromString("7e570014-8e7a-4b6d-9f2a-6c4d3e2f1000")
-    fun supportsStream(bytes: ByteArray) = bytes.contentEquals(byteArrayOf(2,1,4,15,0,2))
+    fun streamCredits(bytes: ByteArray): Int {
+        if (bytes.size != 6 || bytes[0].toInt() != 2 || bytes[1].toInt() != 1 ||
+            bytes[3].toInt() != 15 || bytes[4].toInt() != 0 || bytes[5].toInt() != 2) return 0
+        return (bytes[2].toInt() and 255).takeIf { it == 4 || it == 16 } ?: 0
+    }
+    fun supportsStream(bytes: ByteArray) = streamCredits(bytes) != 0
     fun shouldYieldVoice(active: Boolean, alreadyYielded: Boolean, queueSize: Int, next: UUID?) =
         active && !alreadyYielded && queueSize == 1 && (next == CONTROL || next == DATA)
-    fun grant(session: Int, epoch: Int, offset: Int): ByteArray = ByteBuffer.allocate(15)
+    fun grant(session: Int, epoch: Int, offset: Int, credits: Int = 4): ByteArray {
+        require(credits in 1..16)
+        return ByteBuffer.allocate(15)
         .order(ByteOrder.LITTLE_ENDIAN).put(2.toByte()).put(4.toByte()).putInt(session)
-        .putInt(epoch).putInt(offset).put(4.toByte()).array()
+        .putInt(epoch).putInt(offset).put(credits.toByte()).array()
+    }
     fun shouldPollMetadata(transferActive: Boolean, pending: UUID?, queued: Iterable<UUID>) =
         !transferActive && pending != META && queued.none { it == META }
     data class Metadata(val session: Int, val size: Int, val crc: Long)
@@ -71,14 +79,14 @@ object VoiceProtocol {
         fun takeAudio(): ByteArray { require(active && verified && offset == audio.size); return audio.copyOf() }
     }
     /** No out-of-order audio buffer: acknowledge only the verified contiguous prefix. */
-    class StreamReceiver(val receiver: Receiver, mtu: Int) {
+    class StreamReceiver(val receiver: Receiver, mtu: Int, val credits: Int = 4) {
         enum class Event { IGNORE, GAP, PROGRESS, WINDOW, COMPLETE }
         private val payload = (minOf(512,mtu-3)-15) and -2
         var epoch = 0; private set
         private var sequence = 0
         private var retries = 0
         private var retryOffset = -1
-        init { require(mtu in 64..517 && payload > 0) }
+        init { require(mtu in 64..517 && payload > 0 && credits in 1..16) }
         fun nextGrant(retry: Boolean = false): ByteArray {
             require(receiver.active && receiver.offset < receiver.metadata.size)
             if (retry) {
@@ -87,7 +95,7 @@ object VoiceProtocol {
             } else { retries = 0; retryOffset = receiver.offset }
             require(epoch < Int.MAX_VALUE)
             epoch++; sequence = 0
-            return grant(receiver.metadata.session,epoch,receiver.offset)
+            return grant(receiver.metadata.session,epoch,receiver.offset,credits)
         }
         fun accept(frame: ByteArray): Event {
             require(frame.size in 17..(payload+15) && frame[0].toInt() == 2 && (frame.size-15)%2 == 0)
@@ -95,11 +103,11 @@ object VoiceProtocol {
             if (b.getInt(1) != receiver.metadata.session || b.getInt(5) != epoch) return Event.IGNORE
             val at = b.getInt(9); val seq = frame[13].toInt() and 255
             val flags = frame[14].toInt() and 255
-            require(seq < 4 && flags in 0..1)
+            require(seq < credits && flags in 0..1)
             if (at < receiver.offset && seq < sequence) return Event.IGNORE
             if (at != receiver.offset || seq != sequence) return Event.GAP
             require(frame.size-15 == minOf(payload,receiver.metadata.size-at))
-            val last = seq == 3 || at+frame.size-15 == receiver.metadata.size
+            val last = seq == credits-1 || at+frame.size-15 == receiver.metadata.size
             require((flags == 1) == last)
             val complete = receiver.acceptPayload(frame,15,b.getInt(1),at)
             sequence++

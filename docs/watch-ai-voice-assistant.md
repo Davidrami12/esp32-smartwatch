@@ -351,3 +351,19 @@ could not run with redirected stdin (TTY required); bounded pyserial fallback
 captured runtime, closed COM9 cleanly, and logged no audio/transcripts/credentials.
 Full startup capture, real unclaimed expiry interaction, full-length transfer and
 authorized live AI end-to-end validation remain pending.
+# Current automatic AI session policy (2026-10-15)
+
+Supersedes historical memory-only refresh-token / paid-OFF-after-restart notes
+below. One initial manual Firebase login is required; no password or bearer token
+goes in a global `.env` or the APK. Refresh credentials (refresh token, UID and
+public Firebase project key) are encrypted with AES-256-GCM and an Android
+Keystore key, saved atomically in the phone's non-backup directory. ID tokens
+remain in memory. On app startup and watch-ready reconnect, the app attempts
+refresh and backend authorization verification without sending speech to OpenAI.
+Only then are new recordings eligible for paid AI, enabled by default. A manual
+OFF preference survives restarts, reconnects and new logins. Signing out clears
+the saved session/key, revokes queued consent tickets and cancels active calls.
+Old recordings cannot become eligible after automatic restoration. Transient
+network failures retain saved credentials; invalid/revoked credentials or lost
+Keystore access require a new manual sign-in. Transfer-only builds never restore
+automatically or permit voice HTTP requests.
