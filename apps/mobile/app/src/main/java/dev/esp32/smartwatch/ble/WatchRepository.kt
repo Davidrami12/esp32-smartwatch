@@ -139,7 +139,7 @@ class WatchRepository(context: Context) {
         val message = if (result != null && accepted == null) "Paid AI consent revoked. Hold to retry" else error
         val frames = if (accepted != null) VoiceProtocol.resultFrames(session,1,accepted.transcription,negotiatedMtu) +
             VoiceProtocol.resultFrames(session,2,accepted.answer,negotiatedMtu)
-        else VoiceProtocol.resultFrames(session,3,message ?: "AI service unavailable",negotiatedMtu)
+        else VoiceProtocol.resultFrames(session,3,VoiceProtocol.watchError(message),negotiatedMtu)
         frames.forEach { operations.add(Operation(VoiceProtocol.RESULT,writeValue=it)) }
         resultDeliveryStartedNs = System.nanoTime()
         Log.i(TAG,"VoiceLatency trace=${session.toUInt().toString(16).padStart(8,'0')} stage=result_queued frames=${frames.size}")

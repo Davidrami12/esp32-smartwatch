@@ -55,6 +55,8 @@ void watch_ui_configure_2048(uint32_t best, uint32_t random_seed, watch_ui_2048_
 typedef bool (*watch_ui_voice_cb_t)(uint8_t action); // 1 start, 2 release, 3 cancel, 4 preview
 void watch_ui_set_voice_callback(watch_ui_voice_cb_t callback);
 void watch_ui_set_voice(uint8_t state, uint32_t duration_ms, uint8_t level, const char *error);
+// Progress uses only the phone-confirmed contiguous prefix, not radio enqueues.
+void watch_ui_set_voice_progress(uint32_t confirmed_bytes, uint32_t total_bytes);
 void watch_ui_set_voice_text(const char *transcription, const char *answer);
 // Daily goal: 1,000-30,000 in increments of 1,000. Callback rejects failed saves.
 typedef bool (*watch_ui_step_goal_cb_t)(uint32_t goal);

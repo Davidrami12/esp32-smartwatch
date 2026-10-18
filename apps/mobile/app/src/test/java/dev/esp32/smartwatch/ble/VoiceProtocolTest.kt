@@ -7,6 +7,23 @@ import java.nio.ByteOrder
 import java.util.zip.CRC32
 
 class VoiceProtocolTest {
+    @Test fun assistantErrorsAreDistinctBoundedTagsWithoutUpstreamDetails() {
+        val cases = mapOf(
+            "Enable paid AI before recording a new question" to "AI_DISABLED",
+            "Paid AI consent revoked. Hold to retry" to "AI_DISABLED",
+            "Sign in to AI on your phone" to "AI_SIGN_IN",
+            "Configure AI and sign in on phone" to "AI_SIGN_IN",
+            "AI request timed out. Hold to retry" to "AI_TIMEOUT",
+            "AI request limit reached" to "AI_LIMIT",
+            "AI service unavailable" to "AI_SERVICE",
+            "AI request cancelled" to "AI_CANCELLED",
+            "Audio transfer verified. AI paused for testing" to "AI_TEST_MODE",
+            "private upstream error / token=must-not-be-forwarded" to "AI_CONNECTION"
+        )
+        cases.forEach { (message,tag) -> assertEquals(tag,VoiceProtocol.watchError(message)) }
+        assertEquals("AI_CONNECTION",VoiceProtocol.watchError(null))
+        assertEquals("AI_DISABLED",VoiceProtocol.watchError("ENABLE PAID AI"))
+    }
     @Test fun completeAndClear() {
         val audio = ByteArray(8000) { it.toByte() }
         val receiver = VoiceProtocol.Receiver(VoiceProtocol.Metadata(123, audio.size, CRC32().apply { update(audio) }.value))

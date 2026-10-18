@@ -23,6 +23,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.contentDescription
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -46,6 +48,11 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
+            val readingPreferences = remember { getSharedPreferences("reading", MODE_PRIVATE) }
+            var largeText by remember { mutableStateOf(readingPreferences.getBoolean("large_text",false)) }
+            val density = androidx.compose.ui.platform.LocalDensity.current
+            CompositionLocalProvider(androidx.compose.ui.platform.LocalDensity provides
+                androidx.compose.ui.unit.Density(density.density,density.fontScale * if (largeText) 1.2f else 1f)) {
             MaterialTheme(colorScheme = darkColorScheme(
                 primary = Color.White, onPrimary = Color.Black,
                 background = Color.Black, surface = Color(0xFF141414),
@@ -104,9 +111,12 @@ class MainActivity : ComponentActivity() {
                     { startActivity(Intent(this, HealthPrivacyActivity::class.java)) },
                     { runCatching { startActivity(Intent(HealthConnectClient.ACTION_HEALTH_CONNECT_SETTINGS)) } },
                     { showActivity = true; model.refreshActivity() },
-                    { startActivity(Intent(this, dev.esp32.smartwatch.ai.VoiceAiSettingsActivity::class.java)) }) {
+                     { startActivity(Intent(this, dev.esp32.smartwatch.ai.VoiceAiSettingsActivity::class.java)) },
+                     largeText, { enabled -> largeText = enabled; readingPreferences.edit().putBoolean("large_text",enabled).apply() },
+                     { permissions.launch(arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)) }) {
                     startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
                 }
+            }
             }
         }
     }
@@ -123,6 +133,7 @@ private fun SmartwatchScreen(
     healthAutomatic: (Boolean) -> Unit, healthPrivacy: () -> Unit, healthSettings: () -> Unit,
     openActivity: () -> Unit,
     openAi: () -> Unit,
+    largeText: Boolean, setLargeText: (Boolean) -> Unit, requestPermissions: () -> Unit,
     appSettings: () -> Unit,
 ) {
     val busy = state.connectionState in listOf(ConnectionState.CONNECTING, ConnectionState.PAIRING, ConnectionState.DISCOVERING_SERVICES, ConnectionState.RECONNECTING)
@@ -130,21 +141,21 @@ private fun SmartwatchScreen(
         LazyColumn(modifier = Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(24.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)) {
             item { Text("Smartwatch", fontSize = 34.sp, fontWeight = FontWeight.Bold) }
-            item { OutlinedButton(onClick = openActivity, modifier = Modifier.fillMaxWidth()) { Text("Activity dashboard") } }
-            item { OutlinedButton(onClick = openAi, modifier = Modifier.fillMaxWidth()) { Text("AI Assistant · configure / sign in") } }
-            item { HealthConnectCard(health, state, healthPermission, syncHealth, healthAutomatic, healthPrivacy, healthSettings) }
+            item { ReadinessCard(state,permitted,requestPermissions,appSettings,notificationSettings,
+                notificationAllowed,notificationPermission,
+                { if (state.savedWatchAvailable) resumeCompanion() else scan() },openAi) }
             item {
-                Text(when (state.connectionState) {
-                    ConnectionState.DISCONNECTED -> "Disconnected"
-                    ConnectionState.SCANNING -> "Scanning for compatible watches…"
-                    ConnectionState.CONNECTING -> "Connecting…"
-                    ConnectionState.PAIRING -> "Pairing · compare codes on both devices"
-                    ConnectionState.DISCOVERING_SERVICES -> "Discovering services and preparing data…"
-                    ConnectionState.CONNECTED -> "Connected · encrypted + MITM protected"
-                    ConnectionState.RECONNECTING -> "Reconnecting to bonded watch…"
-                    ConnectionState.ERROR -> "Connection error"
-                }, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp)) {
+                        Text("Lectura", style = MaterialTheme.typography.titleMedium)
+                        Text("Amplía el texto de esta pantalla y del panel de actividad. Respeta también el tamaño configurado en Android.")
+                        Switch(checked = largeText,onCheckedChange = setLargeText,
+                            modifier = Modifier.semantics { contentDescription = "Texto ampliado" })
+                    }
+                }
             }
+            item { OutlinedButton(onClick = openActivity, modifier = Modifier.fillMaxWidth()) { Text("Activity dashboard") } }
+            item { HealthConnectCard(health, state, healthPermission, syncHealth, healthAutomatic, healthPrivacy, healthSettings) }
             if (!permitted) item {
                 Text("Nearby devices permission is required to find and connect to your watch. Location is not used.")
                 TextButton(onClick = appSettings) { Text("Open app settings") }

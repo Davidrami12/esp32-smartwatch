@@ -40,6 +40,7 @@ endif()
 # Main include files of the project
 set(WATCH_FONT_SOURCES
     ../../components/watch-ui/watch_fonts.cpp
+    ../../components/watch-ui/fonts/watch_latin_14.c
     ../../components/watch-ui/fonts/watch_latin_18.c
     ../../components/watch-ui/fonts/watch_latin_26.c
     ../../components/watch-ui/fonts/watch_latin_30.c

@@ -20,6 +20,7 @@ object VoiceAiClient {
     @Volatile private var backendVerified = false
     @Volatile var sessionStatus = "Sign in once to enable automatic AI access"; private set
     val paidRequestsEnabled get() = consent.enabled()
+    val sessionReady get() = backendVerified && auth.available()
     val paidRequestsRequested get() = preferences?.getBoolean("paid_enabled",true) != false
     internal fun consentTicket() = consent.ticket()
     internal fun consentValid(ticket: PaidVoiceConsent.Ticket?) = consent.permits(ticket)

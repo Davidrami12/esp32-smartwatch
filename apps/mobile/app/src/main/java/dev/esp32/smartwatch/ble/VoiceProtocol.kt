@@ -13,6 +13,20 @@ object VoiceProtocol {
     val RESULT: UUID = UUID.fromString("7e570012-8e7a-4b6d-9f2a-6c4d3e2f1000")
     val CAPS: UUID = UUID.fromString("7e570013-8e7a-4b6d-9f2a-6c4d3e2f1000")
     val STREAM: UUID = UUID.fromString("7e570014-8e7a-4b6d-9f2a-6c4d3e2f1000")
+    /** Stable UI-only error tags; never send upstream exceptions or credentials. */
+    fun watchError(error: String?): String {
+        val text = error.orEmpty().lowercase(java.util.Locale.ROOT)
+        return when {
+            "paused for testing" in text || "transfer test mode" in text -> "AI_TEST_MODE"
+            "consent" in text || "enable paid ai" in text -> "AI_DISABLED"
+            "sign in" in text || "firebase" in text || "configure ai" in text -> "AI_SIGN_IN"
+            "timed out" in text || "timeout" in text -> "AI_TIMEOUT"
+            "limit reached" in text -> "AI_LIMIT"
+            "service unavailable" in text -> "AI_SERVICE"
+            "cancelled" in text -> "AI_CANCELLED"
+            else -> "AI_CONNECTION"
+        }
+    }
     fun streamCredits(bytes: ByteArray): Int {
         if (bytes.size != 6 || bytes[0].toInt() != 2 || bytes[1].toInt() != 1 ||
             bytes[3].toInt() != 15 || bytes[4].toInt() != 0 || bytes[5].toInt() != 2) return 0

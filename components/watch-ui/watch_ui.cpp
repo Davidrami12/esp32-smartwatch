@@ -2,6 +2,7 @@
 #include "watch_design.h"
 #include "watch_time_tools.h"
 #include "watch_2048.h"
+#include "watch_voice_feedback.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -25,13 +26,17 @@ static watch_ui_voice_cb_t voice_callback;
 static lv_obj_t *voice_status, *voice_details, *voice_level, *voice_hold, *voice_preview;
 static lv_obj_t *voice_transcription, *voice_answer;
 static lv_obj_t *voice_note, *voice_question_heading, *voice_answer_heading;
-static lv_obj_t *voice_microphone;
+static lv_obj_t *voice_microphone, *voice_waiting;
 static uint8_t voice_state = 0;
 static bool voice_held = false;
+static uint32_t voice_confirmed = 0, voice_total = 0;
 static void cancel_voice()
 {
     voice_held = false;
     if (voice_callback) voice_callback(3);
+    watch_ui_set_voice_text("","");
+    watch_ui_set_voice_progress(0,0);
+    watch_ui_set_voice(0,0,0,nullptr);
 }
 static Watch2048 game_2048;
 static watch_ui_2048_best_cb_t game_best_callback = nullptr;
@@ -126,6 +131,12 @@ static lv_screen_load_anim_t navigation_animation(WatchScreen from, WatchScreen 
     // Home buttons map spatially: Settings is left, Apps is right.
     if (from == WatchScreen::Home && to == WatchScreen::Settings) return LV_SCR_LOAD_ANIM_MOVE_RIGHT;
     if (from == WatchScreen::Settings && to == WatchScreen::Home) return LV_SCR_LOAD_ANIM_MOVE_LEFT;
+    const auto settings_option = [](WatchScreen screen) {
+        return screen == WatchScreen::Wifi || screen == WatchScreen::Bluetooth ||
+               screen == WatchScreen::Brightness || screen == WatchScreen::Timeout;
+    };
+    if (from == WatchScreen::Settings && settings_option(to)) return LV_SCR_LOAD_ANIM_MOVE_RIGHT;
+    if (settings_option(from) && to == WatchScreen::Settings) return LV_SCR_LOAD_ANIM_MOVE_LEFT;
     const bool back = to == WatchScreen::Home ||
         ((to == WatchScreen::Launcher || to == WatchScreen::Settings) && from != WatchScreen::Home);
     return back ? LV_SCR_LOAD_ANIM_MOVE_RIGHT : LV_SCR_LOAD_ANIM_MOVE_LEFT;
@@ -250,13 +261,20 @@ static lv_obj_t *button(lv_obj_t *screen, const char *text, int width, int heigh
                         lv_align_t align, int x, int y, lv_event_cb_t callback)
 {
     lv_obj_t *object = lv_button_create(screen);
-    lv_obj_set_size(object, width, height);
+    lv_obj_set_size(object, width < design::TouchHeight ? design::TouchHeight : width,
+                    height < design::TouchHeight ? design::TouchHeight : height);
     lv_obj_align(object, align, x, y);
     style_surface(object);
     style_press_feedback(object);
     lv_obj_set_style_text_color(object, lv_color_hex(design::Disabled), LV_STATE_DISABLED);
+    lv_obj_set_style_text_color(object, lv_color_hex(kWhite), 0);
     if (callback) lv_obj_add_event_cb(object, callback, LV_EVENT_CLICKED, nullptr);
-    label(object, text, design::body(), kWhite, LV_ALIGN_CENTER, 0, 0);
+    // Inherit text color from the button so disabled/pressed states apply to
+    // every app consistently (a fixed child color previously masked them).
+    auto *text_label = lv_label_create(object);
+    lv_label_set_text(text_label,text);
+    lv_obj_set_style_text_font(text_label,design::body(),0);
+    lv_obj_center(text_label);
     return object;
 }
 
@@ -286,6 +304,9 @@ static lv_obj_t *create_screen(WatchScreen id, const char *title)
         snprintf(heading, sizeof(heading), "%s", title);
         for (char *p = heading; *p; ++p) *p = static_cast<char>(toupper(static_cast<unsigned char>(*p)));
         lv_obj_t *heading_label = label(screen, heading, design::title(), kWhite, LV_ALIGN_TOP_MID, 0, design::HeaderY);
+        lv_obj_set_width(heading_label,design::ContentWidth);
+        lv_obj_set_style_text_align(heading_label,LV_TEXT_ALIGN_CENTER,0);
+        lv_label_set_long_mode(heading_label,LV_LABEL_LONG_DOT);
         lv_obj_set_style_text_letter_space(heading_label, 2, 0);
         const bool parent_screen = id == WatchScreen::Launcher || id == WatchScreen::Settings;
         button(screen, id == WatchScreen::Notification ? LV_SYMBOL_CLOSE "  DISMISS" : parent_screen ? LV_SYMBOL_HOME "  HOME" : LV_SYMBOL_LEFT "  BACK",
@@ -650,11 +671,13 @@ static void create_bluetooth_screen()
                                    LV_ALIGN_TOP_MID, 0, 192);
     security_label = label(screen, "No paired phone", &lv_font_montserrat_16, kMuted,
           LV_ALIGN_TOP_MID, 0, 236);
-    bluetooth_action = button(screen, "Enable Bluetooth", 300, 64, LV_ALIGN_TOP_MID, 0, 314,
+    lv_obj_set_width(security_label,design::ContentWidth);
+    lv_obj_set_style_text_align(security_label,LV_TEXT_ALIGN_CENTER,0);
+    bluetooth_action = button(screen, "Enable Bluetooth", design::ContentWidth, design::TouchHeight, LV_ALIGN_TOP_MID, 0, 286,
                               bluetooth_action_cb);
     bluetooth_action_label = lv_obj_get_child(bluetooth_action, 0);
     lv_obj_add_state(bluetooth_action, LV_STATE_DISABLED);
-    forget_phone_button = button(screen, "Forget paired phone", 300, 48, LV_ALIGN_TOP_MID, 0, 388,
+    forget_phone_button = button(screen, "Forget paired phone", design::ContentWidth, design::TouchHeight, LV_ALIGN_TOP_MID, 0, 350,
         [](lv_event_t *) { navigate_to(WatchScreen::ForgetPhone); });
     lv_obj_add_state(forget_phone_button, LV_STATE_DISABLED);
 }
@@ -666,13 +689,13 @@ static void create_activity_screen()
           LV_ALIGN_TOP_LEFT, design::Margin, 78);
     activity_steps_label = label(screen, "0", design::number(), design::Activity,
                                  LV_ALIGN_TOP_LEFT, design::Margin, design::ActivityCountY);
-    goal_minus = button(screen, "-", 48, 48, LV_ALIGN_TOP_LEFT, design::Margin, 158, step_goal_changed_cb);
+    goal_minus = button(screen, "-", 56, 56, LV_ALIGN_TOP_LEFT, design::Margin, 150, step_goal_changed_cb);
     activity_goal_label = label(screen, "Goal 8,000", design::caption(), kMuted, LV_ALIGN_TOP_MID, 0, 174);
-    goal_plus = button(screen, "+", 48, 48, LV_ALIGN_TOP_RIGHT, -design::Margin, 158, step_goal_changed_cb);
+    goal_plus = button(screen, "+", 56, 56, LV_ALIGN_TOP_RIGHT, -design::Margin, 150, step_goal_changed_cb);
     label(screen, "7 DAYS / LOCAL", design::caption(), kMuted,
-          LV_ALIGN_TOP_LEFT, design::Margin, 212);
+          LV_ALIGN_TOP_LEFT, design::Margin, 218);
     for (unsigned i = 0; i < 7; ++i) {
-        const int y = 238 + i * 26;
+        const int y = 242 + i * 24;
         history_names[i] = label(screen, "--", &lv_font_montserrat_18, i ? kMuted : kWhite,
                                  LV_ALIGN_TOP_LEFT, 44, y);
         history_counts[i] = label(screen, "0", &lv_font_montserrat_20, i ? kWhite : design::Activity,
@@ -695,7 +718,7 @@ static void create_wifi_screen()
     lv_obj_set_style_text_align(wifi_name_label, LV_TEXT_ALIGN_CENTER, 0);
     wifi_signal_label = label(screen, "", &lv_font_montserrat_20, kMuted,
                                LV_ALIGN_TOP_MID, 0, 272);
-    wifi_action = button(screen, "Connect", 300, 64, LV_ALIGN_TOP_MID, 0, 314, wifi_action_cb);
+    wifi_action = button(screen, "Connect", design::ContentWidth, 64, LV_ALIGN_TOP_MID, 0, 314, wifi_action_cb);
     wifi_action_label = lv_obj_get_child(wifi_action, 0);
     lv_obj_add_state(wifi_action, LV_STATE_DISABLED);
 }
@@ -809,9 +832,10 @@ static void create_settings_screen()
     brightness_label = label(screen, "60%", &lv_font_montserrat_26, design::Brightness,
                              LV_ALIGN_TOP_MID, 0, 157);
     brightness_slider = lv_slider_create(screen);
-    lv_obj_set_size(brightness_slider, 202, 16);
+    lv_obj_set_size(brightness_slider, 186, 16);
     lv_obj_align(brightness_slider, LV_ALIGN_TOP_MID, 0, 213);
-    lv_obj_set_ext_click_area(brightness_slider, 12);
+    lv_obj_set_ext_click_area(brightness_slider, 20); // 56px-high touch region, no overlap with +/-.
+    lv_obj_remove_flag(brightness_slider,LV_OBJ_FLAG_GESTURE_BUBBLE);
     lv_obj_t *minus = button(screen, "-", 48, 56, LV_ALIGN_TOP_LEFT, design::Margin, 193, nullptr);
     lv_obj_t *plus = button(screen, "+", 48, 56, LV_ALIGN_TOP_RIGHT, -design::Margin, 193, nullptr);
     static bool increment = true;
@@ -1069,7 +1093,7 @@ static void voice_hold_cb(lv_event_t *event)
     const auto code = lv_event_get_code(event);
     if (code == LV_EVENT_PRESSED && display_active) {
         voice_held = voice_callback && voice_callback(1);
-        if (!voice_held) watch_ui_set_voice(5,0,0,voice_callback ? "Microphone busy or unavailable" : "Simulator: microphone unavailable");
+        if (!voice_held) watch_ui_set_voice(5,0,0,voice_callback ? "Micrófono ocupado o no disponible" : "Simulador: micrófono no disponible");
     } else if (code == LV_EVENT_RELEASED && voice_held) {
         voice_held = false; if (voice_callback) voice_callback(2);
     } else if (code == LV_EVENT_PRESS_LOST) cancel_voice();
@@ -1099,13 +1123,19 @@ static void microphone_draw_cb(lv_event_t *event)
 static void create_voice_screen()
 {
     auto *screen = create_screen(WatchScreen::Voice,"AI Assistant");
-    voice_status = label(screen,"HOLD TO RECORD",design::body(),kWhite,LV_ALIGN_TOP_MID,0,84);
-    auto *note = voice_note = label(screen,"Mantén pulsado, habla y suelta.\nAudio enviado a través del móvil.",design::body(),kMuted,LV_ALIGN_TOP_MID,0,126);
+    voice_status = label(screen,"Mantén pulsado para hablar",design::body(),kWhite,LV_ALIGN_TOP_MID,0,84);
+    lv_obj_set_width(voice_status,design::ContentWidth);
+    lv_obj_set_style_text_align(voice_status,LV_TEXT_ALIGN_CENTER,0);
+    lv_label_set_long_mode(voice_status,LV_LABEL_LONG_WRAP);
+    auto *note = voice_note = label(screen,"Mantén pulsado, habla y suelta.\nAudio enviado a través del móvil.",design::body(),kMuted,LV_ALIGN_TOP_MID,0,136);
     lv_obj_set_width(note,design::ContentWidth); lv_obj_set_style_text_align(note,LV_TEXT_ALIGN_CENTER,0);
-    voice_details = label(screen,"16 kHz PCM / max 8 seconds",design::caption(),kMuted,LV_ALIGN_TOP_MID,0,182);
+    voice_details = label(screen,"Máximo 8 segundos",design::caption(),kMuted,LV_ALIGN_TOP_MID,0,190);
     lv_obj_set_width(voice_details,design::ContentWidth); lv_obj_set_style_text_align(voice_details,LV_TEXT_ALIGN_CENTER,0);
-    voice_level = lv_bar_create(screen); lv_obj_set_size(voice_level,design::ContentWidth,8);
+    voice_level = lv_bar_create(screen); lv_obj_set_size(voice_level,design::ContentWidth,12);
     lv_obj_align(voice_level,LV_ALIGN_TOP_MID,0,224); lv_bar_set_range(voice_level,0,100);
+    lv_obj_set_style_bg_color(voice_level,lv_color_hex(design::Border),LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(voice_level,LV_OPA_COVER,LV_PART_MAIN);
+    lv_obj_remove_flag(voice_level,LV_OBJ_FLAG_CLICKABLE);
     voice_hold = button(screen,"HOLD TO TALK",design::ContentWidth,96,LV_ALIGN_TOP_MID,0,246,nullptr);
     lv_obj_align(lv_obj_get_child(voice_hold,0),LV_ALIGN_CENTER,18,0);
     voice_microphone = lv_obj_create(voice_hold); lv_obj_remove_style_all(voice_microphone);
@@ -1128,6 +1158,9 @@ static void create_voice_screen()
     lv_obj_set_style_pad_row(results,10,0);
     lv_obj_set_flex_flow(results,LV_FLEX_FLOW_COLUMN); lv_obj_set_scroll_dir(results,LV_DIR_VER);
     lv_obj_remove_flag(results,LV_OBJ_FLAG_GESTURE_BUBBLE);
+    // Handle horizontal back locally once. Vertical scrolling remains owned by
+    // the card, without bubbling a second navigation event to the screen.
+    lv_obj_add_event_cb(results,navigation_gesture_cb,LV_EVENT_GESTURE,nullptr);
     voice_question_heading = lv_label_create(results);
     lv_obj_set_style_text_font(voice_question_heading,design::body(),0);
     lv_obj_set_style_text_color(voice_question_heading,lv_color_hex(0xB8B8B8),0);
@@ -1146,6 +1179,10 @@ static void create_voice_screen()
     lv_obj_set_style_text_color(voice_answer,lv_color_hex(0xFFFFFF),0);
     lv_obj_set_style_text_line_space(voice_answer,4,0);
     lv_label_set_text(voice_transcription,""); lv_label_set_text(voice_answer,"");
+    voice_waiting = label(results,"El móvil está preparando la respuesta.\nPuedes cancelar con CLEAR o BACK.",design::body(),kMuted,LV_ALIGN_TOP_LEFT,0,0);
+    lv_obj_set_width(voice_waiting,LV_PCT(100));
+    lv_label_set_long_mode(voice_waiting,LV_LABEL_LONG_WRAP);
+    lv_obj_add_flag(voice_waiting,LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(results,LV_OBJ_FLAG_HIDDEN);
     lv_obj_set_user_data(voice_answer,results);
 }
@@ -1320,33 +1357,61 @@ void watch_ui_set_security_status(const char *text, bool has_phone)
 }
 void watch_ui_set_media_callback(watch_ui_media_command_cb_t callback) { media_callback = callback; }
 void watch_ui_set_voice_callback(watch_ui_voice_cb_t callback) { voice_callback = callback; }
+static void render_voice_progress()
+{
+    if (!voice_status || voice_state != 6) return;
+    const auto percent = watch_voice_feedback::percent(voice_confirmed,voice_total);
+    lv_label_set_text_fmt(voice_status,"Enviando al móvil · %u%%",unsigned(percent));
+    lv_label_set_text_fmt(voice_details,"%lu / %lu bytes confirmados",
+        static_cast<unsigned long>(voice_confirmed > voice_total ? voice_total : voice_confirmed),static_cast<unsigned long>(voice_total));
+    lv_bar_set_value(voice_level,percent,LV_ANIM_OFF);
+}
+void watch_ui_set_voice_progress(uint32_t confirmed_bytes, uint32_t total_bytes)
+{
+    voice_confirmed = confirmed_bytes; voice_total = total_bytes;
+    render_voice_progress();
+}
 void watch_ui_set_voice(uint8_t state, uint32_t duration_ms, uint8_t level, const char *error)
 {
     voice_state = state;
     if (!voice_status) return;
-    const char *states[] = {"HOLD TO RECORD","STARTING MICROPHONE","RECORDING / RELEASE TO STOP","WAITING FOR PHONE / READY","PLAYING LOCAL TEST","STOPPED / SEE MESSAGE","TRANSFERRING TO PHONE","PROCESSING AI REQUEST","AI RESPONSE"};
-    lv_label_set_text(voice_status,states[state < 9 ? state : 5]);
-    lv_obj_set_style_text_color(voice_status,lv_color_hex(state == 2 ? kWarning : kWhite),0);
-    if (error) lv_label_set_text(voice_details,error);
-    else lv_label_set_text_fmt(voice_details,"%lu.%lus / 8s  |  %s",static_cast<unsigned long>(duration_ms/1000),
-        static_cast<unsigned long>((duration_ms%1000)/100),state == 3 ? "Enable companion; expires in 30s" : "16 kHz PCM");
+    const char *states[] = {"Mantén pulsado para hablar","Preparando micrófono","Grabando · suelta para enviar","Esperando al móvil","Reproduciendo audio","Error de conexión","Enviando al móvil","Preparando respuesta","Respuesta lista"};
+    const bool disconnected = state == 3 && bluetooth_state != WATCH_UI_BLUETOOTH_CONNECTED;
+    lv_label_set_text(voice_status,state == 5 && error ? error : disconnected ? "Móvil desconectado" : states[state < 9 ? state : 5]);
+    const bool test = error && strstr(error,"Prueba completada");
+    lv_obj_set_style_text_color(voice_status,lv_color_hex(state == 2 || (state == 5 && !test) ? kWarning : kWhite),0);
+    lv_label_set_text(voice_note,state == 5 ? watch_voice_feedback::hint(error) : disconnected ?
+        "Conecta el móvil y abre la app.\nEl audio se guarda durante 30 s." : state == 3 ?
+        "Esperando a que la app recoja el audio.\nPuedes cancelar con CLEAR o BACK." : state == 6 ?
+        "Progreso confirmado por el móvil.\nPuedes cancelar con CLEAR o BACK." :
+        "Mantén pulsado, habla y suelta.\nAudio enviado a través del móvil.");
+    if (error) lv_label_set_text(voice_details,"Mantén pulsado para reintentar.");
+    else lv_label_set_text_fmt(voice_details,"%lu,%lu s / máximo 8 s",static_cast<unsigned long>(duration_ms/1000),
+        static_cast<unsigned long>((duration_ms%1000)/100));
     lv_bar_set_value(voice_level,level > 100 ? 100 : level,LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(voice_level,lv_color_hex(state == 6 ? design::Bluetooth : design::Activity),LV_PART_INDICATOR);
+    render_voice_progress();
     if (state == 3) lv_obj_remove_state(voice_preview,LV_STATE_DISABLED); else lv_obj_add_state(voice_preview,LV_STATE_DISABLED);
     if (state == 4 || state == 6 || state == 7) lv_obj_add_state(voice_hold,LV_STATE_DISABLED); else lv_obj_remove_state(voice_hold,LV_STATE_DISABLED);
     const bool showing = state == 7 || state == 8 || (state == 5 && lv_label_get_text(voice_answer)[0]);
     if (showing) lv_obj_add_flag(voice_note,LV_OBJ_FLAG_HIDDEN);
     else lv_obj_remove_flag(voice_note,LV_OBJ_FLAG_HIDDEN);
-    lv_label_set_text(voice_answer_heading,state == 7 ? "WAITING FOR RESPONSE..." : state == 5 ? "MESSAGE" : "RESPONSE");
+    lv_label_set_text(voice_answer_heading,state == 5 ? "MESSAGE" : "RESPONSE");
+    const bool question = lv_label_get_text(voice_transcription)[0] != 0;
+    if (question) { lv_obj_remove_flag(voice_question_heading,LV_OBJ_FLAG_HIDDEN); lv_obj_remove_flag(voice_transcription,LV_OBJ_FLAG_HIDDEN); }
+    else { lv_obj_add_flag(voice_question_heading,LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(voice_transcription,LV_OBJ_FLAG_HIDDEN); }
+    if (state == 7) lv_obj_remove_flag(voice_waiting,LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(voice_waiting,LV_OBJ_FLAG_HIDDEN);
+    if (state == 5 && showing && error) lv_label_set_text(voice_answer,watch_voice_feedback::hint(error));
     auto *results = static_cast<lv_obj_t *>(lv_obj_get_user_data(voice_answer));
     if (showing) { lv_obj_remove_flag(results,LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(voice_hold,LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(voice_level,LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(voice_details,LV_OBJ_FLAG_HIDDEN); }
     else { lv_obj_add_flag(results,LV_OBJ_FLAG_HIDDEN); lv_obj_remove_flag(voice_hold,LV_OBJ_FLAG_HIDDEN); lv_obj_remove_flag(voice_level,LV_OBJ_FLAG_HIDDEN); lv_obj_remove_flag(voice_details,LV_OBJ_FLAG_HIDDEN); }
     if (state == 8 || state == 5) lv_obj_remove_flag(voice_hold,LV_OBJ_FLAG_HIDDEN);
     const bool retry = state == 8 || state == 5;
-    lv_label_set_text(lv_obj_get_child(voice_hold,0),retry ? "HOLD / RETRY" : "HOLD TO TALK");
-    lv_obj_align(lv_obj_get_child(voice_hold,0),LV_ALIGN_CENTER,retry ? 0 : 18,0);
-    if (retry) lv_obj_add_flag(voice_microphone,LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(lv_obj_get_child(voice_hold,0),retry ? "HOLD / RETRY" : state == 2 ? "SUELTA PARA ENVIAR" : "HOLD TO TALK");
+    lv_obj_align(lv_obj_get_child(voice_hold,0),LV_ALIGN_CENTER,retry || state == 2 ? 0 : 18,0);
+    if (retry || state == 2) lv_obj_add_flag(voice_microphone,LV_OBJ_FLAG_HIDDEN);
     else lv_obj_remove_flag(voice_microphone,LV_OBJ_FLAG_HIDDEN);
-    if (showing) { lv_obj_align(results,LV_ALIGN_TOP_MID,0,120); lv_obj_set_height(results,226); }
+    if (showing) { lv_obj_align(results,LV_ALIGN_TOP_MID,0,136); lv_obj_set_height(results,210); }
     else { lv_obj_align(results,LV_ALIGN_TOP_MID,0,162); lv_obj_set_height(results,190); }
     if (state == 8 || state == 5) { lv_obj_set_size(voice_hold,160,56); lv_obj_align(voice_hold,LV_ALIGN_TOP_MID,-88,354); lv_obj_add_flag(voice_preview,LV_OBJ_FLAG_HIDDEN); }
     else { lv_obj_set_size(voice_hold,design::ContentWidth,96); lv_obj_align(voice_hold,LV_ALIGN_TOP_MID,0,246); lv_obj_remove_flag(voice_preview,LV_OBJ_FLAG_HIDDEN); }

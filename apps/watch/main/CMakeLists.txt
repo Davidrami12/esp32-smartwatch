@@ -23,6 +23,7 @@ idf_component_register(
         ../../../components/watch-ui/watch_ui.cpp
         ../../../components/watch-ui/watch_2048.cpp
         ../../../components/watch-ui/watch_fonts.cpp
+        ../../../components/watch-ui/fonts/watch_latin_14.c
         ../../../components/watch-ui/fonts/watch_latin_18.c
         ../../../components/watch-ui/fonts/watch_latin_26.c
         ../../../components/watch-ui/fonts/watch_latin_30.c

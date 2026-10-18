@@ -8,6 +8,7 @@
 #include "../apps/watch/main/watch_media_protocol.h"
 #include <vector>
 #include "../components/watch-ui/watch_voice_result.h"
+#include "../components/watch-ui/watch_touch_gate.h"
 
 static void notification_protocol_tests()
 {
@@ -84,9 +85,38 @@ static lv_obj_t *find_button(lv_obj_t *screen, const char *text)
     assert(false && "Button not found");
     return nullptr;
 }
+static void check_touch_targets(lv_obj_t *parent)
+{
+    if (lv_obj_check_type(parent,&lv_button_class)) {
+        assert(lv_obj_get_width(parent) >= design::TouchHeight);
+        assert(lv_obj_get_height(parent) >= design::TouchHeight);
+    }
+    for (uint32_t i = 0; i < lv_obj_get_child_count(parent); ++i) check_touch_targets(lv_obj_get_child(parent,i));
+}
 
 int main()
 {
+    {
+        WatchTouchGate gate;
+        auto sample = gate.sample(false,true); assert(!sample.allow && sample.wake_press);
+        sample = gate.sample(false,true); assert(!sample.allow && !sample.wake_press);
+        assert(!gate.sample(false,false).allow);
+        sample = gate.sample(false,true); assert(!sample.allow && sample.wake_press);
+        assert(!gate.sample(true,true).allow); // Second tap wakes, but cannot click or swipe.
+        assert(!gate.sample(true,false).allow); // Its release cannot click either.
+        assert(gate.sample(true,true).allow); // A fresh, awake touch works.
+        gate.sleep();
+        assert(!gate.sample(false,true).wake_press); // Held finger is not another tap.
+        assert(!gate.sample(false,false).allow);
+        assert(gate.sample(false,true).wake_press);
+        assert(!gate.sample(true,true).allow); // Also safe if awakened externally.
+    }
+    for (auto option : {WatchScreen::Wifi, WatchScreen::Bluetooth, WatchScreen::Brightness, WatchScreen::Timeout}) {
+        assert(navigation_animation(WatchScreen::Settings,option) == LV_SCR_LOAD_ANIM_MOVE_RIGHT);
+        assert(navigation_animation(option,WatchScreen::Settings) == LV_SCR_LOAD_ANIM_MOVE_LEFT);
+    }
+    assert(navigation_animation(WatchScreen::Launcher,WatchScreen::Voice) == LV_SCR_LOAD_ANIM_MOVE_LEFT);
+    assert(navigation_animation(WatchScreen::Voice,WatchScreen::Launcher) == LV_SCR_LOAD_ANIM_MOVE_RIGHT);
     {
         WatchMediaAssembler assembler; watch_media_t media;
         uint8_t frame[] = {1, 2, 1, 0, 0, 0, 12, 0, 1, 1, 7, 0, 99, 0, 0, 0, 0, 0, 0, 0};
@@ -133,7 +163,7 @@ int main()
     watch_ui_create();
     const uint32_t spanish_glyphs[] = {0x00a1, 0x00bf, 0x00c1, 0x00c9, 0x00cd, 0x00d1, 0x00d3, 0x00da,
         0x00dc, 0x00e1, 0x00e9, 0x00ed, 0x00f1, 0x00f3, 0x00fa, 0x00fc};
-    const lv_font_t *spanish_fonts[] = {watch_font_18(), watch_font_26(), watch_font_30()};
+    const lv_font_t *spanish_fonts[] = {design::caption(), watch_font_18(), watch_font_26(), watch_font_30()};
     for (const auto *font : spanish_fonts) {
         for (const auto codepoint : spanish_glyphs) {
             lv_font_glyph_dsc_t glyph = {};
@@ -282,8 +312,8 @@ int main()
     assert(navigation_animation(WatchScreen::Settings, WatchScreen::Home) == LV_SCR_LOAD_ANIM_MOVE_LEFT);
     assert(navigation_animation(WatchScreen::Home, WatchScreen::Launcher) == LV_SCR_LOAD_ANIM_MOVE_LEFT);
     assert(navigation_animation(WatchScreen::Launcher, WatchScreen::Home) == LV_SCR_LOAD_ANIM_MOVE_RIGHT);
-    assert(navigation_animation(WatchScreen::Settings, WatchScreen::Wifi) == LV_SCR_LOAD_ANIM_MOVE_LEFT);
-    assert(navigation_animation(WatchScreen::Wifi, WatchScreen::Settings) == LV_SCR_LOAD_ANIM_MOVE_RIGHT);
+    assert(navigation_animation(WatchScreen::Settings, WatchScreen::Wifi) == LV_SCR_LOAD_ANIM_MOVE_RIGHT);
+    assert(navigation_animation(WatchScreen::Wifi, WatchScreen::Settings) == LV_SCR_LOAD_ANIM_MOVE_LEFT);
     assert(navigation_animation(WatchScreen::Launcher, WatchScreen::Timer) == LV_SCR_LOAD_ANIM_MOVE_LEFT);
     assert(navigation_animation(WatchScreen::Timer, WatchScreen::Launcher) == LV_SCR_LOAD_ANIM_MOVE_RIGHT);
     lv_obj_t *apps = find_button(screen_for(WatchScreen::Home), LV_SYMBOL_LIST "  APPS");
@@ -451,5 +481,40 @@ int main()
     assert(strcmp(lv_label_get_text(voice_transcription),spanish) == 0);
     assert(!lv_obj_has_flag(static_cast<lv_obj_t *>(lv_obj_get_user_data(voice_answer)),LV_OBJ_FLAG_HIDDEN));
     ai_result.clear(); assert(!ai_result.transcription[0] && !ai_result.answer[0]);
+    assert(watch_voice_feedback::percent(0,0) == 0);
+    assert(watch_voice_feedback::percent(2000,8000) == 25);
+    assert(watch_voice_feedback::percent(7999,8000) == 99);
+    assert(watch_voice_feedback::percent(9000,8000) == 100);
+    watch_ui_set_voice_text("","");
+    watch_ui_set_voice(6,2000,90,nullptr);
+    watch_ui_set_voice_progress(2000,8000);
+    assert(strstr(lv_label_get_text(voice_status),"25%"));
+    assert(lv_bar_get_value(voice_level) == 25);
+    assert(strstr(lv_label_get_text(voice_details),"2000 / 8000"));
+    watch_ui_set_voice(2,2000,73,nullptr);
+    assert(strstr(lv_label_get_text(voice_status),"suelta para enviar"));
+    assert(lv_bar_get_value(voice_level) == 73); // Microphone level is not transfer percent.
+    watch_ui_set_voice(7,2000,0,nullptr);
+    assert(!strchr(lv_label_get_text(voice_status),'%'));
+    assert(!lv_obj_has_flag(voice_waiting,LV_OBJ_FLAG_HIDDEN));
+    watch_ui_set_voice_text("","AI desactivada");
+    watch_ui_set_voice(5,0,0,watch_voice_feedback::message("AI_DISABLED"));
+    assert(strcmp(lv_label_get_text(voice_status),"AI desactivada") == 0);
+    assert(strstr(lv_label_get_text(voice_answer),"activarla"));
+    assert(strcmp(watch_voice_feedback::message("AI_SIGN_IN"),"Inicia sesión en el móvil") == 0);
+    assert(strcmp(watch_voice_feedback::message("unknown"),"Error de conexión") == 0);
+    watch_ui_set_bluetooth_state(WATCH_UI_BLUETOOTH_DISABLED);
+    watch_ui_set_voice(3,2000,0,nullptr);
+    assert(strcmp(lv_label_get_text(voice_status),"Móvil desconectado") == 0);
+    open_voice_cb(nullptr); process_swipe(LV_DIR_TOP); assert(current_screen == WatchScreen::Voice);
+    process_swipe(LV_DIR_RIGHT); assert(current_screen == WatchScreen::Launcher);
+    assert(voice_state == 0 && !voice_held && !lv_label_get_text(voice_answer)[0]);
+    navigate_to(WatchScreen::Bluetooth); lv_obj_update_layout(screen_for(WatchScreen::Bluetooth));
+    auto *bluetooth_back = find_button(screen_for(WatchScreen::Bluetooth),LV_SYMBOL_LEFT "  BACK");
+    assert(lv_obj_get_y(bluetooth_action)+lv_obj_get_height(bluetooth_action)+8 <= lv_obj_get_y(forget_phone_button));
+    assert(lv_obj_get_y(forget_phone_button)+lv_obj_get_height(forget_phone_button)+8 <= lv_obj_get_y(bluetooth_back));
+    lv_obj_add_state(bluetooth_action,LV_STATE_DISABLED);
+    assert(lv_color_eq(lv_obj_get_style_text_color(bluetooth_action_label,LV_PART_MAIN),lv_color_hex(design::Disabled)));
+    for (auto *screen : screens) { lv_obj_update_layout(screen); check_touch_targets(screen); }
     puts("PASS: UI/navigation/time tools, 2048, media, Spanish fonts, voice privacy routing and bounded Spanish AI results");
 }

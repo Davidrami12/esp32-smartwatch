@@ -10,13 +10,17 @@
 #include "esp_log.h"
 #include "watch_voice_result.h"
 #include "watch_voice_window.h"
+#include "watch_voice_feedback.h"
 #include <atomic>
 #include <string.h>
+#include <stdio.h>
 
 namespace {
 constexpr unsigned kRate = 16000, kFrames = 320, kMaxSamples = kRate * 8;
 constexpr uint32_t kStart = 1, kPlay = 2, kCancel = 4;
 constexpr uint32_t kProcess = 8;
+constexpr uint32_t kDisconnected = 16;
+std::atomic<uint32_t> confirmed_bytes{0}, total_bytes{0};
 std::atomic<uint32_t> request_id{0};
 WatchVoiceResult result_text;
 uint32_t text_revision = 0;
@@ -59,6 +63,7 @@ void clear_audio()
         heap_caps_free(pcm); pcm = nullptr;
     }
     samples = 0; expires = 0;
+    confirmed_bytes = 0; total_bytes = 0;
     session_id = selected_offset = checksum = 0;
     stream_window.clear();
     xSemaphoreGive(audio_lock);
@@ -82,17 +87,17 @@ bool codecs()
 void record()
 {
     clear_audio();
-    if (!codecs()) { publish(WatchVoiceState::Error,"Audio initialization failed"); return; }
+    if (!codecs()) { publish(WatchVoiceState::Error,"Audio no disponible"); return; }
     if (!held || cancelled) { publish(WatchVoiceState::Idle); return; }
     pcm = static_cast<int16_t *>(heap_caps_calloc(kMaxSamples,sizeof(int16_t),MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (!pcm) { publish(WatchVoiceState::Error,"Audio buffer unavailable"); return; }
+    if (!pcm) { publish(WatchVoiceState::Error,"Memoria de audio no disponible"); return; }
     esp_codec_dev_sample_info_t format = {};
     format.sample_rate = kRate; format.channel = 2; format.bits_per_sample = 16;
     if (esp_codec_dev_open(microphone,&format) != ESP_CODEC_DEV_OK) {
-        esp_codec_dev_close(microphone); clear_audio(); publish(WatchVoiceState::Error,"Microphone open failed"); return;
+        esp_codec_dev_close(microphone); clear_audio(); publish(WatchVoiceState::Error,"Micrófono no disponible"); return;
     }
     if (esp_codec_dev_set_in_gain(microphone,24.0f) != ESP_CODEC_DEV_OK) {
-        esp_codec_dev_close(microphone); clear_audio(); publish(WatchVoiceState::Error,"Microphone gain setup failed"); return;
+        esp_codec_dev_close(microphone); clear_audio(); publish(WatchVoiceState::Error,"Error al configurar el micrófono"); return;
     }
     int16_t raw[kFrames*2];
     bool failed = false;
@@ -116,12 +121,13 @@ void record()
     const int close_result = esp_codec_dev_close(microphone);
     held = false;
     if (cancelled) { clear_audio(); publish(WatchVoiceState::Idle); }
-    else if (failed || close_result != ESP_CODEC_DEV_OK) { clear_audio(); publish(WatchVoiceState::Error,"Microphone capture failed"); }
-    else if (samples < kRate/4) { clear_audio(); publish(WatchVoiceState::Error,"Hold at least 0.25 seconds"); }
+    else if (failed || close_result != ESP_CODEC_DEV_OK) { clear_audio(); publish(WatchVoiceState::Error,"Error al grabar el audio"); }
+    else if (samples < kRate/4) { clear_audio(); publish(WatchVoiceState::Error,"Grabación demasiado corta"); }
     else {
         session_id = esp_random(); if (!session_id) session_id = 1;
         diagnostic_session = session_id;
         selected_offset = 0; checksum = crc32(reinterpret_cast<const uint8_t *>(pcm),samples*sizeof(int16_t));
+        confirmed_bytes = 0; total_bytes = samples*sizeof(int16_t);
         expires = esp_timer_get_time()+30'000'000; publish(WatchVoiceState::Ready);
         ESP_LOGI("watch_voice","VoiceLatency trace=%08lx stage=finalized mono_us=%lld release_to_ready_us=%lld",static_cast<unsigned long>(session_id),esp_timer_get_time(),released_us.load() ? esp_timer_get_time()-released_us.load() : -1LL);
     }
@@ -140,7 +146,7 @@ void preview()
     }
     if (speaker) esp_codec_dev_close(speaker);
     clear_audio();
-    publish(failed ? WatchVoiceState::Error : WatchVoiceState::Idle,failed ? "Playback failed" : nullptr);
+    publish(failed ? WatchVoiceState::Error : WatchVoiceState::Idle,failed ? "Error al reproducir el audio" : nullptr);
 }
 void worker(void *)
 {
@@ -148,6 +154,7 @@ void worker(void *)
         uint32_t command = 0;
         xTaskNotifyWait(0,UINT32_MAX,&command,pdMS_TO_TICKS(100));
         if ((command & kCancel) && cancelled) { clear_audio(); publish(WatchVoiceState::Idle); continue; }
+        if ((command & kDisconnected) && cancelled) { clear_audio(); publish(WatchVoiceState::Error,"Móvil desconectado"); continue; }
         if (command & kProcess) { clear_audio(); expires = esp_timer_get_time()+90'000'000; }
         if (command & kStart) record();
         else if (command & kPlay) preview();
@@ -155,10 +162,10 @@ void worker(void *)
             auto ready = WatchVoiceState::Ready;
             if (state.compare_exchange_strong(ready,WatchVoiceState::Starting)) {
                 ESP_LOGW("watch_voice", "Unclaimed capture expired after 30 seconds; no phone transfer claim received");
-                clear_audio(); publish(WatchVoiceState::Error,"Phone did not claim audio. Enable companion; hold to retry");
+                clear_audio(); publish(WatchVoiceState::Error,"El móvil no recogió el audio");
             }
-            else if (state == WatchVoiceState::Transferring) { clear_audio(); publish(WatchVoiceState::Error,"Phone transfer timed out"); }
-            else if (state == WatchVoiceState::Processing) { request_id = 0; expires = 0; publish(WatchVoiceState::Error,"AI request timed out. Hold to retry"); }
+            else if (state == WatchVoiceState::Transferring) { clear_audio(); publish(WatchVoiceState::Error,"Tiempo de transferencia agotado"); }
+            else if (state == WatchVoiceState::Processing) { request_id = 0; expires = 0; publish(WatchVoiceState::Error,"Tiempo de espera agotado"); }
         }
     }
 }
@@ -195,7 +202,7 @@ bool watch_voice_preview()
 WatchVoiceStatus watch_voice_status()
 {
     portENTER_CRITICAL(&status_lock); const auto result = status; portEXIT_CRITICAL(&status_lock);
-    return {state.load(),result.duration_ms,result.level,result.error};
+    return {state.load(),result.duration_ms,result.level,result.error,confirmed_bytes.load(),total_bytes.load()};
 }
 size_t watch_voice_metadata(uint8_t bytes[18])
 {
@@ -226,9 +233,10 @@ bool watch_voice_select(uint32_t session, uint32_t offset, uint8_t operation)
             ESP_LOGI("watch_voice","VoiceLatency trace=%08lx stage=claimed mono_us=%lld",static_cast<unsigned long>(session),esp_timer_get_time());
         }
         valid = state == WatchVoiceState::Transferring && offset < samples*sizeof(int16_t);
-        if (valid) { selected_offset = offset; stream_window.clear(); } // Explicit pull fallback stops push.
+        if (valid) { selected_offset = offset; confirmed_bytes = offset; stream_window.clear(); } // Next select acknowledges the preceding read.
     }
     if (valid && operation == 3) {
+        confirmed_bytes = offset; // Whole clip verified by the phone before opcode 3.
         stream_window.clear();
         ESP_LOGI("watch_voice", "Phone acknowledged complete audio: bytes=%u; processing started", unsigned(offset));
         request_id = session; publish(WatchVoiceState::Processing);
@@ -262,6 +270,7 @@ bool watch_voice_grant(uint32_t session, uint32_t epoch, uint32_t offset, uint8_
         expires && esp_timer_get_time() < expires;
     if (valid && state == WatchVoiceState::Ready && offset != 0) valid = false;
     if (valid) valid = stream_window.grant(session,epoch,offset,credits,samples*2);
+    if (valid) confirmed_bytes = offset; // Grant acknowledges only the contiguous received prefix.
     if (valid && state == WatchVoiceState::Ready) {
         expires = esp_timer_get_time()+180'000'000;
         publish(WatchVoiceState::Transferring);
@@ -296,7 +305,13 @@ void watch_voice_stop_stream()
     if (!audio_lock) return;
     xSemaphoreTake(audio_lock,portMAX_DELAY); stream_window.clear(); xSemaphoreGive(audio_lock);
 }
-void watch_voice_disconnected() { if (state == WatchVoiceState::Transferring || state == WatchVoiceState::Processing) watch_voice_cancel(); }
+void watch_voice_disconnected() {
+    if (state == WatchVoiceState::Transferring || state == WatchVoiceState::Processing) {
+        request_id = 0; cancelled = true; held = false;
+        watch_voice_stop_stream();
+        if (task) xTaskNotify(task,kDisconnected,eSetBits);
+    }
+}
 bool watch_voice_result(const uint8_t *bytes, size_t count)
 {
     if (count < 11 || bytes[0] != 1 || !audio_lock) return false;
@@ -308,7 +323,7 @@ bool watch_voice_result(const uint8_t *bytes, size_t count)
         ESP_LOGI("watch_voice", "Phone result frame assembled: kind=%u bytes=%u", unsigned(bytes[1]), unsigned(result_text.total));
         ESP_LOGI("watch_voice","VoiceLatency trace=%08lx stage=result_assembled mono_us=%lld release_to_result_us=%lld",static_cast<unsigned long>(session),esp_timer_get_time(),released_us.load() ? esp_timer_get_time()-released_us.load() : -1LL);
         ++text_revision;
-        if (bytes[1] != 1) { expires = 0; request_id = 0; publish(bytes[1] == 2 ? WatchVoiceState::Complete : WatchVoiceState::Error,bytes[1] == 3 ? "AI request failed. Hold to retry" : nullptr); }
+        if (bytes[1] != 1) { expires = 0; request_id = 0; publish(bytes[1] == 2 ? WatchVoiceState::Complete : WatchVoiceState::Error,bytes[1] == 3 ? watch_voice_feedback::message(result_text.answer) : nullptr); }
     }
     xSemaphoreGive(audio_lock); return valid;
 }
@@ -322,6 +337,7 @@ bool watch_voice_copy_text(uint32_t *revision, char *transcription, char *answer
         if (result_text.kind == 1 && !result_text.complete()) transcription[0] = 0;
         else memcpy(transcription,result_text.transcription,513);
         if (result_text.kind != 1 && !result_text.complete()) answer[0] = 0;
+        else if (result_text.kind == 3) snprintf(answer,3073,"%s",watch_voice_feedback::message(result_text.answer));
         else memcpy(answer,result_text.answer,3073);
         *revision = text_revision;
     }

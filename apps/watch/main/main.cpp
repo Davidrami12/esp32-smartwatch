@@ -15,6 +15,7 @@
 #include "watch_2048_store.h"
 #include "watch_display_start.h"
 #include "watch_voice.h"
+#include "watch_touch_gate.h"
 #include "esp_random.h"
 #include <stdio.h>
 #include <time.h>
@@ -411,17 +412,12 @@ static void update_battery_cb(
 
 static void update_steps_cb(lv_timer_t *timer);
 
-static void touch_event_cb(
-    lv_event_t *event
-)
-{
-    if (
-        lv_event_get_code(event) !=
-        LV_EVENT_PRESSED
-    ) {
-        return;
-    }
+static WatchTouchGate touch_gate;
+static lv_indev_read_cb_t original_touch_read;
+static lv_indev_t *touch_input;
 
+static void wake_touch_press()
+{
     uint32_t now =
         lv_tick_get();
 
@@ -456,6 +452,20 @@ static void touch_event_cb(
     }
 }
 
+static void gated_touch_read(lv_indev_t *indev, lv_indev_data_t *data)
+{
+    original_touch_read(indev,data);
+    const bool pressed = data->state == LV_INDEV_STATE_PRESSED;
+    const auto filtered = touch_gate.sample(watch_power_is_active(),pressed);
+    if (filtered.wake_press) wake_touch_press();
+    if (!filtered.allow) {
+        data->state = LV_INDEV_STATE_RELEASED;
+        data->continue_reading = false;
+    } else if (pressed) {
+        last_activity = lv_tick_get();
+    }
+}
+
 static void register_touch_handler(void)
 {
     lv_indev_t *indev =
@@ -466,12 +476,10 @@ static void register_touch_handler(void)
             lv_indev_get_type(indev) ==
             LV_INDEV_TYPE_POINTER
         ) {
-            lv_indev_add_event_cb(
-                indev,
-                touch_event_cb,
-                LV_EVENT_PRESSED,
-                NULL
-            );
+            original_touch_read = lv_indev_get_read_cb(indev);
+            if (!original_touch_read) { printf("Touch read callback unavailable\n"); return; }
+            touch_input = indev;
+            lv_indev_set_read_cb(indev,gated_touch_read);
 
             printf("Touch handler registered\n");
             return;
@@ -502,6 +510,9 @@ static void display_timeout_cb(
             last_activity
         ) >= display_timeout_ms
     ) {
+        // Drop any in-flight click/gesture before the next released sample.
+        touch_gate.sleep();
+        if (touch_input) lv_indev_reset(touch_input,NULL);
         watch_power_set_active(false, current_brightness);
         watch_ui_set_display_active(false);
         last_tap = 0;
@@ -688,6 +699,7 @@ static void voice_update_cb(lv_timer_t *)
     if (status.state == WatchVoiceState::Starting || status.state == WatchVoiceState::Recording || status.state == WatchVoiceState::Playing ||
         status.state == WatchVoiceState::Transferring || status.state == WatchVoiceState::Processing)
         last_activity = lv_tick_get(); // Bounded explicit interaction; normal timeout resumes afterwards.
+    watch_ui_set_voice_progress(status.confirmed_bytes,status.total_bytes);
     watch_ui_set_voice(static_cast<uint8_t>(status.state),status.duration_ms,status.level,status.error);
     static uint32_t revision = UINT32_MAX;
     static char transcription[513], answer[3073];
