@@ -61,8 +61,8 @@ static void notification_protocol_tests()
 static unsigned brightness_calls, commit_calls;
 static uint8_t committed;
 static unsigned goal_calls;
-static unsigned voice_calls[5];
-static bool voice_test_action(uint8_t action) { assert(action >= 1 && action <= 4); ++voice_calls[action]; return true; }
+static unsigned voice_calls[4];
+static bool voice_test_action(uint8_t action) { assert(action >= 1 && action <= 3); ++voice_calls[action]; return true; }
 static unsigned game_save_calls, game_force_calls;
 static uint32_t game_saved_best;
 static bool game_best_test(uint32_t best, bool force)
@@ -81,6 +81,13 @@ static lv_obj_t *find_button(lv_obj_t *screen, const char *text)
         if (!lv_obj_check_type(object, &lv_button_class) || !lv_obj_get_child_count(object)) continue;
         lv_obj_t *child = lv_obj_get_child(object, 0);
         if (lv_obj_check_type(child, &lv_label_class) && strcmp(lv_label_get_text(child), text) == 0) return object;
+        if (lv_obj_check_type(child,&lv_label_class) && lv_obj_get_child_count(object) == 2) {
+            auto *title = lv_obj_get_child(object,1);
+            if (lv_obj_check_type(title,&lv_label_class)) {
+                char combined[64]; snprintf(combined,sizeof(combined),"%s  %s",lv_label_get_text(child),lv_label_get_text(title));
+                if (!strcmp(combined,text)) return object;
+            }
+        }
     }
     assert(false && "Button not found");
     return nullptr;
@@ -96,6 +103,39 @@ static void check_touch_targets(lv_obj_t *parent)
 
 int main()
 {
+    static_assert(sizeof(astra_halo_pixels) == astra_halo_size*astra_halo_size*2,"Fixed-size RGB565 halo");
+    {
+        auto pixel = [](unsigned x, unsigned y) {
+            const auto at = (y*astra_halo_size+x)*2;
+            return unsigned(astra_halo_pixels[at]) | (unsigned(astra_halo_pixels[at+1])<<8);
+        };
+        assert(pixel(88,88) == 0); // Black face interior.
+        assert(pixel(0,0) == 0); // No rectangular glow at image corners.
+        assert(pixel(144,88) != 0); // Bright ring, same radius as before.
+        assert((pixel(160,88) & 31) >= 2); // Glow now extends beyond the previous image.
+        assert(pixel(175,88) == 0); // Fade to black before the asset boundary.
+    }
+    {
+        WatchOffscreenHold hold;
+        assert(!hold.sample(false,true,100,100,0));
+        assert(!hold.sample(false,true,104,102,999));
+        assert(hold.sample(false,true,104,102,1000));
+        assert(!hold.sample(false,true,104,102,3000)); // One activation per press.
+        assert(!hold.sample(true,false,104,102,3010));
+        assert(!hold.sample(true,true,100,100,4000));
+        assert(!hold.sample(false,true,100,100,6000)); // Press began awake.
+        hold.sample(false,false,100,100,6010);
+        hold.sample(false,true,100,100,7000);
+        assert(!hold.sample(false,true,113,100,7500));
+        assert(!hold.sample(false,true,100,100,9000)); // Moving back cannot rearm.
+        hold.sample(false,false,100,100,9010);
+        hold.sample(false,true,100,100,10000);
+        assert(!hold.sample(true,true,100,100,10500)); // Double tap/external wake cancels.
+        assert(!hold.sample(true,true,100,100,12000));
+        hold.sample(false,false,100,100,12010);
+        hold.sample(false,true,100,100,UINT32_MAX-499);
+        assert(hold.sample(false,true,100,100,500)); // Tick wraparound.
+    }
     {
         WatchTouchGate gate;
         auto sample = gate.sample(false,true); assert(!sample.allow && sample.wake_press);
@@ -174,6 +214,17 @@ int main()
         assert(lv_font_get_glyph_dsc(font, &ascii, 'A', 0) && !ascii.is_placeholder);
         lv_font_glyph_dsc_t icon = {};
         assert(lv_font_get_glyph_dsc(font, &icon, 0xf04b, 0) && !icon.is_placeholder);
+    }
+    {
+        watch_ui_set_voice_callback(voice_test_action);
+        const auto recordings = voice_calls[1];
+        watch_ui_set_display_active(false);
+        assert(!watch_ui_open_voice());
+        watch_ui_set_display_active(true);
+        assert(watch_ui_open_voice() && current_screen == WatchScreen::Voice);
+        assert(lv_screen_active() == screen_for(WatchScreen::Voice)); // Immediate, no intermediate Home animation.
+        assert(!voice_held && voice_calls[1] == recordings);
+        navigate_to(WatchScreen::Home);
     }
     watch_ui_configure_2048(100, 42, game_best_test);
     open_game_cb(nullptr); assert(current_screen == WatchScreen::Game2048);
@@ -321,7 +372,8 @@ int main()
     lv_obj_update_layout(screen_for(WatchScreen::Home));
     assert(lv_obj_get_x(settings) < lv_obj_get_x(apps));
     for (auto *nav : {settings, apps}) {
-        assert(lv_obj_get_width(nav) == design::TileWidth && lv_obj_get_height(nav) == design::TouchHeight);
+        assert(lv_obj_get_width(nav) == 136 && lv_obj_get_height(nav) == design::TouchHeight);
+        assert(lv_obj_get_style_radius(nav,LV_PART_MAIN) == design::TouchHeight/2);
         assert(lv_obj_get_style_border_width(nav, LV_PART_MAIN) == design::BorderWidth);
         assert(lv_obj_get_style_bg_opa(nav, LV_PART_MAIN) == LV_OPA_COVER);
         assert(lv_color_eq(lv_obj_get_style_text_color(lv_obj_get_child(nav, 0), LV_PART_MAIN), lv_color_hex(kWhite)));
@@ -450,12 +502,65 @@ int main()
     back_cb(nullptr); assert(current_screen == WatchScreen::Launcher);
     watch_ui_set_voice_callback(voice_test_action);
     open_voice_cb(nullptr); assert(current_screen == WatchScreen::Voice);
+    watch_ui_set_voice(0,0,0,nullptr);
+    assert(!lv_obj_has_flag(voice_face,LV_OBJ_FLAG_HIDDEN));
+    assert(!lv_obj_has_flag(voice_face,LV_OBJ_FLAG_CLICKABLE));
+    assert(strcmp(lv_label_get_text(voice_name),"Astra") == 0);
+    assert(!lv_obj_has_flag(voice_name,LV_OBJ_FLAG_HIDDEN));
+    assert(strcmp(lv_label_get_text(lv_obj_get_child(voice_hold,0)),"HOLD TO TALK") == 0);
+    assert(lv_obj_has_flag(voice_clear,LV_OBJ_FLAG_HIDDEN));
+    assert(lv_obj_has_flag(voice_details,LV_OBJ_FLAG_HIDDEN));
+    assert(lv_obj_has_flag(voice_level,LV_OBJ_FLAG_HIDDEN));
+    lv_obj_update_layout(screen_for(WatchScreen::Voice));
+    const int idle_hold_y = lv_obj_get_y(voice_hold);
+    assert(lv_obj_get_height(voice_hold) == 72);
+    for (uint8_t busy_state : {1,2,3,6,7}) {
+        watch_ui_set_voice(busy_state,1000,0,nullptr);
+        assert(!lv_obj_has_flag(voice_clear,LV_OBJ_FLAG_HIDDEN));
+        assert(strcmp(lv_label_get_text(lv_obj_get_child(voice_clear,0)),"CANCEL") == 0);
+        if (busy_state == 2 || busy_state == 6) {
+            lv_obj_update_layout(screen_for(WatchScreen::Voice));
+            assert(lv_obj_get_y(voice_hold) == idle_hold_y && lv_obj_get_height(voice_hold) == 72);
+            assert(!lv_obj_has_flag(voice_level,LV_OBJ_FLAG_HIDDEN));
+            assert(!lv_obj_has_flag(voice_details,LV_OBJ_FLAG_HIDDEN));
+        }
+    }
+    for (uint8_t finished_state : {5,8}) {
+        watch_ui_set_voice(finished_state,1000,0,nullptr);
+        assert(!lv_obj_has_flag(voice_clear,LV_OBJ_FLAG_HIDDEN));
+        assert(strcmp(lv_label_get_text(lv_obj_get_child(voice_clear,0)),"CLEAR") == 0);
+    }
+    watch_ui_set_voice(0,0,0,nullptr);
+    auto *ai_tile = find_button(screen_for(WatchScreen::Launcher),"AI ASSISTANT");
+    auto *timer_tile = find_button(screen_for(WatchScreen::Launcher),"TIMER");
+    assert(lv_color_eq(lv_obj_get_style_bg_color(ai_tile,LV_PART_MAIN),lv_obj_get_style_bg_color(timer_tile,LV_PART_MAIN)));
+    assert(lv_color_eq(lv_obj_get_style_border_color(ai_tile,LV_PART_MAIN),lv_obj_get_style_border_color(timer_tile,LV_PART_MAIN)));
+    for (uint32_t i = 0; i < lv_obj_get_child_count(ai_tile); ++i) {
+        auto *child = lv_obj_get_child(ai_tile,i);
+        if (lv_obj_check_type(child,&lv_label_class)) assert(strcmp(lv_label_get_text(child),"HOLD TO TALK") != 0);
+    }
+    assert(!lv_obj_has_flag(voice_microphone,LV_OBJ_FLAG_HIDDEN));
+    assert(lv_color_eq(lv_obj_get_style_bg_color(voice_hold,LV_PART_MAIN),lv_color_hex(0xC4A7FF)));
+    assert(lv_obj_get_child(screen_for(WatchScreen::Voice),-1) == voice_name);
+    {
+        const bool blinking = voice_face_blink;
+        watch_ui_set_display_active(false);
+        voice_face_tick(nullptr);
+        assert(voice_face_blink == blinking); // No hidden-screen animation work.
+        watch_ui_set_display_active(true);
+    }
+    lv_obj_update_layout(screen_for(WatchScreen::Voice));
+    assert(lv_obj_get_width(voice_face) == 176);
+    assert(lv_obj_get_y(voice_face)+lv_obj_get_height(voice_face)/2+58+8 <= lv_obj_get_y(voice_details));
+    assert(lv_obj_get_y(voice_name) == 74 && lv_obj_get_y(voice_face) == 80);
+    assert(lv_obj_get_y(voice_hold)+lv_obj_get_height(voice_hold)+8 <= lv_obj_get_y(voice_clear));
     lv_obj_send_event(voice_hold,LV_EVENT_PRESSED,nullptr); assert(voice_held && voice_calls[1] == 1);
     lv_obj_send_event(voice_hold,LV_EVENT_RELEASED,nullptr); assert(!voice_held && voice_calls[2] == 1);
-    watch_ui_set_voice(3,2500,50,nullptr); assert(!lv_obj_has_state(voice_preview,LV_STATE_DISABLED));
-    lv_obj_send_event(voice_preview,LV_EVENT_CLICKED,nullptr); assert(voice_calls[4] == 1);
-    watch_ui_set_voice(4,2500,0,nullptr); assert(lv_obj_has_state(voice_hold,LV_STATE_DISABLED));
+    watch_ui_set_voice(3,2500,50,nullptr);
+    watch_ui_set_voice(6,2500,0,nullptr); assert(lv_obj_has_state(voice_hold,LV_STATE_DISABLED));
     watch_ui_set_voice(0,0,0,nullptr);
+    assert(!lv_label_get_text(voice_status)[0]);
+    assert(!lv_label_get_text(voice_note)[0]);
     lv_obj_send_event(voice_hold,LV_EVENT_PRESSED,nullptr);
     const unsigned cancels = voice_calls[3];
     lv_obj_send_event(voice_hold,LV_EVENT_PRESS_LOST,nullptr); assert(!voice_held && voice_calls[3] == cancels+1);
@@ -479,6 +584,9 @@ int main()
     watch_ui_set_voice_text(spanish,"Una respuesta larga\ncon varias líneas.");
     watch_ui_set_voice(8,0,0,nullptr);
     assert(strcmp(lv_label_get_text(voice_transcription),spanish) == 0);
+    assert(strcmp(lv_label_get_text(voice_answer),"Una respuesta larga\ncon varias líneas.") == 0);
+    assert(strcmp(lv_label_get_text(voice_question_heading),"QUESTION") == 0);
+    assert(strcmp(lv_label_get_text(voice_answer_heading),"ANSWER") == 0);
     assert(!lv_obj_has_flag(static_cast<lv_obj_t *>(lv_obj_get_user_data(voice_answer)),LV_OBJ_FLAG_HIDDEN));
     ai_result.clear(); assert(!ai_result.transcription[0] && !ai_result.answer[0]);
     assert(watch_voice_feedback::percent(0,0) == 0);
@@ -492,29 +600,149 @@ int main()
     assert(lv_bar_get_value(voice_level) == 25);
     assert(strstr(lv_label_get_text(voice_details),"2000 / 8000"));
     watch_ui_set_voice(2,2000,73,nullptr);
-    assert(strstr(lv_label_get_text(voice_status),"suelta para enviar"));
+    assert(strstr(lv_label_get_text(voice_status),"release to send"));
     assert(lv_bar_get_value(voice_level) == 73); // Microphone level is not transfer percent.
     watch_ui_set_voice(7,2000,0,nullptr);
     assert(!strchr(lv_label_get_text(voice_status),'%'));
     assert(!lv_obj_has_flag(voice_waiting,LV_OBJ_FLAG_HIDDEN));
-    watch_ui_set_voice_text("","AI desactivada");
+    watch_ui_set_voice_text("","AI disabled");
     watch_ui_set_voice(5,0,0,watch_voice_feedback::message("AI_DISABLED"));
-    assert(strcmp(lv_label_get_text(voice_status),"AI desactivada") == 0);
-    assert(strstr(lv_label_get_text(voice_answer),"activarla"));
-    assert(strcmp(watch_voice_feedback::message("AI_SIGN_IN"),"Inicia sesión en el móvil") == 0);
-    assert(strcmp(watch_voice_feedback::message("unknown"),"Error de conexión") == 0);
+    assert(strcmp(lv_label_get_text(voice_status),"AI disabled") == 0);
+    assert(strstr(lv_label_get_text(voice_answer),"Enable AI"));
+    assert(strcmp(watch_voice_feedback::message("AI_SIGN_IN"),"Sign in on your phone") == 0);
+    assert(strcmp(watch_voice_feedback::message("unknown"),"Connection error") == 0);
     watch_ui_set_bluetooth_state(WATCH_UI_BLUETOOTH_DISABLED);
     watch_ui_set_voice(3,2000,0,nullptr);
-    assert(strcmp(lv_label_get_text(voice_status),"Móvil desconectado") == 0);
+    assert(strcmp(lv_label_get_text(voice_status),"Phone disconnected") == 0);
     open_voice_cb(nullptr); process_swipe(LV_DIR_TOP); assert(current_screen == WatchScreen::Voice);
     process_swipe(LV_DIR_RIGHT); assert(current_screen == WatchScreen::Launcher);
     assert(voice_state == 0 && !voice_held && !lv_label_get_text(voice_answer)[0]);
     navigate_to(WatchScreen::Bluetooth); lv_obj_update_layout(screen_for(WatchScreen::Bluetooth));
     auto *bluetooth_back = find_button(screen_for(WatchScreen::Bluetooth),LV_SYMBOL_LEFT "  BACK");
+    {
+        auto *home = screen_for(WatchScreen::Home);
+        lv_obj_update_layout(home);
+        auto *settings = find_button(home,LV_SYMBOL_SETTINGS "  SETTINGS");
+        auto *apps = find_button(home,LV_SYMBOL_LIST "  APPS");
+        assert(lv_obj_get_width(settings) == 136 && lv_obj_get_width(apps) == 136);
+        assert(lv_obj_get_height(settings) == 56 && lv_obj_get_height(apps) == 56);
+        assert(lv_obj_get_x(apps)-lv_obj_get_x(settings)-lv_obj_get_width(settings) == 16);
+        assert(lv_obj_get_y(settings) == lv_obj_get_y(apps));
+    }
+    for (auto *screen : screens) {
+        lv_obj_update_layout(screen);
+        for (uint32_t i = 0; i < lv_obj_get_child_count(screen); ++i) {
+            auto *object = lv_obj_get_child(screen,i);
+            if (!lv_obj_check_type(object,&lv_button_class) || !lv_obj_get_child_count(object)) continue;
+            auto *text = lv_obj_get_child(object,0);
+            if (lv_obj_check_type(text,&lv_label_class) && lv_obj_get_child_count(object) == 2 &&
+                (!strcmp(lv_label_get_text(text),LV_SYMBOL_LEFT) ||
+                 !strcmp(lv_label_get_text(text),LV_SYMBOL_HOME))) {
+                assert(lv_obj_get_width(object) == design::BackWidth);
+                assert(lv_obj_get_height(object) >= design::TouchHeight);
+                assert(lv_obj_get_style_radius(object,LV_PART_MAIN) == design::TouchHeight/2);
+                auto *title = lv_obj_get_child(object,1);
+                assert(lv_obj_get_x(title)-lv_obj_get_x(text)-lv_obj_get_width(text) == 8);
+                const int group_center_twice = lv_obj_get_x(text)+lv_obj_get_x(title)+lv_obj_get_width(title);
+                assert(group_center_twice >= lv_obj_get_width(object)-2 && group_center_twice <= lv_obj_get_width(object)+2);
+            }
+        }
+    }
     assert(lv_obj_get_y(bluetooth_action)+lv_obj_get_height(bluetooth_action)+8 <= lv_obj_get_y(forget_phone_button));
     assert(lv_obj_get_y(forget_phone_button)+lv_obj_get_height(forget_phone_button)+8 <= lv_obj_get_y(bluetooth_back));
     lv_obj_add_state(bluetooth_action,LV_STATE_DISABLED);
     assert(lv_color_eq(lv_obj_get_style_text_color(bluetooth_action_label,LV_PART_MAIN),lv_color_hex(design::Disabled)));
+    {
+        find_button(screen_for(WatchScreen::Launcher),"SUN & MOON");
+        watch_ui_set_astronomy_time(0,false);
+        open_astronomy_cb(nullptr);
+        assert(current_screen == WatchScreen::Astronomy);
+        for (auto *arrow : {astronomy_previous_day,astronomy_next_day}) {
+            assert(lv_obj_get_style_radius(arrow,LV_PART_MAIN) == LV_RADIUS_CIRCLE);
+        }
+        assert(!lv_obj_has_flag(astronomy_empty,LV_OBJ_FLAG_HIDDEN));
+        assert(lv_obj_has_state(astronomy_next_day,LV_STATE_DISABLED));
+        const int64_t noon = astronomy::day_number({2026,10,24})*86400+12*3600;
+        watch_ui_set_astronomy_time(noon,true);
+        assert(lv_obj_has_flag(astronomy_empty,LV_OBJ_FLAG_HIDDEN));
+        assert(!strcmp(lv_label_get_text(astronomy_first_title),"SUNRISE"));
+        assert(strcmp(lv_label_get_text(astronomy_first_value),"--:--"));
+        lv_obj_send_event(astronomy_next_day,LV_EVENT_CLICKED,nullptr);
+        assert(astronomy_day_offset == 1 && strstr(lv_label_get_text(astronomy_date_label),"25/10"));
+        lv_obj_send_event(astronomy_moon_tab,LV_EVENT_CLICKED,nullptr);
+        assert(astronomy_moon_view && !strcmp(lv_label_get_text(astronomy_first_title),"ILLUMINATION"));
+        for (auto *tab : {astronomy_sun_tab,astronomy_moon_tab}) {
+            const auto color = lv_color_hex(tab == astronomy_sun_tab ? design::Weather : design::Timeout);
+            assert(lv_color_eq(lv_obj_get_style_text_color(lv_obj_get_child(tab,0),LV_PART_MAIN),color));
+        }
+        lv_obj_send_event(astronomy_sun_tab,LV_EVENT_CLICKED,nullptr);
+        assert(lv_obj_has_state(astronomy_sun_tab,LV_STATE_DISABLED));
+        assert(lv_color_eq(lv_obj_get_style_text_color(lv_obj_get_child(astronomy_sun_tab,0),LV_PART_MAIN),lv_color_hex(design::Weather)));
+        for (int i = 0; i < 9; ++i) lv_obj_send_event(astronomy_next_day,LV_EVENT_CLICKED,nullptr);
+        assert(astronomy_day_offset == 6 && lv_obj_has_state(astronomy_next_day,LV_STATE_DISABLED));
+        for (int i = 0; i < 9; ++i) lv_obj_send_event(astronomy_previous_day,LV_EVENT_CLICKED,nullptr);
+        assert(!astronomy_day_offset && lv_obj_has_state(astronomy_previous_day,LV_STATE_DISABLED));
+        watch_ui_set_display_active(false);
+        watch_ui_set_astronomy_time(noon+86400,true);
+        assert(strstr(lv_label_get_text(astronomy_date_label),"24/10")); // No asleep redraw.
+        watch_ui_set_display_active(true);
+        assert(strstr(lv_label_get_text(astronomy_date_label),"25/10"));
+        back_cb(nullptr); assert(current_screen == WatchScreen::Launcher);
+        watch_ui_set_astronomy_time(noon+2*86400,true);
+        assert(strstr(lv_label_get_text(astronomy_date_label),"25/10")); // Hidden app stays quiet.
+        open_astronomy_cb(nullptr);
+        assert(strstr(lv_label_get_text(astronomy_date_label),"26/10"));
+        watch_ui_show_notification("Phone","Test","Astronomy interruption");
+        watch_ui_hide_notification(); assert(current_screen == WatchScreen::Astronomy);
+        lv_obj_update_layout(screen_for(WatchScreen::Astronomy));
+        auto *back = find_button(screen_for(WatchScreen::Astronomy),LV_SYMBOL_LEFT "  BACK");
+        assert(lv_obj_get_y(astronomy_next)+lv_obj_get_height(astronomy_next) <= lv_obj_get_y(back));
+        back_cb(nullptr);
+    }
     for (auto *screen : screens) { lv_obj_update_layout(screen); check_touch_targets(screen); }
+    {
+        assert(!watch_planets::valid_clock(0));
+        for (unsigned p=0;p<8;++p) {
+            const auto pos=watch_planets::position(p,946728000);
+            assert(isfinite(pos.longitude) && pos.longitude>=0 && pos.longitude<6.284);
+            assert(pos.distance_au>watch_planets::elements[p].a*.75);
+            assert(pos.distance_au<watch_planets::elements[p].a*1.25);
+        }
+        // J2000 Earth/Moon barycentre ~100.38 degrees, radius ~0.9833 AU.
+        auto earth=watch_planets::position(2,946728000);
+        assert(fabs(earth.longitude*180/3.141592653589793-100.38)<.1);
+        assert(fabs(earth.distance_au-.9833)<.001);
+        find_button(screen_for(WatchScreen::Launcher),"PLANETS");
+        watch_ui_set_astronomy_time(0,false);
+        open_planets_cb(nullptr);
+        assert(current_screen==WatchScreen::Planets && lv_obj_has_flag(planet_dots[0],LV_OBJ_FLAG_HIDDEN));
+        watch_ui_set_astronomy_time(1792324800,true);
+        assert(!lv_obj_has_flag(planet_dots[0],LV_OBJ_FLAG_HIDDEN));
+        assert(lv_obj_has_flag(planets_empty,LV_OBJ_FLAG_HIDDEN));
+        lv_obj_update_layout(screen_for(WatchScreen::Planets));
+        assert(lv_obj_get_height(planets_map)==340 && lv_obj_get_width(planets_map)==390);
+        for (unsigned p=0;p<8;++p) {
+            lv_obj_send_event(planet_dots[p],LV_EVENT_CLICKED,nullptr);
+            lv_obj_update_layout(planets_map);
+            assert(!strcmp(lv_label_get_text(planet_name),planet_names[p]));
+            assert(lv_color_eq(lv_obj_get_style_text_color(planet_name,LV_PART_MAIN),lv_color_hex(planet_colors[p])));
+            assert(lv_obj_get_x(planet_name)>=0 && lv_obj_get_y(planet_name)>=0);
+            assert(lv_obj_get_x(planet_name)+lv_obj_get_width(planet_name)<=lv_obj_get_width(planets_map));
+            assert(lv_obj_get_y(planet_name)+lv_obj_get_height(planet_name)<=lv_obj_get_height(planets_map));
+        }
+        back_cb(nullptr); assert(current_screen==WatchScreen::Launcher);
+    }
+    {
+        const char *names[]={"ACTIVITY","TIMER","STOPWATCH","WEATHER","MEDIA","2048","SUN & MOON","PLANETS","AI ASSISTANT"};
+        auto *launcher=screen_for(WatchScreen::Launcher);
+        lv_obj_update_layout(launcher);
+        for (unsigned i=0;i<9;++i) {
+            auto *tile=find_button(launcher,names[i]);
+            assert(lv_obj_get_width(tile)==108 && lv_obj_get_height(tile)==100);
+            assert(lv_obj_get_y(tile)==92+int(i/3)*110);
+            assert(lv_obj_get_x(tile)==lv_obj_get_x(find_button(launcher,names[i%3])));
+            assert(lv_obj_get_y(lv_obj_get_child(tile,0))==70);
+        }
+    }
     puts("PASS: UI/navigation/time tools, 2048, media, Spanish fonts, voice privacy routing and bounded Spanish AI results");
 }

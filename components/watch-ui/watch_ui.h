@@ -34,6 +34,8 @@ void watch_ui_set_settings(
 
 void watch_ui_set_time(const char *time);
 void watch_ui_set_date(const char *date);
+// Platform UTC clock for offline Madrid Sun & Moon. No network activity here.
+void watch_ui_set_astronomy_time(int64_t utc_seconds, bool valid);
 void watch_ui_set_steps(uint32_t steps);
 typedef void (*watch_ui_notification_dismiss_cb_t)(void);
 void watch_ui_set_notification_dismiss_callback(watch_ui_notification_dismiss_cb_t callback);
@@ -52,8 +54,10 @@ void watch_ui_set_media(uint8_t state, uint8_t actions, uint32_t session, const 
 typedef bool (*watch_ui_2048_best_cb_t)(uint32_t best, bool force);
 void watch_ui_configure_2048(uint32_t best, uint32_t random_seed, watch_ui_2048_best_cb_t callback);
 // Phase 1 local microphone validation; no upload or AI requests.
-typedef bool (*watch_ui_voice_cb_t)(uint8_t action); // 1 start, 2 release, 3 cancel, 4 preview
+typedef bool (*watch_ui_voice_cb_t)(uint8_t action); // 1 start, 2 release, 3 cancel
 void watch_ui_set_voice_callback(watch_ui_voice_cb_t callback);
+// Opens only the assistant UI; never activates the microphone or sends audio.
+bool watch_ui_open_voice();
 void watch_ui_set_voice(uint8_t state, uint32_t duration_ms, uint8_t level, const char *error);
 // Progress uses only the phone-confirmed contiguous prefix, not radio enqueues.
 void watch_ui_set_voice_progress(uint32_t confirmed_bytes, uint32_t total_bytes);
