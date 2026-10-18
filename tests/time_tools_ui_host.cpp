@@ -748,15 +748,24 @@ int main()
         assert(!lv_obj_has_flag(planet_dots[0],LV_OBJ_FLAG_HIDDEN));
         assert(lv_obj_has_flag(planets_empty,LV_OBJ_FLAG_HIDDEN));
         lv_obj_update_layout(screen_for(WatchScreen::Planets));
-        assert(lv_obj_get_height(planets_map)==340 && lv_obj_get_width(planets_map)==390);
+        assert(lv_obj_get_height(planets_map)==354 && lv_obj_get_width(planets_map)==404);
         for (unsigned p=0;p<8;++p) {
-            lv_obj_send_event(planet_dots[p],LV_EVENT_CLICKED,nullptr);
+            assert(!lv_obj_has_flag(planet_dots[p],LV_OBJ_FLAG_CLICKABLE));
+            auto *planet_name=planet_labels[p];
+            assert(lv_obj_get_style_bg_opa(planet_name,LV_PART_MAIN)==LV_OPA_TRANSP);
+            assert(!lv_obj_has_flag(planet_name,LV_OBJ_FLAG_HIDDEN));
+            assert(lv_obj_get_width(planet_dots[p])==44 && lv_obj_get_height(planet_dots[p])==44);
             lv_obj_update_layout(planets_map);
             assert(!strcmp(lv_label_get_text(planet_name),planet_names[p]));
             assert(lv_color_eq(lv_obj_get_style_text_color(planet_name,LV_PART_MAIN),lv_color_hex(planet_colors[p])));
             assert(lv_obj_get_x(planet_name)>=0 && lv_obj_get_y(planet_name)>=0);
             assert(lv_obj_get_x(planet_name)+lv_obj_get_width(planet_name)<=lv_obj_get_width(planets_map));
             assert(lv_obj_get_y(planet_name)+lv_obj_get_height(planet_name)<=lv_obj_get_height(planets_map));
+            if (p==7) {
+                const int label_y=lv_obj_get_y(planet_name)+lv_obj_get_height(planet_name)/2;
+                const int planet_y=lv_obj_get_y(planet_dots[p])+lv_obj_get_height(planet_dots[p])/2;
+                assert(abs(label_y-planet_y)<=18);
+            }
         }
         back_cb(nullptr); assert(current_screen==WatchScreen::Launcher);
     }
