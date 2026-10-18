@@ -465,25 +465,51 @@ int main()
     assert(current_screen == WatchScreen::Settings);
     back_cb(nullptr); assert(current_screen == WatchScreen::Home);
     open_launcher_cb(nullptr); open_timer_cb(nullptr);
-    timer_minutes = 1;
+    assert(pomodoro_duration()==25*60000);
+    assert(strcmp(lv_label_get_text(timer_status),"READY WHEN YOU ARE")==0);
+    assert(strcmp(lv_label_get_text(pomodoro_phase),"FOCUS TIME")==0);
+    auto *skip_phase=find_button(screen_for(WatchScreen::Timer),"SKIP PHASE");
+    lv_obj_update_layout(screen_for(WatchScreen::Timer));
+    assert(lv_obj_get_y(skip_phase)+lv_obj_get_height(skip_phase)<=414);
+    assert(lv_obj_get_width(pomodoro_start)==304);
+    countdown.elapsed_ms=pomodoro_duration()/2;
+    refresh_time_tools();
+    assert(lv_arc_get_value(pomodoro_progress)==500);
+    assert(strcmp(lv_label_get_text(timer_value),"12:30")==0);
+    timer_reset_cb(nullptr);
     timer_control_cb(nullptr);
     lv_tick_inc(1000); time_tools_tick(nullptr);
-    assert(strcmp(lv_label_get_text(timer_value), "00:00:59") == 0);
+    assert(strcmp(lv_label_get_text(timer_value), "24:59") == 0);
+    assert(lv_arc_get_value(pomodoro_progress)==0);
+    assert(!lv_obj_has_flag(pomodoro_progress,LV_OBJ_FLAG_CLICKABLE));
     timer_control_cb(nullptr);
     lv_tick_inc(5000); time_tools_tick(nullptr);
     assert(countdown.elapsed_ms == 1000 && !countdown.running);
     timer_control_cb(nullptr); stopwatch_control_cb(nullptr);
     watch_ui_set_display_active(false);
-    lv_tick_inc(59000); time_tools_tick(nullptr);
-    assert(!countdown.running && countdown.elapsed_ms == 60000);
-    assert(stopwatch.running && stopwatch.elapsed_ms == 59000);
+    lv_tick_inc(1499000); time_tools_tick(nullptr);
+    assert(!countdown.running && countdown.elapsed_ms == 1500000);
+    assert(stopwatch.running && stopwatch.elapsed_ms == 1499000);
     // Expiry while IDLE must not redraw until wake.
-    assert(strcmp(lv_label_get_text(timer_value), "00:00:59") == 0);
+    assert(strcmp(lv_label_get_text(timer_value), "24:59") == 0);
     watch_ui_set_display_active(true);
-    assert(strcmp(lv_label_get_text(timer_value), "00:00:00") == 0);
-    assert(strcmp(lv_label_get_text(timer_status), "TIME'S UP") == 0);
+    assert(strcmp(lv_label_get_text(timer_value), "00:00") == 0);
+    assert(lv_arc_get_value(pomodoro_progress)==1000);
+    assert(strstr(lv_label_get_text(timer_status), "DONE"));
+    timer_control_cb(nullptr);
+    assert(pomodoro_break && pomodoro_completed==1 && countdown.running && pomodoro_duration()==300000);
+    assert(strcmp(lv_label_get_text(pomodoro_phase),"SHORT BREAK")==0);
+    assert(lv_arc_get_value(pomodoro_progress)==0);
+    assert(lv_color_eq(lv_obj_get_style_arc_color(pomodoro_progress,LV_PART_INDICATOR),lv_color_hex(0x86C978)));
+    for (unsigned i=1;i<4;++i) { pomodoro_next_cb(nullptr); pomodoro_next_cb(nullptr); }
+    assert(pomodoro_break && pomodoro_completed==4 && pomodoro_duration()==900000);
+    pomodoro_next_cb(nullptr);
+    assert(!pomodoro_break && pomodoro_completed==0 && !countdown.running);
+    timer_reset_cb(nullptr);
+    assert(countdown.elapsed_ms==0 && pomodoro_duration()==1500000);
+    assert(lv_arc_get_value(pomodoro_progress)==0);
     back_cb(nullptr); open_stopwatch_cb(nullptr);
-    assert(strcmp(lv_label_get_text(stopwatch_value), "00:00:59.0") == 0);
+    assert(strcmp(lv_label_get_text(stopwatch_value), "00:24:59.0") == 0);
     stopwatch_control_cb(nullptr); stopwatch_reset_cb(nullptr);
     assert(stopwatch.elapsed_ms == 0 && !stopwatch.running);
     back_cb(nullptr); assert(current_screen == WatchScreen::Launcher);
@@ -532,7 +558,7 @@ int main()
     }
     watch_ui_set_voice(0,0,0,nullptr);
     auto *ai_tile = find_button(screen_for(WatchScreen::Launcher),"AI ASSISTANT");
-    auto *timer_tile = find_button(screen_for(WatchScreen::Launcher),"TIMER");
+    auto *timer_tile = find_button(screen_for(WatchScreen::Launcher),"POMODORO");
     assert(lv_color_eq(lv_obj_get_style_bg_color(ai_tile,LV_PART_MAIN),lv_obj_get_style_bg_color(timer_tile,LV_PART_MAIN)));
     assert(lv_color_eq(lv_obj_get_style_border_color(ai_tile,LV_PART_MAIN),lv_obj_get_style_border_color(timer_tile,LV_PART_MAIN)));
     for (uint32_t i = 0; i < lv_obj_get_child_count(ai_tile); ++i) {
@@ -770,7 +796,7 @@ int main()
         back_cb(nullptr); assert(current_screen==WatchScreen::Launcher);
     }
     {
-        const char *names[]={"ACTIVITY","TIMER","STOPWATCH","WEATHER","MEDIA","2048","SUN & MOON","PLANETS","AI ASSISTANT"};
+        const char *names[]={"ACTIVITY","POMODORO","STOPWATCH","WEATHER","MEDIA","2048","SUN & MOON","PLANETS","AI ASSISTANT"};
         auto *launcher=screen_for(WatchScreen::Launcher);
         lv_obj_update_layout(launcher);
         for (unsigned i=0;i<9;++i) {

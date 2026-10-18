@@ -89,8 +89,13 @@ static uint32_t forecast_age = 0;
 static void render_forecast();
 static bool display_active = true;
 static WatchTimeTool countdown, stopwatch;
-static uint32_t timer_minutes = 5;
-static lv_obj_t *timer_value, *timer_status, *timer_action_label, *timer_minus, *timer_plus;
+static bool pomodoro_break=false;
+static unsigned pomodoro_completed=0;
+static uint64_t pomodoro_duration() { return uint64_t(pomodoro_break ? (pomodoro_completed==4 ? 15 : 5) : 25)*60000; }
+static void pomodoro_next_cb(lv_event_t *);
+static lv_obj_t *timer_value, *timer_status, *timer_action_label;
+static lv_obj_t *pomodoro_progress;
+static lv_obj_t *pomodoro_phase, *pomodoro_sessions[4], *pomodoro_start;
 static lv_obj_t *stopwatch_value, *stopwatch_status, *stopwatch_action_label;
 static void refresh_time_tools();
 static lv_obj_t *time_label, *date_label, *steps_label, *activity_steps_label;
@@ -614,13 +619,32 @@ static void sparkle_draw_cb(lv_event_t *event)
     sparkle(31,28,4,1);
 }
 
+static void tomato_draw_cb(lv_event_t *event)
+{
+    lv_area_t a; lv_obj_get_coords(static_cast<lv_obj_t *>(lv_event_get_target(event)),&a);
+    auto *layer=lv_event_get_layer(event);
+    lv_draw_rect_dsc_t body; lv_draw_rect_dsc_init(&body);
+    body.bg_color=lv_color_hex(0xEE594E); body.bg_opa=LV_OPA_COVER; body.radius=LV_RADIUS_CIRCLE;
+    lv_area_t bounds={a.x1+2,a.y1+10,a.x1+37,a.y1+37}; lv_draw_rect(layer,&body,&bounds);
+    body.bg_color=lv_color_hex(0x86C978); body.radius=3;
+    bounds={a.x1+18,a.y1+2,a.x1+22,a.y1+16}; lv_draw_rect(layer,&body,&bounds);
+    bounds={a.x1+10,a.y1+10,a.x1+30,a.y1+14}; lv_draw_rect(layer,&body,&bounds);
+}
+static void tomato_icon(lv_obj_t *parent,lv_align_t align,int x,int y)
+{
+    auto *icon=lv_obj_create(parent); lv_obj_remove_style_all(icon);
+    lv_obj_set_size(icon,40,40); lv_obj_align(icon,align,x,y);
+    lv_obj_remove_flag(icon,LV_OBJ_FLAG_CLICKABLE); lv_obj_remove_flag(icon,LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(icon,tomato_draw_cb,LV_EVENT_DRAW_MAIN,nullptr);
+}
 static void create_launcher_screen()
 {
     lv_obj_t *screen = create_screen(WatchScreen::Launcher, "Apps");
     lv_obj_t *activity = launcher_tile(screen, "ACTIVITY", "", -118, 92, design::Activity, open_activity_cb);
     lv_obj_t *activity_icon = footprints_icon(activity, 36, design::Activity);
     lv_obj_align(activity_icon, LV_ALIGN_TOP_MID, 0, 26);
-    launcher_tile(screen, "TIMER", LV_SYMBOL_BELL, 0, 92, design::Timer, open_timer_cb);
+    auto *pomodoro_tile=launcher_tile(screen, "POMODORO", "", 0, 92, 0xEE594E, open_timer_cb);
+    tomato_icon(pomodoro_tile,LV_ALIGN_TOP_MID,0,20);
     launcher_tile(screen, "STOPWATCH", LV_SYMBOL_PLAY, 118, 92, design::Stopwatch, open_stopwatch_cb);
     lv_obj_t *weather = launcher_tile(screen, "WEATHER", "", -118, 202, design::Weather, open_weather_cb);
     launcher_tile(screen, "MEDIA", LV_SYMBOL_AUDIO, 0, 202, kMediaAccent, open_media_cb);
@@ -959,18 +983,25 @@ static void refresh_time_tools()
     if (!display_active) return;
     char text[40];
     if (current_screen == WatchScreen::Timer && timer_value) {
-        const uint64_t duration = static_cast<uint64_t>(timer_minutes) * 60000;
+        const uint64_t duration = pomodoro_duration();
         const bool finished = countdown.elapsed_ms >= duration;
         const uint64_t remaining = finished ? 0 : duration - countdown.elapsed_ms;
-        format_elapsed(text, sizeof(text), ((remaining + 999) / 1000) * 1000, false);
+        const uint64_t seconds=(remaining+999)/1000;
+        snprintf(text,sizeof(text),"%02llu:%02llu",(unsigned long long)(seconds/60),(unsigned long long)(seconds%60));
         lv_label_set_text(timer_value, text);
-        lv_label_set_text(timer_status, finished ? "TIME'S UP" : countdown.running ? "RUNNING" : countdown.elapsed_ms ? "PAUSED" : "SET MINUTES / 1-120");
-        lv_label_set_text(timer_action_label, finished ? "RESTART" : countdown.running ? "PAUSE" : countdown.elapsed_ms ? "RESUME" : "START");
-        if (countdown.running || countdown.elapsed_ms) {
-            lv_obj_add_state(timer_minus, LV_STATE_DISABLED); lv_obj_add_state(timer_plus, LV_STATE_DISABLED);
-        } else {
-            lv_obj_remove_state(timer_minus, LV_STATE_DISABLED); lv_obj_remove_state(timer_plus, LV_STATE_DISABLED);
+        lv_arc_set_value(pomodoro_progress,static_cast<int32_t>((duration-remaining)*1000/duration));
+        lv_obj_set_style_arc_color(pomodoro_progress,lv_color_hex(pomodoro_break ? 0x86C978 : 0xEE594E),LV_PART_INDICATOR);
+        const uint32_t accent=pomodoro_break ? 0x86C978 : 0xEE594E;
+        lv_label_set_text(pomodoro_phase,pomodoro_break ? (pomodoro_completed==4 ? "LONG BREAK" : "SHORT BREAK") : "FOCUS TIME");
+        lv_obj_set_style_text_color(pomodoro_phase,lv_color_hex(accent),0);
+        lv_obj_set_style_bg_color(pomodoro_start,lv_color_hex(accent),0);
+        snprintf(text,sizeof(text),"%s",finished ? "DONE / TAKE A BREATH" : countdown.running ? (pomodoro_break ? "REST AND RECHARGE" : "ONE THING AT A TIME") : countdown.elapsed_ms ? "PAUSED" : "READY WHEN YOU ARE");
+        lv_label_set_text(timer_status,text);
+        for (unsigned i=0;i<4;++i) {
+            lv_obj_set_style_bg_color(pomodoro_sessions[i],lv_color_hex(i<pomodoro_completed ? 0xEE594E : design::Border),0);
+            lv_obj_set_style_border_color(pomodoro_sessions[i],lv_color_hex(!pomodoro_break && i==pomodoro_completed ? 0xEE594E : design::Border),0);
         }
+        lv_label_set_text(timer_action_label, finished ? "START NEXT" : countdown.running ? "PAUSE" : countdown.elapsed_ms ? "RESUME" : "START");
     }
     if (current_screen == WatchScreen::Stopwatch && stopwatch_value) {
         format_elapsed(text, sizeof(text), stopwatch.elapsed_ms, true);
@@ -984,7 +1015,7 @@ static void time_tools_tick(lv_timer_t *)
 {
     const uint32_t now = lv_tick_get();
     countdown.advance(now); stopwatch.advance(now);
-    const uint64_t duration = static_cast<uint64_t>(timer_minutes) * 60000;
+    const uint64_t duration = pomodoro_duration();
     const bool finished_now = countdown.running && countdown.elapsed_ms >= duration;
     if (countdown.elapsed_ms >= duration) { countdown.elapsed_ms = duration; countdown.running = false; }
     static uint64_t last_timer_second = UINT64_MAX;
@@ -998,15 +1029,15 @@ static void timer_control_cb(lv_event_t *)
 {
     const uint32_t now = lv_tick_get();
     countdown.advance(now);
-    if (countdown.elapsed_ms >= static_cast<uint64_t>(timer_minutes) * 60000) countdown.reset(now);
+    if (countdown.elapsed_ms >= pomodoro_duration()) pomodoro_next_cb(nullptr);
     countdown.toggle(now); refresh_time_tools();
 }
-static void timer_reset_cb(lv_event_t *) { countdown.reset(lv_tick_get()); refresh_time_tools(); }
-static void timer_adjust_cb(lv_event_t *event)
+static void timer_reset_cb(lv_event_t *) { pomodoro_break=false; pomodoro_completed=0; countdown.reset(lv_tick_get()); refresh_time_tools(); }
+static void pomodoro_next_cb(lv_event_t *)
 {
-    if (countdown.running || countdown.elapsed_ms) return;
-    int value = static_cast<int>(timer_minutes) + (lv_event_get_user_data(event) ? 1 : -1);
-    if (value >= 1 && value <= 120) timer_minutes = value;
+    if (pomodoro_break) { pomodoro_break=false; if (pomodoro_completed==4) pomodoro_completed=0; }
+    else { pomodoro_break=true; ++pomodoro_completed; }
+    countdown.reset(lv_tick_get());
     refresh_time_tools();
 }
 static void stopwatch_control_cb(lv_event_t *) { stopwatch.toggle(lv_tick_get()); refresh_time_tools(); }
@@ -1014,18 +1045,43 @@ static void stopwatch_reset_cb(lv_event_t *) { stopwatch.reset(lv_tick_get()); r
 
 static void create_time_tools()
 {
-    lv_obj_t *screen = create_screen(WatchScreen::Timer, "Timer");
-    timer_status = label(screen, "SET MINUTES / 1-120", design::caption(), kMuted, LV_ALIGN_TOP_MID, 0, 116);
-    timer_value = label(screen, "00:05:00", &lv_font_montserrat_48, kWhite, LV_ALIGN_TOP_MID, 0, 162);
-    timer_minus = button(screen, "- 1 MIN", 148, 56, LV_ALIGN_TOP_MID, -84, 240, nullptr);
-    timer_plus = button(screen, "+ 1 MIN", 148, 56, LV_ALIGN_TOP_MID, 84, 240, nullptr);
-    static bool increment = true;
-    lv_obj_add_event_cb(timer_minus, timer_adjust_cb, LV_EVENT_CLICKED, nullptr);
-    lv_obj_add_event_cb(timer_plus, timer_adjust_cb, LV_EVENT_CLICKED, &increment);
-    lv_obj_t *action = button(screen, "START", 148, 56, LV_ALIGN_TOP_MID, -84, 320, timer_control_cb);
+    lv_obj_t *screen = create_screen(WatchScreen::Timer, "Pomodoro");
+    pomodoro_progress=lv_arc_create(screen);
+    lv_obj_set_size(pomodoro_progress,216,216);
+    lv_obj_align(pomodoro_progress,LV_ALIGN_TOP_MID,0,72);
+    lv_arc_set_rotation(pomodoro_progress,270);
+    lv_arc_set_bg_angles(pomodoro_progress,0,360);
+    lv_arc_set_range(pomodoro_progress,0,1000);
+    lv_arc_set_value(pomodoro_progress,0);
+    lv_obj_remove_style(pomodoro_progress,nullptr,LV_PART_KNOB);
+    lv_obj_remove_flag(pomodoro_progress,LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(pomodoro_progress,LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_arc_width(pomodoro_progress,10,LV_PART_MAIN);
+    lv_obj_set_style_arc_width(pomodoro_progress,10,LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(pomodoro_progress,lv_color_hex(design::Border),LV_PART_MAIN);
+    lv_obj_set_style_arc_color(pomodoro_progress,lv_color_hex(0xEE594E),LV_PART_INDICATOR);
+    tomato_icon(screen,LV_ALIGN_TOP_MID,0,92);
+    pomodoro_phase=label(screen,"FOCUS TIME",design::caption(),0xEE594E,LV_ALIGN_TOP_MID,0,139);
+    timer_value = label(screen, "25:00", &lv_font_montserrat_48, kWhite, LV_ALIGN_TOP_MID, 0, 164);
+    timer_status = label(screen, "READY WHEN YOU ARE", design::caption(), kMuted, LV_ALIGN_TOP_MID, 0, 224);
+    for (unsigned i=0;i<4;++i) {
+        auto *dot=pomodoro_sessions[i]=lv_obj_create(screen);
+        lv_obj_remove_style_all(dot); lv_obj_set_size(dot,10,10);
+        lv_obj_align(dot,LV_ALIGN_TOP_MID,int(i)*20-30,258);
+        lv_obj_set_style_radius(dot,LV_RADIUS_CIRCLE,0);
+        lv_obj_set_style_bg_color(dot,lv_color_hex(design::Border),0);
+        lv_obj_set_style_bg_opa(dot,LV_OPA_COVER,0);
+        lv_obj_set_style_border_width(dot,2,0);
+        lv_obj_set_style_border_color(dot,lv_color_hex(i==0 ? 0xEE594E : design::Border),0);
+        lv_obj_remove_flag(dot,LV_OBJ_FLAG_CLICKABLE);
+    }
+    lv_obj_t *action = pomodoro_start = button(screen, "START", 304, 56, LV_ALIGN_TOP_MID, 0, 294, timer_control_cb);
+    lv_obj_set_style_bg_color(action,lv_color_hex(0xEE594E),0);
+    lv_obj_set_style_bg_opa(action,LV_OPA_COVER,0);
+    lv_obj_set_style_text_color(lv_obj_get_child(action,0),lv_color_hex(0x101010),0);
     timer_action_label = lv_obj_get_child(action, 0);
-    button(screen, "RESET", 148, 56, LV_ALIGN_TOP_MID, 84, 320, timer_reset_cb);
-    label(screen, "VISUAL ALERT ONLY", design::caption(), kMuted, LV_ALIGN_TOP_MID, 0, 392);
+    button(screen, "RESET", 144, 56, LV_ALIGN_TOP_MID, -80, 358, timer_reset_cb);
+    button(screen,"SKIP PHASE",144,56,LV_ALIGN_TOP_MID,80,358,pomodoro_next_cb);
 
     screen = create_screen(WatchScreen::Stopwatch, "Stopwatch");
     stopwatch_status = label(screen, "READY", design::caption(), kMuted, LV_ALIGN_TOP_MID, 0, 116);
