@@ -103,11 +103,11 @@ static void check_touch_targets(lv_obj_t *parent)
 
 int main()
 {
-    static_assert(sizeof(astra_halo_pixels) == astra_halo_size*astra_halo_size*2,"Fixed-size RGB565 halo");
+    static_assert(sizeof(mochi_halo_pixels) == mochi_halo_size*mochi_halo_size*2,"Fixed-size RGB565 halo");
     {
         auto pixel = [](unsigned x, unsigned y) {
-            const auto at = (y*astra_halo_size+x)*2;
-            return unsigned(astra_halo_pixels[at]) | (unsigned(astra_halo_pixels[at+1])<<8);
+            const auto at = (y*mochi_halo_size+x)*2;
+            return unsigned(mochi_halo_pixels[at]) | (unsigned(mochi_halo_pixels[at+1])<<8);
         };
         assert(pixel(88,88) == 0); // Black face interior.
         assert(pixel(0,0) == 0); // No rectangular glow at image corners.
@@ -531,7 +531,7 @@ int main()
     watch_ui_set_voice(0,0,0,nullptr);
     assert(!lv_obj_has_flag(voice_face,LV_OBJ_FLAG_HIDDEN));
     assert(!lv_obj_has_flag(voice_face,LV_OBJ_FLAG_CLICKABLE));
-    assert(strcmp(lv_label_get_text(voice_name),"Astra") == 0);
+    assert(strcmp(lv_label_get_text(voice_name),"Mochi") == 0);
     assert(!lv_obj_has_flag(voice_name,LV_OBJ_FLAG_HIDDEN));
     assert(strcmp(lv_label_get_text(lv_obj_get_child(voice_hold,0)),"HOLD TO TALK") == 0);
     assert(lv_obj_has_flag(voice_clear,LV_OBJ_FLAG_HIDDEN));
@@ -724,12 +724,17 @@ int main()
         lv_obj_send_event(astronomy_next_day,LV_EVENT_CLICKED,nullptr);
         assert(astronomy_day_offset == 1 && strstr(lv_label_get_text(astronomy_date_label),"25/10"));
         lv_obj_send_event(astronomy_moon_tab,LV_EVENT_CLICKED,nullptr);
+        assert(lv_color_eq(lv_obj_get_style_text_color(astronomy_first_value,LV_PART_MAIN),lv_color_hex(design::Timeout)));
+        assert(lv_color_eq(lv_obj_get_style_text_color(astronomy_second_value,LV_PART_MAIN),lv_color_hex(design::Timeout)));
         assert(astronomy_moon_view && !strcmp(lv_label_get_text(astronomy_first_title),"ILLUMINATION"));
         for (auto *tab : {astronomy_sun_tab,astronomy_moon_tab}) {
+            assert(strcmp(lv_label_get_text(lv_obj_get_child(tab,0)),"")==0);
             const auto color = lv_color_hex(tab == astronomy_sun_tab ? design::Weather : design::Timeout);
             assert(lv_color_eq(lv_obj_get_style_text_color(lv_obj_get_child(tab,0),LV_PART_MAIN),color));
         }
         lv_obj_send_event(astronomy_sun_tab,LV_EVENT_CLICKED,nullptr);
+        assert(lv_color_eq(lv_obj_get_style_text_color(astronomy_first_value,LV_PART_MAIN),lv_color_hex(design::Weather)));
+        assert(lv_color_eq(lv_obj_get_style_text_color(astronomy_second_value,LV_PART_MAIN),lv_color_hex(design::Weather)));
         assert(lv_obj_has_state(astronomy_sun_tab,LV_STATE_DISABLED));
         assert(lv_color_eq(lv_obj_get_style_text_color(lv_obj_get_child(astronomy_sun_tab,0),LV_PART_MAIN),lv_color_hex(design::Weather)));
         for (int i = 0; i < 9; ++i) lv_obj_send_event(astronomy_next_day,LV_EVENT_CLICKED,nullptr);

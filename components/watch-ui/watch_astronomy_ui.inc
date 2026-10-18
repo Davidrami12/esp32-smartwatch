@@ -28,6 +28,42 @@ static void astronomy_icon_draw(lv_event_t *event)
     astronomy_circle(layer,area.x1+33,area.y1+8,9,kSurface);
 }
 
+static void astronomy_tab_icon_draw(lv_event_t *event)
+{
+    auto *tab=static_cast<lv_obj_t *>(lv_event_get_target(event));
+    lv_area_t area; lv_obj_get_coords(tab,&area);
+    auto *layer=lv_event_get_layer(event);
+    const int cx=(area.x1+area.x2)/2,cy=(area.y1+area.y2)/2;
+    if (tab==astronomy_sun_tab) {
+        astronomy_circle(layer,cx,cy,8,design::Weather);
+        for (int ray=0;ray<8;++ray) {
+            const double angle=ray*6.283185307179586/8;
+            lv_draw_line_dsc_t line; lv_draw_line_dsc_init(&line);
+            line.color=lv_color_hex(design::Weather); line.width=2;
+            line.round_start=line.round_end=1;
+            line.p1={static_cast<lv_value_precise_t>(cx+lround(cos(angle)*12)),static_cast<lv_value_precise_t>(cy+lround(sin(angle)*12))};
+            line.p2={static_cast<lv_value_precise_t>(cx+lround(cos(angle)*15)),static_cast<lv_value_precise_t>(cy+lround(sin(angle)*15))};
+            lv_draw_line(layer,&line);
+        }
+    } else {
+        // Draw only the crescent, leaving the selected-tab surface untouched.
+        for (int y=-13;y<=13;++y) {
+            const int half=int(sqrt(double(169-y*y)));
+            int left=-half,right=half;
+            const int inner_y=y+5;
+            if (abs(inner_y)<=12) {
+                const int cut=5-int(sqrt(double(144-inner_y*inner_y)));
+                if (cut<=right) right=cut-1;
+            }
+            if (right<left) continue;
+            lv_draw_rect_dsc_t row; lv_draw_rect_dsc_init(&row);
+            row.bg_color=lv_color_hex(design::Timeout); row.bg_opa=LV_OPA_COVER;
+            lv_area_t bounds={cx+left,cy+y,cx+right,cy+y};
+            lv_draw_rect(layer,&row,&bounds);
+        }
+    }
+}
+
 static void astronomy_graph_draw(lv_event_t *event)
 {
     if (!astronomy_clock_valid) return;
@@ -107,6 +143,9 @@ static void render_astronomy()
     if (!astronomy_graph || !display_active || current_screen != WatchScreen::Astronomy) return;
     for (auto *tab : {astronomy_sun_tab,astronomy_moon_tab}) lv_obj_remove_state(tab,LV_STATE_DISABLED);
     lv_obj_add_state(astronomy_moon_view ? astronomy_moon_tab : astronomy_sun_tab,LV_STATE_DISABLED);
+    const auto value_color=lv_color_hex(astronomy_moon_view ? design::Timeout : design::Weather);
+    lv_obj_set_style_text_color(astronomy_first_value,value_color,0);
+    lv_obj_set_style_text_color(astronomy_second_value,value_color,0);
     lv_obj_t *content[] = {astronomy_graph,astronomy_first_title,astronomy_second_title,
         astronomy_first_value,astronomy_second_value,astronomy_info,astronomy_next};
     for (auto *object : content) {
@@ -189,8 +228,10 @@ static void astronomy_day_cb(lv_event_t *event)
 static void create_astronomy_screen()
 {
     auto *screen = create_screen(WatchScreen::Astronomy,"Sun & Moon");
-    astronomy_sun_tab = button(screen,"SUN",160,56,LV_ALIGN_TOP_MID,-88,80,astronomy_tab_cb);
-    astronomy_moon_tab = button(screen,"MOON",160,56,LV_ALIGN_TOP_MID,88,80,astronomy_tab_cb);
+    astronomy_sun_tab = button(screen,"",160,56,LV_ALIGN_TOP_MID,-88,80,astronomy_tab_cb);
+    astronomy_moon_tab = button(screen,"",160,56,LV_ALIGN_TOP_MID,88,80,astronomy_tab_cb);
+    lv_obj_add_event_cb(astronomy_sun_tab,astronomy_tab_icon_draw,LV_EVENT_DRAW_MAIN,nullptr);
+    lv_obj_add_event_cb(astronomy_moon_tab,astronomy_tab_icon_draw,LV_EVENT_DRAW_MAIN,nullptr);
     lv_obj_set_style_text_color(astronomy_sun_tab,lv_color_hex(design::Weather),0);
     lv_obj_set_style_text_color(astronomy_moon_tab,lv_color_hex(design::Timeout),0);
     // Keep category colors on the captions even when the selected tab uses

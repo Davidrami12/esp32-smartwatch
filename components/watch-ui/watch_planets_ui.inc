@@ -55,12 +55,12 @@ static void planets_icon_draw(lv_event_t *event) {
                 return lv_point_precise_t{static_cast<lv_value_precise_t>(cx+.90*x+.44*y),static_cast<lv_value_precise_t>(cy-.44*x+.90*y)};
             };
             lv_draw_line_dsc_t line; lv_draw_line_dsc_init(&line);
-            line.color=lv_color_hex(0x8AC4FF); line.width=2;
+            line.color=lv_color_hex(0xDEC9FF); line.width=2;
             line.p1=point(a); line.p2=point(b); lv_draw_line(layer,&line);
         }
     };
     ring_half(16,32);
-    astronomy_circle(layer,cx,cy,10,design::Bluetooth);
+    astronomy_circle(layer,cx,cy,10,0xA879E8);
     ring_half(0,16);
 }
 static void planets_draw(lv_event_t *event) {

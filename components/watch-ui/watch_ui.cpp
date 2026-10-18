@@ -6,7 +6,7 @@
 #include "watch_astronomy.h"
 #include "watch_planets.h"
 #include "watch_perf_monitor.h"
-#include "astra_halo.h"
+#include "mochi_halo.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -599,25 +599,7 @@ static lv_obj_t *launcher_tile(lv_obj_t *screen, const char *text, const char *s
     return tile;
 }
 
-static void sparkle_draw_cb(lv_event_t *event)
-{
-    lv_area_t area; lv_obj_get_coords(static_cast<lv_obj_t *>(lv_event_get_target(event)), &area);
-    auto *layer = lv_event_get_layer(event);
-    auto sparkle = [&](int x, int y, int radius, int waist) {
-        const int points[8][2] = {{0,-radius},{waist,-waist},{radius,0},{waist,waist},{0,radius},{-waist,waist},{-radius,0},{-waist,-waist}};
-        for (unsigned i = 0; i < 8; ++i) {
-            lv_draw_triangle_dsc_t triangle; lv_draw_triangle_dsc_init(&triangle);
-            triangle.color = lv_color_hex(0xC4A7FF); triangle.opa = LV_OPA_COVER;
-            triangle.p[0] = {static_cast<lv_value_precise_t>(area.x1+x),static_cast<lv_value_precise_t>(area.y1+y)};
-            triangle.p[1] = {static_cast<lv_value_precise_t>(area.x1+x+points[i][0]),static_cast<lv_value_precise_t>(area.y1+y+points[i][1])};
-            triangle.p[2] = {static_cast<lv_value_precise_t>(area.x1+x+points[(i+1)%8][0]),static_cast<lv_value_precise_t>(area.y1+y+points[(i+1)%8][1])};
-            lv_draw_triangle(layer,&triangle);
-        }
-    };
-    sparkle(13,20,12,3);
-    sparkle(29,7,6,2);
-    sparkle(31,28,4,1);
-}
+static void voice_happy_draw(lv_event_t *event);
 
 static void tomato_draw_cb(lv_event_t *event)
 {
@@ -653,10 +635,11 @@ static void create_launcher_screen()
     lv_label_set_text(lv_obj_get_child(ai,0),"AI ASSISTANT");
     lv_obj_set_style_text_font(lv_obj_get_child(ai,0),design::caption(),0);
     lv_obj_align(lv_obj_get_child(ai,0),LV_ALIGN_TOP_MID,0,70);
-    auto *sparkles = lv_obj_create(ai); lv_obj_remove_style_all(sparkles);
-    lv_obj_set_size(sparkles,36,34); lv_obj_align(sparkles,LV_ALIGN_TOP_MID,0,24);
-    lv_obj_remove_flag(sparkles,LV_OBJ_FLAG_CLICKABLE); lv_obj_remove_flag(sparkles,LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(sparkles,sparkle_draw_cb,LV_EVENT_DRAW_MAIN,nullptr);
+    auto *bot = lv_obj_create(ai); lv_obj_remove_style_all(bot);
+    lv_obj_set_size(bot,52,52); lv_obj_align(bot,LV_ALIGN_TOP_MID,0,12);
+    lv_obj_remove_flag(bot,LV_OBJ_FLAG_CLICKABLE); lv_obj_remove_flag(bot,LV_OBJ_FLAG_SCROLLABLE);
+    static bool open_eyes=true;
+    lv_obj_add_event_cb(bot,voice_happy_draw,LV_EVENT_DRAW_MAIN,&open_eyes);
     auto *astronomy_tile = launcher_tile(screen,"SUN & MOON","",-118,312,design::Weather,open_astronomy_cb);
     auto *astronomy_caption = lv_obj_get_child(astronomy_tile,0);
     lv_obj_set_style_text_font(astronomy_caption,design::caption(),0);
@@ -1264,10 +1247,10 @@ static void voice_face_draw(lv_event_t *event)
         lv_image_dsc_t image = {};
         image.header.magic = LV_IMAGE_HEADER_MAGIC;
         image.header.cf = LV_COLOR_FORMAT_RGB565;
-        image.header.w = image.header.h = astra_halo_size;
-        image.header.stride = astra_halo_size*2;
-        image.data_size = sizeof(astra_halo_pixels);
-        image.data = astra_halo_pixels;
+        image.header.w = image.header.h = mochi_halo_size;
+        image.header.stride = mochi_halo_size*2;
+        image.data_size = sizeof(mochi_halo_pixels);
+        image.data = mochi_halo_pixels;
         return image;
     }();
     lv_draw_image_dsc_t image; lv_draw_image_dsc_init(&image);
@@ -1329,21 +1312,31 @@ static void voice_happy_draw(lv_event_t *event)
     lv_area_t area; lv_obj_get_coords(static_cast<lv_obj_t *>(lv_event_get_target(event)),&area);
     auto *layer=lv_event_get_layer(event);
     const int cx=(area.x1+area.x2)/2,cy=(area.y1+area.y2)/2;
+    const int size=lv_obj_get_width(static_cast<lv_obj_t *>(lv_event_get_target(event)));
     for (int glow=3;glow>=0;--glow) {
         lv_draw_arc_dsc_t ring; lv_draw_arc_dsc_init(&ring);
-        ring.center={cx,cy}; ring.radius=23+glow*2; ring.width=2;
-        ring.start_angle=0; ring.end_angle=360; ring.color=lv_color_hex(0xC4A7FF);
+        ring.center={cx,cy}; ring.radius=(23+glow*2)*size/64; ring.width=glow ? 1 : 2;
+        ring.start_angle=0; ring.end_angle=360; ring.color=lv_color_hex(lv_event_get_user_data(event) ? kWhite : 0xC4A7FF);
         ring.opa=glow ? static_cast<lv_opa_t>(32/glow) : LV_OPA_COVER;
         lv_draw_arc(layer,&ring);
     }
     for (int eye=0;eye<2;++eye) {
-        const int x=cx+(eye ? 8 : -8);
+        const int x=cx+(eye ? 8 : -8)*size/64;
+        if (lv_event_get_user_data(event)) {
+            lv_draw_rect_dsc_t pupil; lv_draw_rect_dsc_init(&pupil);
+            pupil.bg_color=lv_color_hex(kWhite); pupil.bg_opa=LV_OPA_COVER;
+            pupil.radius=LV_RADIUS_CIRCLE;
+            const int half_width=(size+10)/20,half_height=size/10;
+            lv_area_t bounds={x-half_width,cy-half_height,x+half_width-1,cy+half_height-1};
+            lv_draw_rect(layer,&pupil,&bounds);
+            continue;
+        }
         const int points[][2]={{-4,1},{-2,-2},{0,-3},{2,-2},{4,1}};
         for (unsigned segment=0;segment<4;++segment) {
             lv_draw_line_dsc_t line; lv_draw_line_dsc_init(&line);
             line.color=lv_color_hex(kWhite); line.width=2; line.round_start=line.round_end=1;
-            line.p1={static_cast<lv_value_precise_t>(x+points[segment][0]),static_cast<lv_value_precise_t>(cy+points[segment][1])};
-            line.p2={static_cast<lv_value_precise_t>(x+points[segment+1][0]),static_cast<lv_value_precise_t>(cy+points[segment+1][1])};
+            line.p1={static_cast<lv_value_precise_t>(x+points[segment][0]*size/64),static_cast<lv_value_precise_t>(cy+points[segment][1]*size/64)};
+            line.p2={static_cast<lv_value_precise_t>(x+points[segment+1][0]*size/64),static_cast<lv_value_precise_t>(cy+points[segment+1][1]*size/64)};
             lv_draw_line(layer,&line);
         }
     }
@@ -1352,9 +1345,9 @@ static void voice_happy_draw(lv_event_t *event)
 static void create_voice_screen()
 {
     auto *screen = create_screen(WatchScreen::Voice,"AI Assistant");
-    voice_name = label(screen,"Astra",design::body(),kWhite,LV_ALIGN_TOP_MID,0,66);
+    voice_name = label(screen,"Mochi",design::body(),kWhite,LV_ALIGN_TOP_MID,0,66);
     voice_face = lv_obj_create(screen); lv_obj_remove_style_all(voice_face);
-    lv_obj_set_size(voice_face,astra_halo_size,astra_halo_size); lv_obj_align(voice_face,LV_ALIGN_TOP_MID,0,64);
+    lv_obj_set_size(voice_face,mochi_halo_size,mochi_halo_size); lv_obj_align(voice_face,LV_ALIGN_TOP_MID,0,64);
     lv_obj_remove_flag(voice_face,static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
     lv_obj_add_event_cb(voice_face,voice_face_draw,LV_EVENT_DRAW_MAIN,nullptr);
     voice_face_timer = lv_timer_create(voice_face_tick,80,nullptr);
