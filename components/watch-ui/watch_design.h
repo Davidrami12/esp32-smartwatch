@@ -17,6 +17,7 @@ constexpr uint32_t BatteryHigh = 0x32CD32, BatteryMedium = 0xFFD166;
 constexpr uint32_t BatteryLow = 0xFFAA55, BatteryCritical = 0xFF6655;
 constexpr int Unit = 8, Margin = 32, ContentWidth = 346;
 constexpr int Radius = 12, BorderWidth = 1, TouchHeight = 56;
+constexpr int BackWidth = 136;
 constexpr int HeaderY = 32, BackInset = 24, TransitionMs = 160;
 constexpr int IconSize = 32, IconStroke = 2;
 constexpr int TileWidth = 160, TileHeight = 132, TileOffset = 88;

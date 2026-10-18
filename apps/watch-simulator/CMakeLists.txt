@@ -82,19 +82,24 @@ set(
     src/hal/hal.c
     ../../components/watch-ui/watch_ui.cpp
     ../../components/watch-ui/watch_2048.cpp
+    ../../components/watch-ui/watch_astronomy.cpp
     ${WATCH_FONT_SOURCES}
 )
 set(MAIN_LIBS lvgl lvgl::examples lvgl::demos lvgl::thorvg ${SDL2_LIBRARIES})
 
 # Explicitly built headless integration tests; not part of normal firmware/simulator startup.
 add_executable(watch_ui_tools_tests EXCLUDE_FROM_ALL ../../tests/time_tools_ui_host.cpp
-    ../../components/watch-ui/watch_2048.cpp ${WATCH_FONT_SOURCES})
+    ../../components/watch-ui/watch_2048.cpp ../../components/watch-ui/watch_astronomy.cpp ${WATCH_FONT_SOURCES})
 target_include_directories(watch_ui_tools_tests PRIVATE ../../components/watch-ui)
 target_link_libraries(watch_ui_tools_tests PRIVATE ${MAIN_LIBS})
 add_executable(watch_2048_tests EXCLUDE_FROM_ALL
     ../../tests/watch_2048_test.cpp ../../components/watch-ui/watch_2048.cpp)
 target_include_directories(watch_2048_tests PRIVATE ../../components/watch-ui)
 enable_testing()
+add_executable(watch_astronomy_tests EXCLUDE_FROM_ALL
+    ../../tests/watch_astronomy_test.cpp ../../components/watch-ui/watch_astronomy.cpp)
+target_include_directories(watch_astronomy_tests PRIVATE ../../components/watch-ui)
+add_test(NAME watch_astronomy COMMAND watch_astronomy_tests)
 add_test(NAME watch_2048_logic COMMAND watch_2048_tests)
 add_test(NAME watch_ui_integration COMMAND watch_ui_tools_tests)
 add_executable(watch_2048_store_tests EXCLUDE_FROM_ALL ../../tests/watch_2048_store_test.cpp

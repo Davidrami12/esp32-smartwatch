@@ -327,11 +327,13 @@ static void update_clock_cb(
     time(&now);
 
     if (now < MIN_VALID_EPOCH) {
+        watch_ui_set_astronomy_time(static_cast<int64_t>(now),false);
         watch_ui_set_time("--:--");
         watch_ui_set_date("Waiting for local date");
         return;
     }
 
+    watch_ui_set_astronomy_time(static_cast<int64_t>(now),true);
     localtime_r(
         &now,
         &timeinfo
@@ -413,6 +415,7 @@ static void update_battery_cb(
 static void update_steps_cb(lv_timer_t *timer);
 
 static WatchTouchGate touch_gate;
+static WatchOffscreenHold offscreen_hold;
 static lv_indev_read_cb_t original_touch_read;
 static lv_indev_t *touch_input;
 
@@ -456,8 +459,25 @@ static void gated_touch_read(lv_indev_t *indev, lv_indev_data_t *data)
 {
     original_touch_read(indev,data);
     const bool pressed = data->state == LV_INDEV_STATE_PRESSED;
-    const auto filtered = touch_gate.sample(watch_power_is_active(),pressed);
+    const bool active = watch_power_is_active();
+    const auto filtered = touch_gate.sample(active,pressed);
     if (filtered.wake_press) wake_touch_press();
+    // Recheck power after double-tap handling: a normal wake must not turn
+    // into a long-hold shortcut. Pairing must never be interrupted either.
+    if (offscreen_hold.sample(watch_power_is_active() ||
+            watch_ble_security_status().state == watch_pairing_state_t::Comparing,
+            pressed,data->point.x,data->point.y,lv_tick_get())) {
+        watch_ui_set_display_active(true);
+        last_activity = lv_tick_get(); last_tap = 0;
+        update_clock_cb(NULL); update_steps_cb(NULL);
+        update_wifi_status_cb(NULL); update_battery_cb(NULL);
+        watch_ui_open_voice();
+        // Draw the assistant while brightness is still zero; never reveal the
+        // previous screen or a Home-to-AI animation during this wake shortcut.
+        lv_refr_now(NULL);
+        watch_power_set_active(true,current_brightness);
+        printf("Display wake: AI shortcut (no recording)\n");
+    }
     if (!filtered.allow) {
         data->state = LV_INDEV_STATE_RELEASED;
         data->continue_reading = false;
@@ -690,23 +710,34 @@ static bool voice_action(uint8_t action)
     if (action == 1) return watch_power_is_active() && watch_voice_start();
     if (action == 2) { watch_voice_release(); return true; }
     if (action == 3) { watch_voice_cancel(); return true; }
-    if (action == 4) return watch_voice_preview();
     return false;
 }
 static void voice_update_cb(lv_timer_t *)
 {
+    // Brightness zero does not suspend LVGL rendering. Do not continually
+    // invalidate the face/labels while the watch is asleep.
+    if (!watch_power_is_active()) return;
     const auto status = watch_voice_status();
-    if (status.state == WatchVoiceState::Starting || status.state == WatchVoiceState::Recording || status.state == WatchVoiceState::Playing ||
+    if (status.state == WatchVoiceState::Starting || status.state == WatchVoiceState::Recording ||
         status.state == WatchVoiceState::Transferring || status.state == WatchVoiceState::Processing)
         last_activity = lv_tick_get(); // Bounded explicit interaction; normal timeout resumes afterwards.
-    watch_ui_set_voice_progress(status.confirmed_bytes,status.total_bytes);
-    watch_ui_set_voice(static_cast<uint8_t>(status.state),status.duration_ms,status.level,status.error);
     static uint32_t revision = UINT32_MAX;
     static char transcription[513], answer[3073];
-    if (watch_voice_copy_text(&revision,transcription,answer)) {
+    const bool text_changed = watch_voice_copy_text(&revision,transcription,answer);
+    if (text_changed) {
         const auto started = esp_timer_get_time();
         watch_ui_set_voice_text(transcription,answer);
         ESP_LOGI("watch_voice","VoiceLatency stage=ui_labels_updated revision=%lu duration_us=%lld",static_cast<unsigned long>(revision),esp_timer_get_time()-started);
+    }
+    static WatchVoiceStatus previous = {};
+    static bool initialized = false;
+    if (!initialized || text_changed || previous.state != status.state ||
+        previous.duration_ms != status.duration_ms || previous.level != status.level ||
+        previous.error != status.error || previous.confirmed_bytes != status.confirmed_bytes ||
+        previous.total_bytes != status.total_bytes) {
+        watch_ui_set_voice_progress(status.confirmed_bytes,status.total_bytes);
+        watch_ui_set_voice(static_cast<uint8_t>(status.state),status.duration_ms,status.level,status.error);
+        previous = status; initialized = true;
     }
 }
 

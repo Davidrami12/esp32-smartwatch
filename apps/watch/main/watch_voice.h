@@ -2,7 +2,8 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "esp_err.h"
-enum class WatchVoiceState : uint8_t { Idle, Starting, Recording, Ready, Playing, Error, Transferring, Processing, Complete };
+// Value 4 was local playback; keep subsequent UI state values stable.
+enum class WatchVoiceState : uint8_t { Idle, Starting, Recording, Ready, Error = 5, Transferring, Processing, Complete };
 struct WatchVoiceStatus {
     WatchVoiceState state; uint32_t duration_ms; uint8_t level; const char *error;
     uint32_t confirmed_bytes = 0, total_bytes = 0;
@@ -11,7 +12,6 @@ esp_err_t watch_voice_init(); // Task only; no microphone activation.
 bool watch_voice_start();
 void watch_voice_release();
 void watch_voice_cancel();
-bool watch_voice_preview();
 WatchVoiceStatus watch_voice_status();
 // Secure GATT pull transfer; only a completed capture can be claimed.
 size_t watch_voice_metadata(uint8_t bytes[18]);

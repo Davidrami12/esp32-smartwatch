@@ -22,6 +22,7 @@ idf_component_register(
         ${LV_DEMOS_SOURCES}
         ../../../components/watch-ui/watch_ui.cpp
         ../../../components/watch-ui/watch_2048.cpp
+        ../../../components/watch-ui/watch_astronomy.cpp
         ../../../components/watch-ui/watch_fonts.cpp
         ../../../components/watch-ui/fonts/watch_latin_14.c
         ../../../components/watch-ui/fonts/watch_latin_18.c

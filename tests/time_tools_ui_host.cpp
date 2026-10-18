@@ -516,7 +516,7 @@ int main()
     assert(lv_obj_get_height(voice_hold) == 72);
     for (uint8_t busy_state : {1,2,3,6,7}) {
         watch_ui_set_voice(busy_state,1000,0,nullptr);
-        assert(!lv_obj_has_flag(voice_clear,LV_OBJ_FLAG_HIDDEN));
+        assert(lv_obj_has_flag(voice_clear,LV_OBJ_FLAG_HIDDEN) == (busy_state != 2));
         assert(strcmp(lv_label_get_text(lv_obj_get_child(voice_clear,0)),"CANCEL") == 0);
         if (busy_state == 2 || busy_state == 6) {
             lv_obj_update_layout(screen_for(WatchScreen::Voice));
@@ -527,8 +527,8 @@ int main()
     }
     for (uint8_t finished_state : {5,8}) {
         watch_ui_set_voice(finished_state,1000,0,nullptr);
-        assert(!lv_obj_has_flag(voice_clear,LV_OBJ_FLAG_HIDDEN));
-        assert(strcmp(lv_label_get_text(lv_obj_get_child(voice_clear,0)),"CLEAR") == 0);
+        assert(lv_obj_has_flag(voice_clear,LV_OBJ_FLAG_HIDDEN) == (finished_state == 8));
+        assert(lv_obj_has_flag(voice_hold,LV_OBJ_FLAG_HIDDEN) == (finished_state == 8));
     }
     watch_ui_set_voice(0,0,0,nullptr);
     auto *ai_tile = find_button(screen_for(WatchScreen::Launcher),"AI ASSISTANT");
@@ -552,7 +552,13 @@ int main()
     lv_obj_update_layout(screen_for(WatchScreen::Voice));
     assert(lv_obj_get_width(voice_face) == 176);
     assert(lv_obj_get_y(voice_face)+lv_obj_get_height(voice_face)/2+58+8 <= lv_obj_get_y(voice_details));
-    assert(lv_obj_get_y(voice_name) == 74 && lv_obj_get_y(voice_face) == 80);
+    assert(lv_obj_get_y(voice_name) == 66 && lv_obj_get_y(voice_face) == 64);
+    for (uint8_t state : {1,2,3,6,7,8,5,0}) {
+        watch_ui_set_voice(state,1000,0,nullptr);
+        lv_obj_update_layout(screen_for(WatchScreen::Voice));
+        assert(lv_obj_get_y(voice_face)==64 && lv_obj_get_x(voice_face)==117);
+        assert(lv_obj_get_y(voice_name)==66);
+    }
     assert(lv_obj_get_y(voice_hold)+lv_obj_get_height(voice_hold)+8 <= lv_obj_get_y(voice_clear));
     lv_obj_send_event(voice_hold,LV_EVENT_PRESSED,nullptr); assert(voice_held && voice_calls[1] == 1);
     lv_obj_send_event(voice_hold,LV_EVENT_RELEASED,nullptr); assert(!voice_held && voice_calls[2] == 1);
@@ -567,10 +573,11 @@ int main()
     lv_obj_send_event(voice_hold,LV_EVENT_PRESSED,nullptr); watch_ui_set_display_active(false);
     assert(!voice_held && voice_calls[3] == cancels+2); watch_ui_set_display_active(true);
     lv_obj_send_event(voice_hold,LV_EVENT_PRESSED,nullptr); watch_ui_show_notification("Phone","Test","Interrupt capture");
-    assert(!voice_held && voice_calls[3] == cancels+3);
+    assert(voice_held && voice_calls[3] == cancels+2 && current_screen == WatchScreen::Voice);
+    lv_obj_send_event(voice_hold,LV_EVENT_RELEASED,nullptr);
     watch_ui_hide_notification(); assert(current_screen == WatchScreen::Voice);
     lv_obj_send_event(voice_hold,LV_EVENT_PRESSED,nullptr); back_cb(nullptr);
-    assert(!voice_held && voice_calls[3] == cancels+4 && current_screen == WatchScreen::Launcher);
+    assert(!voice_held && voice_calls[3] == cancels+3 && current_screen == WatchScreen::Launcher);
     watch_ui_set_voice_callback(nullptr);
     WatchVoiceResult ai_result;
     const char *spanish = "¿Qué tal?";
@@ -585,8 +592,21 @@ int main()
     watch_ui_set_voice(8,0,0,nullptr);
     assert(strcmp(lv_label_get_text(voice_transcription),spanish) == 0);
     assert(strcmp(lv_label_get_text(voice_answer),"Una respuesta larga\ncon varias líneas.") == 0);
-    assert(strcmp(lv_label_get_text(voice_question_heading),"QUESTION") == 0);
-    assert(strcmp(lv_label_get_text(voice_answer_heading),"ANSWER") == 0);
+    assert(strcmp(lv_label_get_text(voice_question_heading),"QUESTION:") == 0);
+    assert(strcmp(lv_label_get_text(voice_answer_heading),"ANSWER:") == 0);
+    assert(lv_obj_has_flag(voice_hold,LV_OBJ_FLAG_HIDDEN));
+    assert(lv_obj_has_flag(voice_clear,LV_OBJ_FLAG_HIDDEN));
+    lv_obj_update_layout(screen_for(WatchScreen::Voice));
+    auto *answer_box=static_cast<lv_obj_t *>(lv_obj_get_user_data(voice_answer));
+    assert(lv_obj_get_height(answer_box)==184);
+    assert(lv_obj_has_flag(voice_status,LV_OBJ_FLAG_HIDDEN));
+    assert(lv_obj_has_flag(voice_happy,LV_OBJ_FLAG_HIDDEN));
+    assert(!lv_obj_has_flag(voice_face,LV_OBJ_FLAG_HIDDEN));
+    // The halo bitmap includes black outer margins; preserve clearance from
+    // the visible ring without reserving the entire transparent-looking box.
+    assert(lv_obj_get_y(voice_face)+lv_obj_get_height(voice_face)/2+58+8<=lv_obj_get_y(answer_box));
+    auto *answer_back=find_button(screen_for(WatchScreen::Voice),LV_SYMBOL_LEFT "  BACK");
+    assert(lv_obj_get_y(answer_box)+lv_obj_get_height(answer_box)+8<=lv_obj_get_y(answer_back));
     assert(!lv_obj_has_flag(static_cast<lv_obj_t *>(lv_obj_get_user_data(voice_answer)),LV_OBJ_FLAG_HIDDEN));
     ai_result.clear(); assert(!ai_result.transcription[0] && !ai_result.answer[0]);
     assert(watch_voice_feedback::percent(0,0) == 0);
@@ -603,8 +623,16 @@ int main()
     assert(strstr(lv_label_get_text(voice_status),"release to send"));
     assert(lv_bar_get_value(voice_level) == 73); // Microphone level is not transfer percent.
     watch_ui_set_voice(7,2000,0,nullptr);
+    assert(!strcmp(lv_label_get_text(voice_status),"Thinking..."));
     assert(!strchr(lv_label_get_text(voice_status),'%'));
-    assert(!lv_obj_has_flag(voice_waiting,LV_OBJ_FLAG_HIDDEN));
+    assert(lv_obj_has_flag(voice_waiting,LV_OBJ_FLAG_HIDDEN));
+    assert(!lv_obj_has_flag(voice_face,LV_OBJ_FLAG_HIDDEN));
+    assert(!lv_obj_has_flag(voice_name,LV_OBJ_FLAG_HIDDEN));
+    assert(lv_obj_has_flag(static_cast<lv_obj_t *>(lv_obj_get_user_data(voice_answer)),LV_OBJ_FLAG_HIDDEN));
+    assert(lv_obj_has_flag(voice_hold,LV_OBJ_FLAG_HIDDEN));
+    assert(lv_obj_has_flag(voice_details,LV_OBJ_FLAG_HIDDEN));
+    assert(lv_obj_has_flag(voice_clear,LV_OBJ_FLAG_HIDDEN));
+    assert(!strcmp(lv_label_get_text(lv_obj_get_child(voice_clear,0)),"CANCEL"));
     watch_ui_set_voice_text("","AI disabled");
     watch_ui_set_voice(5,0,0,watch_voice_feedback::message("AI_DISABLED"));
     assert(strcmp(lv_label_get_text(voice_status),"AI disabled") == 0);
@@ -744,5 +772,52 @@ int main()
             assert(lv_obj_get_y(lv_obj_get_child(tile,0))==70);
         }
     }
+    {
+        open_voice_cb(nullptr);
+        watch_ui_set_voice_text("Question","Answer");
+        watch_ui_set_voice_callback(voice_test_action);
+        watch_ui_set_voice(8,0,0,nullptr);
+        const unsigned before=voice_calls[3];
+        watch_ui_show_notification("Phone","Message","Incoming notification");
+        assert(current_screen==WatchScreen::Notification && voice_state==8);
+        assert(voice_calls[3]==before && !strcmp(lv_label_get_text(voice_answer),"Answer"));
+        watch_ui_hide_notification();
+        assert(current_screen==WatchScreen::Voice && voice_state==8);
+        watch_ui_set_voice(7,0,0,nullptr);
+        watch_ui_show_notification("Phone","Message","Processing interruption");
+        assert(voice_state==7 && voice_calls[3]==before);
+        watch_ui_set_voice_text("New question","New answer");
+        watch_ui_set_voice(8,0,0,nullptr);
+        watch_ui_hide_notification();
+        assert(current_screen==WatchScreen::Voice && voice_state==8);
+        assert(!strcmp(lv_label_get_text(voice_answer),"New answer"));
+        watch_ui_set_voice(2,1000,0,nullptr);
+        voice_held=true;
+        watch_ui_show_notification("Phone","Message","Recording interruption");
+        assert(current_screen==WatchScreen::Voice && voice_held && voice_notification_pending);
+        voice_held=false;
+        watch_ui_set_voice(6,1000,0,nullptr);
+        assert(current_screen==WatchScreen::Notification && voice_state==6 && voice_calls[3]==before);
+        watch_ui_hide_notification();
+        assert(current_screen==WatchScreen::Voice);
+        back_cb(nullptr);
+        assert(voice_calls[3]==before+1 && voice_state==0);
+    }
+    #if LV_USE_SYSMON && LV_USE_PERF_MONITOR
+    {
+        auto *layer=lv_display_get_layer_sys(lv_display_get_default());
+        bool compact_found=false;
+        for (uint32_t i=0;i<lv_obj_get_child_count(layer);++i) {
+            auto *object=lv_obj_get_child(layer,i);
+            if (!lv_obj_check_type(object,&lv_label_class) || lv_obj_has_flag(object,LV_OBJ_FLAG_HIDDEN)) continue;
+            const char *text=lv_label_get_text(object);
+            if (!strstr(text,"FPS")) continue;
+            assert(strstr(text,"% | ") && !strchr(text,'(') && !strchr(text,'\n'));
+            assert(lv_obj_get_style_align(object,LV_PART_MAIN)==LV_ALIGN_BOTTOM_MID);
+            compact_found=true;
+        }
+        assert(compact_found);
+    }
+    #endif
     puts("PASS: UI/navigation/time tools, 2048, media, Spanish fonts, voice privacy routing and bounded Spanish AI results");
 }

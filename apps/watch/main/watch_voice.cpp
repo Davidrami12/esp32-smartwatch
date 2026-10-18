@@ -17,7 +17,7 @@
 
 namespace {
 constexpr unsigned kRate = 16000, kFrames = 320, kMaxSamples = kRate * 8;
-constexpr uint32_t kStart = 1, kPlay = 2, kCancel = 4;
+constexpr uint32_t kStart = 1, kCancel = 4;
 constexpr uint32_t kProcess = 8;
 constexpr uint32_t kDisconnected = 16;
 std::atomic<uint32_t> confirmed_bytes{0}, total_bytes{0};
@@ -25,7 +25,7 @@ std::atomic<uint32_t> request_id{0};
 WatchVoiceResult result_text;
 uint32_t text_revision = 0;
 TaskHandle_t task;
-esp_codec_dev_handle_t microphone, speaker;
+esp_codec_dev_handle_t microphone;
 int16_t *pcm;
 size_t samples;
 std::atomic<int64_t> expires{0};
@@ -70,7 +70,7 @@ void clear_audio()
 }
 bool codecs()
 {
-    if (microphone && speaker) return true;
+    if (microphone) return true;
     // Official board pin mapping; only initialized after explicit hold.
     i2s_std_config_t config = {};
     config.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(kRate);
@@ -79,25 +79,23 @@ bool codecs()
     config.gpio_cfg.ws = BSP_I2S_LCLK; config.gpio_cfg.dout = BSP_I2S_DOUT; config.gpio_cfg.din = BSP_I2S_DSIN;
     if (bsp_audio_init(&config) != ESP_OK) return false;
     if (!microphone) microphone = bsp_audio_codec_microphone_init();
-    if (!speaker) speaker = bsp_audio_codec_speaker_init();
     if (microphone) esp_codec_dev_close(microphone);
-    if (speaker) esp_codec_dev_close(speaker);
-    return microphone && speaker;
+    return microphone != nullptr;
 }
 void record()
 {
     clear_audio();
-    if (!codecs()) { publish(WatchVoiceState::Error,"Audio no disponible"); return; }
+    if (!codecs()) { publish(WatchVoiceState::Error,"Audio unavailable"); return; }
     if (!held || cancelled) { publish(WatchVoiceState::Idle); return; }
     pcm = static_cast<int16_t *>(heap_caps_calloc(kMaxSamples,sizeof(int16_t),MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (!pcm) { publish(WatchVoiceState::Error,"Memoria de audio no disponible"); return; }
+    if (!pcm) { publish(WatchVoiceState::Error,"Audio buffer unavailable"); return; }
     esp_codec_dev_sample_info_t format = {};
     format.sample_rate = kRate; format.channel = 2; format.bits_per_sample = 16;
     if (esp_codec_dev_open(microphone,&format) != ESP_CODEC_DEV_OK) {
-        esp_codec_dev_close(microphone); clear_audio(); publish(WatchVoiceState::Error,"Micrófono no disponible"); return;
+        esp_codec_dev_close(microphone); clear_audio(); publish(WatchVoiceState::Error,"Microphone unavailable"); return;
     }
     if (esp_codec_dev_set_in_gain(microphone,24.0f) != ESP_CODEC_DEV_OK) {
-        esp_codec_dev_close(microphone); clear_audio(); publish(WatchVoiceState::Error,"Error al configurar el micrófono"); return;
+        esp_codec_dev_close(microphone); clear_audio(); publish(WatchVoiceState::Error,"Microphone setup failed"); return;
     }
     int16_t raw[kFrames*2];
     bool failed = false;
@@ -121,8 +119,8 @@ void record()
     const int close_result = esp_codec_dev_close(microphone);
     held = false;
     if (cancelled) { clear_audio(); publish(WatchVoiceState::Idle); }
-    else if (failed || close_result != ESP_CODEC_DEV_OK) { clear_audio(); publish(WatchVoiceState::Error,"Error al grabar el audio"); }
-    else if (samples < kRate/4) { clear_audio(); publish(WatchVoiceState::Error,"Grabación demasiado corta"); }
+    else if (failed || close_result != ESP_CODEC_DEV_OK) { clear_audio(); publish(WatchVoiceState::Error,"Audio recording failed"); }
+    else if (samples < kRate/4) { clear_audio(); publish(WatchVoiceState::Error,"Recording too short"); }
     else {
         session_id = esp_random(); if (!session_id) session_id = 1;
         diagnostic_session = session_id;
@@ -132,40 +130,23 @@ void record()
         ESP_LOGI("watch_voice","VoiceLatency trace=%08lx stage=finalized mono_us=%lld release_to_ready_us=%lld",static_cast<unsigned long>(session_id),esp_timer_get_time(),released_us.load() ? esp_timer_get_time()-released_us.load() : -1LL);
     }
 }
-void preview()
-{
-    esp_codec_dev_sample_info_t format = {};
-    format.sample_rate = kRate; format.channel = 1; format.bits_per_sample = 16;
-    bool failed = !pcm || esp_codec_dev_open(speaker,&format) != ESP_CODEC_DEV_OK;
-    if (!failed) {
-        failed = esp_codec_dev_set_out_vol(speaker,35) != ESP_CODEC_DEV_OK;
-        for (size_t at = 0; !failed && at < samples && !cancelled; at += kFrames) {
-            const size_t count = samples-at < kFrames ? samples-at : kFrames;
-            if (esp_codec_dev_write(speaker,pcm+at,count*sizeof(int16_t)) != ESP_CODEC_DEV_OK) { failed = true; break; }
-        }
-    }
-    if (speaker) esp_codec_dev_close(speaker);
-    clear_audio();
-    publish(failed ? WatchVoiceState::Error : WatchVoiceState::Idle,failed ? "Error al reproducir el audio" : nullptr);
-}
 void worker(void *)
 {
     while (true) {
         uint32_t command = 0;
         xTaskNotifyWait(0,UINT32_MAX,&command,pdMS_TO_TICKS(100));
         if ((command & kCancel) && cancelled) { clear_audio(); publish(WatchVoiceState::Idle); continue; }
-        if ((command & kDisconnected) && cancelled) { clear_audio(); publish(WatchVoiceState::Error,"Móvil desconectado"); continue; }
+        if ((command & kDisconnected) && cancelled) { clear_audio(); publish(WatchVoiceState::Error,"Phone disconnected"); continue; }
         if (command & kProcess) { clear_audio(); expires = esp_timer_get_time()+90'000'000; }
         if (command & kStart) record();
-        else if (command & kPlay) preview();
         if (expires && esp_timer_get_time() >= expires) {
             auto ready = WatchVoiceState::Ready;
             if (state.compare_exchange_strong(ready,WatchVoiceState::Starting)) {
                 ESP_LOGW("watch_voice", "Unclaimed capture expired after 30 seconds; no phone transfer claim received");
-                clear_audio(); publish(WatchVoiceState::Error,"El móvil no recogió el audio");
+                clear_audio(); publish(WatchVoiceState::Error,"Phone did not collect audio");
             }
-            else if (state == WatchVoiceState::Transferring) { clear_audio(); publish(WatchVoiceState::Error,"Tiempo de transferencia agotado"); }
-            else if (state == WatchVoiceState::Processing) { request_id = 0; expires = 0; publish(WatchVoiceState::Error,"Tiempo de espera agotado"); }
+            else if (state == WatchVoiceState::Transferring) { clear_audio(); publish(WatchVoiceState::Error,"Transfer timed out"); }
+            else if (state == WatchVoiceState::Processing) { request_id = 0; expires = 0; publish(WatchVoiceState::Error,"Request timed out"); }
         }
     }
 }
@@ -192,12 +173,6 @@ void watch_voice_cancel() {
     request_id = 0; cancelled = true; held = false;
     if (audio_lock) { xSemaphoreTake(audio_lock,portMAX_DELAY); stream_window.clear(); result_text.clear(); ++text_revision; xSemaphoreGive(audio_lock); }
     if (task) xTaskNotify(task,kCancel,eSetBits);
-}
-bool watch_voice_preview()
-{
-    auto old = WatchVoiceState::Ready;
-    if (!task || !state.compare_exchange_strong(old,WatchVoiceState::Playing)) return false;
-    cancelled = false; xTaskNotify(task,kPlay,eSetBits); return true;
 }
 WatchVoiceStatus watch_voice_status()
 {
