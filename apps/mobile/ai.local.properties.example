@@ -1,0 +1,4 @@
+# Copy to ai.local.properties (ignored by Git).
+# Use the public Firebase Web API key for esp32-smartwatch-511417.
+# Never add an OpenAI key, password, ID token or refresh token here.
+firebase.webApiKey=

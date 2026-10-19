@@ -75,6 +75,7 @@ static void update_clock_cb(lv_timer_t *timer)
     (void)timer;
 
     time_t now = time(NULL);
+    watch_ui_set_astronomy_time((int64_t)now,now >= 946684800);
     struct tm timeinfo;
 
 #ifdef _MSC_VER

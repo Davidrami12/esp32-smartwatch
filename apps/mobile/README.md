@@ -1,5 +1,103 @@
 # Android companion — secure background BLE, controls, notifications and media
 
+## AI Assistant — deployed Firebase/Cloud Run configuration
+
+- Firebase project: `esp32-smartwatch-511417`.
+- Backend: `https://watch-ai-backend-z5stegdulq-no.a.run.app` (fixed deployed URL).
+- Open **AI Assistant · configure / sign in**. Enter the Firebase public **Web API
+  key** for that project and your Firebase Email/Password account. Never enter an
+  OpenAI key. Only the backend's allowlisted UID is authorized; email alone is not
+  authorization. The phone checks returned token audience/issuer/UID consistency;
+  the backend remains responsible for signature, expiry, revocation and UID checks.
+- Optional build-local setup: copy `ai.local.properties.example` to
+  `ai.local.properties` and supply `firebase.webApiKey` privately. That file is
+  ignored by Git; never add passwords, bearer/refresh tokens or an OpenAI key.
+  When supplied, the public project-identifying key is included in BuildConfig/APK:
+  it is **not a secret** and is not trusted as backend authorization. Otherwise,
+  enter it on the phone; only this public key is saved in private app preferences.
+- Passwords and ID tokens are memory-only and never logged. After a first manual
+  sign-in, only the refresh token, public Firebase key and UID are saved as
+  AES-256-GCM ciphertext under `noBackupFilesDir`, using an Android Keystore key.
+  No passwords/tokens belong in `.env`, Gradle properties, Git or the APK. At app
+  startup and watch-ready reconnect, saved credentials are refreshed and backend
+  UID access verified automatically before admitting paid recordings. Near expiry
+  (last 60 seconds), the next authenticated operation refreshes the token.
+  Disabled/revoked/invalid refresh sessions clear authentication;
+  transient network errors allow a retry. Logout cancels active AI HTTP calls and
+  prevents a queued/in-flight login or refresh from restoring a signed-out session.
+- **Sign in / save automatic session** and automatic restoration POST an empty `audio/wav` body with the ID token.
+  The known backend authenticates/allowlists first, then returns its specific 400
+  invalid-WAV response before Firestore quota reservation or OpenAI. 403 means
+  non-allowlisted UID; 401 means rejected authentication; 503 is service/configuration
+  failure. HTTP redirects are disabled. No audio is submitted by login verification.
+- Paid AI preference defaults ON, but requests remain blocked until successful
+  sign-in/restoration AND backend UID verification (and always in transfer-test
+  builds). Turning it OFF is persisted across restarts, reconnects and sign-in;
+  only an explicit toggle turns it back ON. The sign-in UI explains charges.
+  Sign out removes the encrypted session and Keystore key and cancels calls;
+  it does not automatically sign back in. A new manual login is then required.
+  Transient network errors keep the saved session for retry on a later reconnect
+  or AI-settings resume (minimum 30 seconds between automatic attempts).
+  Clearing app data, uninstalling, key invalidation or revoked refresh credentials
+  require manual login. For unpaid
+  transfer tests, sign out or switch it off before recording. Firebase/Cloud Run networking itself can
+  still have ordinary service charges, but the login probe cannot call OpenAI.
+- Consent is captured when the phone claims a recording. If OFF then, enabling it
+  later cannot authorize that old clip: record a new question. Any consent change
+  revokes queued tickets and cancels active HTTP calls. Cancellation cannot undo a
+  request already accepted remotely or guarantee a refund.
+- Optional v2 lossless PCM notification windows are negotiated via protected
+  capabilities/CCCD; missing/unsupported peers retain legacy pull. For offline A/B
+  APK builds use `-PvoiceNotify=false` (pull) or `-PvoiceNotify=true` (default).
+  Physical validation/approval is still required; no measured speedup yet. See
+  `../../docs/voice-ble-window-optimization.md` for the protocol and test plan.
+
+### Firebase registration/key prerequisites
+
+This integration uses native HTTPS **Firebase REST**, not the Firebase Android SDK
+or Google Services Gradle plugin. Android app registration and `google-services.json`
+are **not required for this Email/Password REST flow**. Firebase Auth must be enabled
+in the correct project; a Web app registration is useful to obtain its public Web
+API key/configuration. The backend requires its authorized UID and existing IAM;
+this Android change does not create users, alter IAM, Firestore or backend settings.
+
+Use a Web API key with API restrictions compatible with both Identity Toolkit
+sign-in and Secure Token refresh. Browser-referrer or Android application-restricted
+keys may reject these REST calls. This client does not send Android package/cert
+restriction headers. Do not silently weaken an existing key: use the appropriate
+approved Web key. If adopting Android-restricted credentials/native Firebase SDK
+later, register package `dev.esp32.smartwatch` and its actual debug/release signing
+certificate fingerprints, then implement matching headers/SDK configuration.
+
+Mock session tests cover login, wrong project, refresh/rotation, transient/fatal
+refresh failures, logout races and disabled paid-request gate. They do not prove
+real Firebase login/UID access or token refresh. Real setup is unverified without
+the project's actual Web key and authorized user's privately entered credentials.
+
+## Activity dashboard (TFM)
+
+Open **Activity dashboard** for today's watch steps, watch-owned goal/progress,
+interactive seven-day Canvas chart and total/average. A private persistent cache
+keeps the latest snapshot offline, clearly marked CACHED/NOT LIVE with update time.
+Dates use watch CET/CEST semantics; missing chart dates display zero but are never
+manufactured into Health Connect records. Optional protected read-only `000e`
+provides the existing persistent goal; older firmware shows unavailable progress.
+No extra permissions or Health Connect readback. Full implementation/validation:
+`../../docs/mobile-activity-dashboard.md`.
+
+## Health Connect steps (TFM)
+
+Official Health Connect SDK, write-steps-only permission, explicit Sync now and
+optional batched automatic sync in the existing companion service. Grant access
+from the new Health Connect card; inspect records in Health Connect, not a new
+health-reading API in this app. Today and existing seven-day recorded history need
+the secured dated-activity `000d` firmware extension; older undated telemetry is
+never assigned a guessed phone date. Daily aggregates retain watch offsets and do
+not represent precise walking timestamps. Stable watch/date IDs and durable versions
+upsert the watch's records without adding the entire total again on each refresh.
+Privacy rationale is accessible both in the app and from Health Connect permissions.
+Full strategy, limitations and validation: `../../docs/mobile-health-connect.md`.
+
 Kotlin / Compose / native Android BLE, designed for the Google Pixel 10 Pro.
 `../../docs/ble-protocol.md` remains the protocol authority. Media requires the
 additive media-enabled firmware; older secured v1 firmware retains existing features.

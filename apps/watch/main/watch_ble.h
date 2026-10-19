@@ -20,4 +20,5 @@ void watch_ble_update_settings(uint8_t brightness, uint32_t timeout_ms);
 // Safe before init; notifications are dispatched on the NimBLE host event queue.
 void watch_ble_update_battery(int percentage); // Negative means unavailable.
 void watch_ble_update_steps(uint32_t steps);
+void watch_ble_update_step_goal(uint32_t goal);
 void watch_ble_update_wifi(uint8_t state); // 0 disconnected, 1 connecting, 2 connected, 3 disabled.

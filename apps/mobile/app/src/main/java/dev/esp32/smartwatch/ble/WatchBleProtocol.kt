@@ -20,6 +20,12 @@ object WatchBleProtocol {
     val MEDIA: UUID = UUID.fromString("7e57000a-8e7a-4b6d-9f2a-6c4d3e2f1000")
     val MEDIA_COMMAND: UUID = UUID.fromString("7e57000b-8e7a-4b6d-9f2a-6c4d3e2f1000")
     val MEDIA_CAPABILITIES: UUID = UUID.fromString("7e57000c-8e7a-4b6d-9f2a-6c4d3e2f1000")
+    val ACTIVITY: UUID = UUID.fromString("7e57000d-8e7a-4b6d-9f2a-6c4d3e2f1000")
+    val STEP_GOAL: UUID = UUID.fromString("7e57000e-8e7a-4b6d-9f2a-6c4d3e2f1000")
+    fun stepGoal(value: ByteArray): Int {
+        require(value.size == 4)
+        return unsigned(value).also { require(it in 1000L..30000L && it % 1000L == 0L) }.toInt()
+    }
     fun secureStatus(value: ByteArray): Boolean = value.contentEquals(byteArrayOf(1, 15, 16))
     val BATTERY: UUID = UUID.fromString("00002a19-0000-1000-8000-00805f9b34fb")
     val CCCD: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")

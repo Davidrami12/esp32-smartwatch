@@ -19,7 +19,7 @@ nvs_handle_t settings_handle = 0;
 watch_settings_t current_settings = {
     kDefaultBrightness,
     kDefaultScreenTimeoutMs,
-    kDefaultStepGoal
+    kDefaultStepGoal, 24, 60
 };
 bool settings_open = false;
 const char *TAG = "watch_settings";
@@ -48,7 +48,7 @@ void watch_settings_load(watch_settings_t *settings)
         return;
     }
 
-    current_settings = {kDefaultBrightness, kDefaultScreenTimeoutMs, kDefaultStepGoal};
+    current_settings = {kDefaultBrightness, kDefaultScreenTimeoutMs, kDefaultStepGoal, 24, 60};
 
     esp_err_t error = nvs_open(kNamespace, NVS_READWRITE, &settings_handle);
     if (error != ESP_OK) {
@@ -90,6 +90,18 @@ void watch_settings_load(watch_settings_t *settings)
         else ESP_LOGW(TAG, "Ignoring invalid step goal: %" PRIu32, goal);
     } else log_read_error(kStepGoalKey, error);
 
+    uint8_t gain=24;
+    error=nvs_get_u8(settings_handle,"mic_gain",&gain);
+    if (error==ESP_OK) {
+        if (gain<=42 && gain%6==0) current_settings.microphone_gain_db=gain;
+        else ESP_LOGW(TAG,"Ignoring invalid microphone gain: %u",gain);
+    } else log_read_error("mic_gain",error);
+    uint8_t volume=60;
+    error=nvs_get_u8(settings_handle,"output_volume",&volume);
+    if (error==ESP_OK) {
+        if (volume<=100) current_settings.output_volume=volume;
+        else ESP_LOGW(TAG,"Ignoring invalid output volume: %u",volume);
+    } else log_read_error("output_volume",error);
     *settings = current_settings;
     ESP_LOGI(TAG, "Loaded brightness=%u timeout_ms=%" PRIu32 " step_goal=%" PRIu32,
              current_settings.brightness, current_settings.screen_timeout_ms, current_settings.step_goal);
@@ -119,6 +131,31 @@ esp_err_t watch_settings_save_brightness(uint8_t brightness)
     }
     return error;
 }
+
+esp_err_t watch_settings_save_microphone_gain(uint8_t gain_db)
+{
+    if (gain_db>42 || gain_db%6) return ESP_ERR_INVALID_ARG;
+    if (gain_db==current_settings.microphone_gain_db) return ESP_OK;
+    if (!settings_open) return ESP_ERR_INVALID_STATE;
+    esp_err_t error=nvs_set_u8(settings_handle,"mic_gain",gain_db);
+    if (error==ESP_OK) error=nvs_commit(settings_handle);
+    if (error==ESP_OK) current_settings.microphone_gain_db=gain_db;
+    else ESP_LOGE(TAG,"Could not save microphone gain: %s",esp_err_to_name(error));
+    return error;
+}
+
+esp_err_t watch_settings_save_output_volume(uint8_t percent)
+{
+    if (percent>100) return ESP_ERR_INVALID_ARG;
+    if (percent==current_settings.output_volume) return ESP_OK;
+    if (!settings_open) return ESP_ERR_INVALID_STATE;
+    esp_err_t error=nvs_set_u8(settings_handle,"output_volume",percent);
+    if (error==ESP_OK) error=nvs_commit(settings_handle);
+    if (error==ESP_OK) current_settings.output_volume=percent;
+    else ESP_LOGE(TAG,"Could not save output volume: %s",esp_err_to_name(error));
+    return error;
+}
+
 
 esp_err_t watch_settings_save_step_goal(uint32_t goal)
 {

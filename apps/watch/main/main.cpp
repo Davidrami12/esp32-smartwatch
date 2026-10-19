@@ -14,6 +14,8 @@
 #include "watch_media.h"
 #include "watch_2048_store.h"
 #include "watch_display_start.h"
+#include "watch_voice.h"
+#include "watch_touch_gate.h"
 #include "esp_random.h"
 #include <stdio.h>
 #include <time.h>
@@ -51,7 +53,7 @@ static constexpr time_t MIN_VALID_EPOCH = 946684800; // 2000-01-01 UTC
 static uint32_t last_activity;
 static uint32_t last_tap = 0;
 
-static watch_settings_t user_settings = {60, 10000, 8000};
+static watch_settings_t user_settings = {60, 10000, 8000, 24, 60};
 static uint8_t current_brightness = 60;
 static uint32_t display_timeout_ms = 10000;
 
@@ -325,11 +327,13 @@ static void update_clock_cb(
     time(&now);
 
     if (now < MIN_VALID_EPOCH) {
+        watch_ui_set_astronomy_time(static_cast<int64_t>(now),false);
         watch_ui_set_time("--:--");
         watch_ui_set_date("Waiting for local date");
         return;
     }
 
+    watch_ui_set_astronomy_time(static_cast<int64_t>(now),true);
     localtime_r(
         &now,
         &timeinfo
@@ -410,17 +414,13 @@ static void update_battery_cb(
 
 static void update_steps_cb(lv_timer_t *timer);
 
-static void touch_event_cb(
-    lv_event_t *event
-)
-{
-    if (
-        lv_event_get_code(event) !=
-        LV_EVENT_PRESSED
-    ) {
-        return;
-    }
+static WatchTouchGate touch_gate;
+static WatchOffscreenHold offscreen_hold;
+static lv_indev_read_cb_t original_touch_read;
+static lv_indev_t *touch_input;
 
+static void wake_touch_press()
+{
     uint32_t now =
         lv_tick_get();
 
@@ -455,6 +455,37 @@ static void touch_event_cb(
     }
 }
 
+static void gated_touch_read(lv_indev_t *indev, lv_indev_data_t *data)
+{
+    original_touch_read(indev,data);
+    const bool pressed = data->state == LV_INDEV_STATE_PRESSED;
+    const bool active = watch_power_is_active();
+    const auto filtered = touch_gate.sample(active,pressed);
+    if (filtered.wake_press) wake_touch_press();
+    // Recheck power after double-tap handling: a normal wake must not turn
+    // into a long-hold shortcut. Pairing must never be interrupted either.
+    if (offscreen_hold.sample(watch_power_is_active() ||
+            watch_ble_security_status().state == watch_pairing_state_t::Comparing,
+            pressed,data->point.x,data->point.y,lv_tick_get())) {
+        watch_ui_set_display_active(true);
+        last_activity = lv_tick_get(); last_tap = 0;
+        update_clock_cb(NULL); update_steps_cb(NULL);
+        update_wifi_status_cb(NULL); update_battery_cb(NULL);
+        watch_ui_open_voice();
+        // Draw the assistant while brightness is still zero; never reveal the
+        // previous screen or a Home-to-AI animation during this wake shortcut.
+        lv_refr_now(NULL);
+        watch_power_set_active(true,current_brightness);
+        printf("Display wake: AI shortcut (no recording)\n");
+    }
+    if (!filtered.allow) {
+        data->state = LV_INDEV_STATE_RELEASED;
+        data->continue_reading = false;
+    } else if (pressed) {
+        last_activity = lv_tick_get();
+    }
+}
+
 static void register_touch_handler(void)
 {
     lv_indev_t *indev =
@@ -465,12 +496,10 @@ static void register_touch_handler(void)
             lv_indev_get_type(indev) ==
             LV_INDEV_TYPE_POINTER
         ) {
-            lv_indev_add_event_cb(
-                indev,
-                touch_event_cb,
-                LV_EVENT_PRESSED,
-                NULL
-            );
+            original_touch_read = lv_indev_get_read_cb(indev);
+            if (!original_touch_read) { printf("Touch read callback unavailable\n"); return; }
+            touch_input = indev;
+            lv_indev_set_read_cb(indev,gated_touch_read);
 
             printf("Touch handler registered\n");
             return;
@@ -501,6 +530,9 @@ static void display_timeout_cb(
             last_activity
         ) >= display_timeout_ms
     ) {
+        // Drop any in-flight click/gesture before the next released sample.
+        touch_gate.sleep();
+        if (touch_input) lv_indev_reset(touch_input,NULL);
         watch_power_set_active(false, current_brightness);
         watch_ui_set_display_active(false);
         last_tap = 0;
@@ -568,7 +600,9 @@ static void ui_brightness_committed(uint8_t brightness)
 
 static bool ui_step_goal_changed(uint32_t goal)
 {
-    return watch_settings_save_step_goal(goal) == ESP_OK;
+    if (watch_settings_save_step_goal(goal) != ESP_OK) return false;
+    watch_ble_update_step_goal(goal);
+    return true;
 }
 
 static esp_err_t ble_apply_control(watch_ble_control_t control, uint32_t value)
@@ -668,8 +702,44 @@ static void media_update_cb(lv_timer_t *)
 {
     static uint32_t revision = 0;
     watch_media_t media;
-    if (watch_media_snapshot(media, revision))
+    if (watch_media_snapshot(media, revision)) {
         watch_ui_set_media(media.state, media.actions, media.session, media.title, media.artist);
+    }
+}
+static bool voice_action(uint8_t action)
+{
+    if (action == 1) return watch_power_is_active() && watch_voice_start();
+    if (action == 2) { watch_voice_release(); return true; }
+    if (action == 3) { watch_voice_cancel(); return true; }
+    return false;
+}
+static void voice_update_cb(lv_timer_t *)
+{
+    // Brightness zero does not suspend LVGL rendering. Do not continually
+    // invalidate the face/labels while the watch is asleep.
+    if (!watch_power_is_active()) return;
+    const auto status = watch_voice_status();
+    if (status.state == WatchVoiceState::Starting || status.state == WatchVoiceState::Recording ||
+        status.state == WatchVoiceState::Transferring || status.state == WatchVoiceState::Processing)
+        last_activity = lv_tick_get(); // Bounded explicit interaction; normal timeout resumes afterwards.
+    static uint32_t revision = UINT32_MAX;
+    static char transcription[513], answer[3073];
+    const bool text_changed = watch_voice_copy_text(&revision,transcription,answer);
+    if (text_changed) {
+        const auto started = esp_timer_get_time();
+        watch_ui_set_voice_text(transcription,answer);
+        ESP_LOGI("watch_voice","VoiceLatency stage=ui_labels_updated revision=%lu duration_us=%lld",static_cast<unsigned long>(revision),esp_timer_get_time()-started);
+    }
+    static WatchVoiceStatus previous = {};
+    static bool initialized = false;
+    if (!initialized || text_changed || previous.state != status.state ||
+        previous.duration_ms != status.duration_ms || previous.level != status.level ||
+        previous.error != status.error || previous.confirmed_bytes != status.confirmed_bytes ||
+        previous.total_bytes != status.total_bytes) {
+        watch_ui_set_voice_progress(status.confirmed_bytes,status.total_bytes);
+        watch_ui_set_voice(static_cast<uint8_t>(status.state),status.duration_ms,status.level,status.error);
+        previous = status; initialized = true;
+    }
 }
 
 
@@ -765,6 +835,9 @@ extern "C" void app_main(void)
     bsp_display_lock(0);
 
     watch_ui_create();
+    if (watch_voice_init() != ESP_OK) ESP_LOGW("watch_voice","Capture task unavailable");
+    watch_ui_set_voice_callback(voice_action);
+    lv_timer_create(voice_update_cb,100,nullptr);
     watch_ui_set_notification_dismiss_callback(dismiss_notification);
     watch_ui_set_security_callbacks(watch_ble_security_confirm, watch_ble_security_forget);
     watch_ui_set_media_callback(watch_ble_media_command);
@@ -790,7 +863,19 @@ extern "C" void app_main(void)
     );
 
     /* Initial UI state */
+    watch_ui_set_volume(user_settings.output_volume,[](uint8_t percent) {
+        if (watch_settings_save_output_volume(percent)!=ESP_OK) return false;
+        watch_voice_preview_volume(percent);
+        return true;
+    });
+    watch_voice_set_microphone_gain(user_settings.microphone_gain_db);
+    watch_ui_set_microphone_gain(user_settings.microphone_gain_db,[](uint8_t gain_db) {
+        if (watch_settings_save_microphone_gain(gain_db)!=ESP_OK) return false;
+        watch_voice_set_microphone_gain(gain_db);
+        return true;
+    });
     watch_ui_set_step_goal(user_settings.step_goal);
+    watch_ble_update_step_goal(user_settings.step_goal);
     watch_ui_set_step_goal_callback(ui_step_goal_changed);
 
     update_clock_cb(NULL);

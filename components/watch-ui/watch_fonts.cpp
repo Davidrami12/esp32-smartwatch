@@ -1,6 +1,7 @@
 #include "watch_fonts.h"
 
 extern "C" {
+LV_FONT_DECLARE(watch_latin_14);
 LV_FONT_DECLARE(watch_latin_18);
 LV_FONT_DECLARE(watch_latin_26);
 LV_FONT_DECLARE(watch_latin_30);
@@ -20,6 +21,11 @@ lv_font_t with_latin(const lv_font_t &base, const lv_font_t &latin)
 }
 }
 
+const lv_font_t *watch_font_14()
+{
+    static const lv_font_t font = with_latin(lv_font_montserrat_14, watch_latin_14);
+    return &font;
+}
 const lv_font_t *watch_font_18()
 {
     static const lv_font_t font = with_latin(lv_font_montserrat_18, watch_latin_18);

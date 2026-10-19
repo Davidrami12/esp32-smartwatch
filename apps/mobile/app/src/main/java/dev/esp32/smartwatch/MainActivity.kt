@@ -23,6 +23,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.contentDescription
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -32,19 +34,41 @@ import dev.esp32.smartwatch.ble.WifiState
 import dev.esp32.smartwatch.ble.WatchBleProtocol
 import java.text.NumberFormat
 import kotlin.math.roundToInt
+import androidx.health.connect.client.HealthConnectClient
+import androidx.health.connect.client.PermissionController
+import dev.esp32.smartwatch.health.HealthConnectRepository
+import dev.esp32.smartwatch.health.HealthConnectState
+import dev.esp32.smartwatch.health.HealthPrivacyActivity
+import dev.esp32.smartwatch.activity.ActivityDashboardScreen
+import androidx.activity.compose.BackHandler
+import androidx.compose.runtime.saveable.rememberSaveable
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
+            val readingPreferences = remember { getSharedPreferences("reading", MODE_PRIVATE) }
+            var largeText by remember { mutableStateOf(readingPreferences.getBoolean("large_text",false)) }
+            val density = androidx.compose.ui.platform.LocalDensity.current
+            CompositionLocalProvider(androidx.compose.ui.platform.LocalDensity provides
+                androidx.compose.ui.unit.Density(density.density,density.fontScale * if (largeText) 1.2f else 1f)) {
             MaterialTheme(colorScheme = darkColorScheme(
                 primary = Color.White, onPrimary = Color.Black,
                 background = Color.Black, surface = Color(0xFF141414),
                 onSurface = Color(0xFFF2F2F2), onSurfaceVariant = Color(0xFFAAAAAA),
             )) {
                 val model: WatchViewModel = viewModel()
+                // Configuration is deliberately runtime-only; no embedded service credential.
                 val state by model.state.collectAsStateWithLifecycle()
+                val health by model.healthState.collectAsStateWithLifecycle()
+                val activity by model.activityState.collectAsStateWithLifecycle()
+                var showActivity by rememberSaveable { mutableStateOf(false) }
+                BackHandler(enabled = showActivity) { showActivity = false }
+                val healthPermissions = rememberLauncherForActivityResult(PermissionController.createRequestPermissionResultContract()) {
+                    model.healthPermissionResult(it.containsAll(HealthConnectRepository.PERMISSIONS))
+                }
+                LaunchedEffect(model) { model.refreshHealthPermissions() }
                 var permitted by remember { mutableStateOf(model.hasPermissions()) }
                 var notificationAllowed by remember { mutableStateOf(checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) }
                 val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
@@ -61,6 +85,7 @@ class MainActivity : ComponentActivity() {
                         if (event == Lifecycle.Event.ON_START) {
                             permitted = model.hasPermissions()
                             model.refreshNotificationAccess()
+                            model.refreshHealthPermissions()
                             notificationAllowed = checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
                             model.setForeground(true)
                         } else if (event == Lifecycle.Event.ON_STOP) model.setForeground(false)
@@ -73,13 +98,25 @@ class MainActivity : ComponentActivity() {
                     if (model.hasPermissions()) model.scan()
                     else permissions.launch(arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT))
                 }
-                SmartwatchScreen(state, permitted, requestScan, model::stopScan, model::connect, model::disconnect,
+                if (showActivity) ActivityDashboardScreen(activity,
+                    state.secureLink && state.connectionState == ConnectionState.CONNECTED && state.activityAvailable,
+                    { showActivity = false }, model::refreshActivity)
+                else SmartwatchScreen(state, permitted, requestScan, model::stopScan, model::connect, model::disconnect,
                     model::setBrightness, model::setScreenTimeout, model::setWifiEnabled,
                     model::resumeCompanion, notificationAllowed,
                     { notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS) },
-                    { startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) }) {
+                    { startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) }, health,
+                    { healthPermissions.launch(HealthConnectRepository.PERMISSIONS) }, model::syncHealthNow,
+                    model::setHealthAutomatic,
+                    { startActivity(Intent(this, HealthPrivacyActivity::class.java)) },
+                    { runCatching { startActivity(Intent(HealthConnectClient.ACTION_HEALTH_CONNECT_SETTINGS)) } },
+                    { showActivity = true; model.refreshActivity() },
+                     { startActivity(Intent(this, dev.esp32.smartwatch.ai.VoiceAiSettingsActivity::class.java)) },
+                     largeText, { enabled -> largeText = enabled; readingPreferences.edit().putBoolean("large_text",enabled).apply() },
+                     { permissions.launch(arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)) }) {
                     startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
                 }
+            }
             }
         }
     }
@@ -92,6 +129,11 @@ private fun SmartwatchScreen(
     brightnessChanged: (Int) -> Unit, timeoutChanged: (Long) -> Unit, wifiChanged: (Boolean) -> Unit,
     resumeCompanion: () -> Unit, notificationAllowed: Boolean, notificationPermission: () -> Unit,
     notificationSettings: () -> Unit,
+    health: HealthConnectState, healthPermission: () -> Unit, syncHealth: () -> Unit,
+    healthAutomatic: (Boolean) -> Unit, healthPrivacy: () -> Unit, healthSettings: () -> Unit,
+    openActivity: () -> Unit,
+    openAi: () -> Unit,
+    largeText: Boolean, setLargeText: (Boolean) -> Unit, requestPermissions: () -> Unit,
     appSettings: () -> Unit,
 ) {
     val busy = state.connectionState in listOf(ConnectionState.CONNECTING, ConnectionState.PAIRING, ConnectionState.DISCOVERING_SERVICES, ConnectionState.RECONNECTING)
@@ -99,18 +141,21 @@ private fun SmartwatchScreen(
         LazyColumn(modifier = Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(24.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)) {
             item { Text("Smartwatch", fontSize = 34.sp, fontWeight = FontWeight.Bold) }
+            item { ReadinessCard(state,permitted,requestPermissions,appSettings,notificationSettings,
+                notificationAllowed,notificationPermission,
+                { if (state.savedWatchAvailable) resumeCompanion() else scan() },openAi) }
             item {
-                Text(when (state.connectionState) {
-                    ConnectionState.DISCONNECTED -> "Disconnected"
-                    ConnectionState.SCANNING -> "Scanning for compatible watches…"
-                    ConnectionState.CONNECTING -> "Connecting…"
-                    ConnectionState.PAIRING -> "Pairing · compare codes on both devices"
-                    ConnectionState.DISCOVERING_SERVICES -> "Discovering services and preparing data…"
-                    ConnectionState.CONNECTED -> "Connected · encrypted + MITM protected"
-                    ConnectionState.RECONNECTING -> "Reconnecting to bonded watch…"
-                    ConnectionState.ERROR -> "Connection error"
-                }, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp)) {
+                        Text("Lectura", style = MaterialTheme.typography.titleMedium)
+                        Text("Amplía el texto de esta pantalla y del panel de actividad. Respeta también el tamaño configurado en Android.")
+                        Switch(checked = largeText,onCheckedChange = setLargeText,
+                            modifier = Modifier.semantics { contentDescription = "Texto ampliado" })
+                    }
+                }
             }
+            item { OutlinedButton(onClick = openActivity, modifier = Modifier.fillMaxWidth()) { Text("Activity dashboard") } }
+            item { HealthConnectCard(health, state, healthPermission, syncHealth, healthAutomatic, healthPrivacy, healthSettings) }
             if (!permitted) item {
                 Text("Nearby devices permission is required to find and connect to your watch. Location is not used.")
                 TextButton(onClick = appSettings) { Text("Open app settings") }
@@ -193,6 +238,38 @@ private fun SmartwatchScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant) }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun HealthConnectCard(health: HealthConnectState, watch: WatchState, permission: () -> Unit,
+                              sync: () -> Unit, automatic: (Boolean) -> Unit, privacy: () -> Unit, settings: () -> Unit) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Health Connect", style = MaterialTheme.typography.titleLarge)
+            Text(when (health.availability) {
+                HealthConnectClient.SDK_AVAILABLE -> if (health.permissionGranted) "Write steps · allowed" else "Write steps · not granted"
+                HealthConnectClient.SDK_UNAVAILABLE_PROVIDER_UPDATE_REQUIRED -> "Install or update Health Connect. On Android 14+, check system updates."
+                else -> "Health Connect unavailable on this device/profile."
+            })
+            Text("Watch daily aggregates, not precise walking times. Today and recorded dates in the last 7 days use the watch's timezone.", style = MaterialTheme.typography.bodySmall)
+            Text("Last successful sync: " + (health.lastSyncMillis?.let { java.text.DateFormat.getDateTimeInstance().format(java.util.Date(it)) } ?: "Never"))
+            if (watch.connectionState == ConnectionState.CONNECTED && !watch.activityAvailable) Text("Install activity-enabled firmware to sync dated totals.")
+            if (health.availability == HealthConnectClient.SDK_AVAILABLE && !health.permissionGranted)
+                OutlinedButton(onClick = permission) { Text("Allow Write steps") }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text("Automatic sync", modifier = Modifier.padding(top = 12.dp))
+                Switch(checked = health.automatic, onCheckedChange = automatic)
+            }
+            Text("Batched every 5 minutes while the companion is enabled. Permissions are requested only here.", style = MaterialTheme.typography.bodySmall)
+            Button(onClick = sync, enabled = health.permissionGranted && !health.syncing && watch.secureLink &&
+                watch.connectionState == ConnectionState.CONNECTED && watch.activityAvailable) { Text("Sync now") }
+            if (health.syncing) LinearProgressIndicator(Modifier.fillMaxWidth())
+            health.message?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+            health.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+            TextButton(onClick = privacy) { Text("Privacy & permission rationale") }
+            TextButton(onClick = settings) { Text("Open Health Connect settings") }
         }
     }
 }

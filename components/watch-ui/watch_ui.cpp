@@ -2,10 +2,17 @@
 #include "watch_design.h"
 #include "watch_time_tools.h"
 #include "watch_2048.h"
+#include "watch_voice_feedback.h"
+#include "watch_astronomy.h"
+#include "watch_planets.h"
+#include "watch_perf_monitor.h"
+#include "mochi_halo.h"
 
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
+#include <math.h>
+#include <initializer_list>
 
 namespace {
 
@@ -16,11 +23,46 @@ constexpr uint32_t kMuted = design::Secondary;
 constexpr uint32_t kAccent = design::Connected;
 constexpr uint32_t kWhite = design::Primary;
 constexpr uint32_t kWarning = design::Warning;
+constexpr uint32_t kMediaAccent = 0x95D5AE;
 constexpr uint32_t kTimeouts[] = {5000, 10000, 30000, 60000, 0};
 
-enum class WatchScreen { Home, Launcher, Activity, Settings, Wifi, Bluetooth, Brightness, Timeout, Timer, Stopwatch, Weather, Notification, Pairing, ForgetPhone, Media, Game2048 };
+enum class WatchScreen { Home, Launcher, Activity, Settings, Wifi, Bluetooth, Brightness, Timeout, Timer, Stopwatch, Weather, Notification, Pairing, ForgetPhone, Media, Game2048, Voice, Astronomy, Planets, Sound, BatterySaver, Hardware };
 static WatchScreen current_screen = WatchScreen::Home;
-static lv_obj_t *screens[16] = {};
+static lv_obj_t *screens[22] = {};
+static void refresh_battery_saver();
+static bool battery_saver_return=false;
+static lv_obj_t *sound_status, *sound_gain;
+static uint8_t sound_gain_db=24;
+static watch_ui_microphone_gain_cb_t sound_gain_callback=nullptr;
+static lv_obj_t *sound_slider, *sound_percent;
+static uint8_t sound_volume_percent=60;
+static watch_ui_volume_cb_t sound_volume_callback=nullptr;
+static lv_obj_t *settings_volume_value;
+static bool sound_dragging=false;
+static void refresh_planets();
+static void refresh_astronomy();
+static watch_ui_voice_cb_t voice_callback;
+static lv_obj_t *voice_status, *voice_details, *voice_level, *voice_hold, *voice_clear;
+static lv_obj_t *voice_transcription, *voice_answer;
+static lv_obj_t *voice_note, *voice_question_heading, *voice_answer_heading;
+static lv_obj_t *voice_face, *voice_name, *voice_happy;
+static lv_timer_t *voice_face_timer;
+static uint8_t voice_face_level = 0;
+static bool voice_face_blink = false;
+static void refresh_voice_face();
+static lv_obj_t *voice_microphone, *voice_waiting;
+static uint8_t voice_state = 0;
+static bool voice_held = false;
+static bool voice_notification_pending = false;
+static uint32_t voice_confirmed = 0, voice_total = 0;
+static void cancel_voice()
+{
+    voice_held = false;
+    if (voice_callback) voice_callback(3);
+    watch_ui_set_voice_text("","");
+    watch_ui_set_voice_progress(0,0);
+    watch_ui_set_voice(0,0,0,nullptr);
+}
 static Watch2048 game_2048;
 static watch_ui_2048_best_cb_t game_best_callback = nullptr;
 static lv_obj_t *game_score, *game_best, *game_board, *game_tiles[16], *game_values[16];
@@ -57,8 +99,13 @@ static uint32_t forecast_age = 0;
 static void render_forecast();
 static bool display_active = true;
 static WatchTimeTool countdown, stopwatch;
-static uint32_t timer_minutes = 5;
-static lv_obj_t *timer_value, *timer_status, *timer_action_label, *timer_minus, *timer_plus;
+static bool pomodoro_break=false;
+static unsigned pomodoro_completed=0;
+static uint64_t pomodoro_duration() { return uint64_t(pomodoro_break ? (pomodoro_completed==4 ? 15 : 5) : 25)*60000; }
+static void pomodoro_next_cb(lv_event_t *);
+static lv_obj_t *timer_value, *timer_status, *timer_action_label;
+static lv_obj_t *pomodoro_progress;
+static lv_obj_t *pomodoro_phase, *pomodoro_sessions[4], *pomodoro_start;
 static lv_obj_t *stopwatch_value, *stopwatch_status, *stopwatch_action_label;
 static void refresh_time_tools();
 static lv_obj_t *time_label, *date_label, *steps_label, *activity_steps_label;
@@ -114,19 +161,34 @@ static lv_screen_load_anim_t navigation_animation(WatchScreen from, WatchScreen 
     // Home buttons map spatially: Settings is left, Apps is right.
     if (from == WatchScreen::Home && to == WatchScreen::Settings) return LV_SCR_LOAD_ANIM_MOVE_RIGHT;
     if (from == WatchScreen::Settings && to == WatchScreen::Home) return LV_SCR_LOAD_ANIM_MOVE_LEFT;
+    const auto settings_option = [](WatchScreen screen) {
+        return screen == WatchScreen::Wifi || screen == WatchScreen::Bluetooth ||
+               screen == WatchScreen::Brightness || screen == WatchScreen::Timeout || screen == WatchScreen::Sound || screen == WatchScreen::BatterySaver || screen == WatchScreen::Hardware;
+    };
+    if (from == WatchScreen::Settings && settings_option(to)) return LV_SCR_LOAD_ANIM_MOVE_RIGHT;
+    if (settings_option(from) && to == WatchScreen::Settings) return LV_SCR_LOAD_ANIM_MOVE_LEFT;
     const bool back = to == WatchScreen::Home ||
         ((to == WatchScreen::Launcher || to == WatchScreen::Settings) && from != WatchScreen::Home);
     return back ? LV_SCR_LOAD_ANIM_MOVE_RIGHT : LV_SCR_LOAD_ANIM_MOVE_LEFT;
 }
 
-static void navigate_to(WatchScreen screen)
+static void navigate_to(WatchScreen screen, bool animate = true)
 {
     if (screen == current_screen) return;
     if (current_screen == WatchScreen::Game2048) save_game_best(true);
-    lv_screen_load_anim(screen_for(screen), navigation_animation(current_screen, screen), design::TransitionMs, 0, false);
+    if (current_screen == WatchScreen::Voice && screen != WatchScreen::Notification) {
+        voice_notification_pending = false;
+        cancel_voice();
+    }
+    if (animate) lv_screen_load_anim(screen_for(screen), navigation_animation(current_screen, screen), design::TransitionMs, 0, false);
+    else lv_screen_load(screen_for(screen));
     current_screen = screen;
+    refresh_voice_face();
     refresh_media_record();
     refresh_time_tools();
+    refresh_astronomy();
+    refresh_planets();
+    refresh_battery_saver();
     if (screen == WatchScreen::Weather) render_forecast();
     if (screen == WatchScreen::Game2048) render_game();
 }
@@ -141,12 +203,15 @@ static void open_timeout_cb(lv_event_t *) { navigate_to(WatchScreen::Timeout); }
 static void open_timer_cb(lv_event_t *) { navigate_to(WatchScreen::Timer); }
 static void open_stopwatch_cb(lv_event_t *) { navigate_to(WatchScreen::Stopwatch); }
 static void open_weather_cb(lv_event_t *) { navigate_to(WatchScreen::Weather); }
+static void open_astronomy_cb(lv_event_t *) { navigate_to(WatchScreen::Astronomy); }
+static void open_planets_cb(lv_event_t *) { navigate_to(WatchScreen::Planets); }
 static void open_media_cb(lv_event_t *) { navigate_to(WatchScreen::Media); }
 static void open_game_cb(lv_event_t *)
 {
     if (!game_2048.started) game_2048.new_game();
     navigate_to(WatchScreen::Game2048);
 }
+static void open_voice_cb(lv_event_t *) { navigate_to(WatchScreen::Voice); }
 static void step_goal_changed_cb(lv_event_t *event)
 {
     const bool increase = lv_event_get_target(event) == goal_plus;
@@ -192,13 +257,17 @@ static void back_cb(lv_event_t *)
         return;
     }
     const bool settings_child = current_screen == WatchScreen::Wifi || current_screen == WatchScreen::Bluetooth ||
-        current_screen == WatchScreen::Brightness || current_screen == WatchScreen::Timeout;
+        current_screen == WatchScreen::Brightness || current_screen == WatchScreen::Timeout || current_screen == WatchScreen::Sound || current_screen == WatchScreen::BatterySaver || current_screen == WatchScreen::Hardware;
+    if (battery_saver_return && settings_child && current_screen!=WatchScreen::BatterySaver) {
+        battery_saver_return=false; navigate_to(WatchScreen::BatterySaver); return;
+    }
     navigate_to(current_screen == WatchScreen::Launcher || current_screen == WatchScreen::Settings ?
                 WatchScreen::Home : settings_child ? WatchScreen::Settings : WatchScreen::Launcher);
 }
 
 static void process_swipe(lv_dir_t direction)
 {
+    if (current_screen == WatchScreen::Voice && voice_held) { cancel_voice(); return; }
     if (current_screen == WatchScreen::Game2048) { game_swipe(direction); return; }
     if (current_screen == WatchScreen::Home && direction == LV_DIR_LEFT) navigate_to(WatchScreen::Launcher);
     else if (current_screen != WatchScreen::Home && direction == LV_DIR_RIGHT) back_cb(nullptr);
@@ -235,23 +304,54 @@ static lv_obj_t *button(lv_obj_t *screen, const char *text, int width, int heigh
                         lv_align_t align, int x, int y, lv_event_cb_t callback)
 {
     lv_obj_t *object = lv_button_create(screen);
-    lv_obj_set_size(object, width, height);
+    lv_obj_set_size(object, width < design::TouchHeight ? design::TouchHeight : width,
+                    height < design::TouchHeight ? design::TouchHeight : height);
     lv_obj_align(object, align, x, y);
     style_surface(object);
     style_press_feedback(object);
     lv_obj_set_style_text_color(object, lv_color_hex(design::Disabled), LV_STATE_DISABLED);
+    lv_obj_set_style_text_color(object, lv_color_hex(kWhite), 0);
     if (callback) lv_obj_add_event_cb(object, callback, LV_EVENT_CLICKED, nullptr);
-    label(object, text, design::body(), kWhite, LV_ALIGN_CENTER, 0, 0);
+    // Inherit text color from the button so disabled/pressed states apply to
+    // every app consistently (a fixed child color previously masked them).
+    auto *text_label = lv_label_create(object);
+    lv_label_set_text(text_label,text);
+    lv_obj_set_style_text_font(text_label,design::body(),0);
+    lv_obj_center(text_label);
     return object;
+}
+
+static void center_navigation_content(lv_obj_t *object)
+{
+    auto *caption = lv_obj_get_child(object,0);
+    const char *text = lv_label_get_text(caption);
+    const char *separator = strstr(text,"  ");
+    if (!separator || separator-text >= 8) return;
+    char icon_text[8] = {}, title[32];
+    memcpy(icon_text,text,separator-text);
+    snprintf(title,sizeof(title),"%s",separator+2);
+    lv_label_set_text(caption,icon_text);
+    auto *title_label = lv_label_create(object);
+    lv_label_set_text(title_label,title);
+    lv_obj_t *parts[] = {caption,title_label};
+    for (auto *part : parts) {
+        lv_obj_set_style_text_font(part,&lv_font_montserrat_16,0);
+        lv_obj_set_style_text_align(part,LV_TEXT_ALIGN_CENTER,0);
+        lv_obj_remove_flag(part,LV_OBJ_FLAG_CLICKABLE);
+    }
+    lv_obj_set_flex_flow(object,LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(object,LV_FLEX_ALIGN_CENTER,LV_FLEX_ALIGN_CENTER,LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(object,8,0);
 }
 
 static lv_obj_t *home_navigation_button(lv_obj_t *screen, bool settings)
 {
     lv_obj_t *object = button(screen, settings ? LV_SYMBOL_SETTINGS "  SETTINGS" : LV_SYMBOL_LIST "  APPS",
-                             design::TileWidth, design::TouchHeight, LV_ALIGN_BOTTOM_MID,
-                             settings ? -design::TileOffset : design::TileOffset, -design::BackInset,
+                             136, design::TouchHeight, LV_ALIGN_BOTTOM_MID,
+                             settings ? -76 : 76, -design::BackInset - design::Unit,
                              settings ? open_settings_cb : open_launcher_cb);
-    lv_obj_set_style_text_font(lv_obj_get_child(object, 0), &lv_font_montserrat_16, 0);
+    center_navigation_content(object);
+    lv_obj_set_style_radius(object,design::TouchHeight/2,0);
     return object;
 }
 
@@ -271,10 +371,18 @@ static lv_obj_t *create_screen(WatchScreen id, const char *title)
         snprintf(heading, sizeof(heading), "%s", title);
         for (char *p = heading; *p; ++p) *p = static_cast<char>(toupper(static_cast<unsigned char>(*p)));
         lv_obj_t *heading_label = label(screen, heading, design::title(), kWhite, LV_ALIGN_TOP_MID, 0, design::HeaderY);
+        lv_obj_set_width(heading_label,design::ContentWidth);
+        lv_obj_set_style_text_align(heading_label,LV_TEXT_ALIGN_CENTER,0);
+        lv_label_set_long_mode(heading_label,LV_LABEL_LONG_DOT);
         lv_obj_set_style_text_letter_space(heading_label, 2, 0);
         const bool parent_screen = id == WatchScreen::Launcher || id == WatchScreen::Settings;
-        button(screen, id == WatchScreen::Notification ? LV_SYMBOL_CLOSE "  DISMISS" : parent_screen ? LV_SYMBOL_HOME "  HOME" : LV_SYMBOL_LEFT "  BACK",
-               240, design::TouchHeight, LV_ALIGN_BOTTOM_MID, 0, -design::BackInset, back_cb);
+        auto *navigation = button(screen, id == WatchScreen::Notification ? LV_SYMBOL_CLOSE "  DISMISS" : parent_screen ? LV_SYMBOL_HOME "  HOME" : LV_SYMBOL_LEFT "  BACK",
+               id == WatchScreen::Notification ? 240 : design::BackWidth,
+               design::TouchHeight, LV_ALIGN_BOTTOM_MID, 0, -design::BackInset, back_cb);
+        if (id != WatchScreen::Notification) {
+            lv_obj_set_style_radius(navigation,design::TouchHeight/2,0);
+            center_navigation_content(navigation);
+        }
     }
     return screen;
 }
@@ -413,6 +521,9 @@ static void clock_draw_cb(lv_event_t *event)
     }
 }
 
+#include "watch_astronomy_ui.inc"
+#include "watch_planets_ui.inc"
+
 static void create_home_screen()
 {
     lv_obj_t *screen = create_screen(WatchScreen::Home, nullptr);
@@ -490,26 +601,79 @@ static lv_obj_t *app_tile(lv_obj_t *screen, const char *text, const char *symbol
     return tile;
 }
 
+// Launcher-only sizing: Settings deliberately retains the original app_tile.
+static lv_obj_t *launcher_tile(lv_obj_t *screen, const char *text, const char *symbol,
+                               int x, int y, uint32_t color, lv_event_cb_t callback)
+{
+    auto *tile = button(screen,text,108,100,LV_ALIGN_TOP_MID,x,y,callback);
+    auto *caption = lv_obj_get_child(tile,0);
+    lv_obj_set_style_text_font(caption,design::caption(),0);
+    lv_obj_align(caption,LV_ALIGN_TOP_MID,0,70);
+    label(tile,symbol,&lv_font_montserrat_30,color,LV_ALIGN_TOP_MID,0,24);
+    return tile;
+}
+
+static void voice_happy_draw(lv_event_t *event);
+
+static void tomato_draw_cb(lv_event_t *event)
+{
+    lv_area_t a; lv_obj_get_coords(static_cast<lv_obj_t *>(lv_event_get_target(event)),&a);
+    auto *layer=lv_event_get_layer(event);
+    lv_draw_rect_dsc_t body; lv_draw_rect_dsc_init(&body);
+    body.bg_color=lv_color_hex(0xEE594E); body.bg_opa=LV_OPA_COVER; body.radius=LV_RADIUS_CIRCLE;
+    lv_area_t bounds={a.x1+2,a.y1+10,a.x1+37,a.y1+37}; lv_draw_rect(layer,&body,&bounds);
+    body.bg_color=lv_color_hex(0x86C978); body.radius=3;
+    bounds={a.x1+18,a.y1+2,a.x1+22,a.y1+16}; lv_draw_rect(layer,&body,&bounds);
+    bounds={a.x1+10,a.y1+10,a.x1+30,a.y1+14}; lv_draw_rect(layer,&body,&bounds);
+}
+static void tomato_icon(lv_obj_t *parent,lv_align_t align,int x,int y)
+{
+    auto *icon=lv_obj_create(parent); lv_obj_remove_style_all(icon);
+    lv_obj_set_size(icon,40,40); lv_obj_align(icon,align,x,y);
+    lv_obj_remove_flag(icon,LV_OBJ_FLAG_CLICKABLE); lv_obj_remove_flag(icon,LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(icon,tomato_draw_cb,LV_EVENT_DRAW_MAIN,nullptr);
+}
 static void create_launcher_screen()
 {
     lv_obj_t *screen = create_screen(WatchScreen::Launcher, "Apps");
-    lv_obj_t *activity = app_tile(screen, "ACTIVITY", "", -design::TileOffset, 84, design::Activity, open_activity_cb);
-    lv_obj_set_height(activity, 116);
+    lv_obj_t *activity = launcher_tile(screen, "ACTIVITY", "", -118, 92, design::Activity, open_activity_cb);
     lv_obj_t *activity_icon = footprints_icon(activity, 36, design::Activity);
     lv_obj_align(activity_icon, LV_ALIGN_TOP_MID, 0, 26);
-    lv_obj_set_height(app_tile(screen, "TIMER", LV_SYMBOL_BELL, design::TileOffset, 84, design::Timer, open_timer_cb), 116);
-    lv_obj_set_height(app_tile(screen, "STOPWATCH", LV_SYMBOL_PLAY, -design::TileOffset, 216, design::Stopwatch, open_stopwatch_cb), 116);
-    lv_obj_t *weather = app_tile(screen, "WEATHER", "", design::TileOffset, 216, design::Weather, open_weather_cb);
-    lv_obj_set_height(weather, 116);
-    auto *media = button(screen, LV_SYMBOL_AUDIO "  MEDIA", design::TileWidth, 56, LV_ALIGN_TOP_MID, -design::TileOffset, 348, open_media_cb);
-    lv_obj_set_style_text_color(lv_obj_get_child(media, 0), lv_color_hex(design::Timeout), 0);
-    auto *game = button(screen, "2048", design::TileWidth, 56, LV_ALIGN_TOP_MID, design::TileOffset, 348, open_game_cb);
-    lv_obj_align(lv_obj_get_child(game, 0), LV_ALIGN_CENTER, 14, 0);
+    auto *pomodoro_tile=launcher_tile(screen, "POMODORO", "", 0, 92, 0xEE594E, open_timer_cb);
+    tomato_icon(pomodoro_tile,LV_ALIGN_TOP_MID,0,20);
+    launcher_tile(screen, "STOPWATCH", LV_SYMBOL_PLAY, 118, 92, design::Stopwatch, open_stopwatch_cb);
+    lv_obj_t *weather = launcher_tile(screen, "WEATHER", "", -118, 202, design::Weather, open_weather_cb);
+    launcher_tile(screen, "MEDIA", LV_SYMBOL_AUDIO, 0, 202, kMediaAccent, open_media_cb);
+    auto *game = launcher_tile(screen, "2048", "", 118, 202, design::Activity, open_game_cb);
+    auto *ai = launcher_tile(screen, "AI ASSISTANT", "", 118, 312, design::Timeout, open_voice_cb);
+    lv_label_set_text(lv_obj_get_child(ai,0),"AI ASSISTANT");
+    lv_obj_set_style_text_font(lv_obj_get_child(ai,0),design::caption(),0);
+    lv_obj_align(lv_obj_get_child(ai,0),LV_ALIGN_TOP_MID,0,70);
+    auto *bot = lv_obj_create(ai); lv_obj_remove_style_all(bot);
+    lv_obj_set_size(bot,52,52); lv_obj_align(bot,LV_ALIGN_TOP_MID,0,12);
+    lv_obj_remove_flag(bot,LV_OBJ_FLAG_CLICKABLE); lv_obj_remove_flag(bot,LV_OBJ_FLAG_SCROLLABLE);
+    static bool open_eyes=true;
+    lv_obj_add_event_cb(bot,voice_happy_draw,LV_EVENT_DRAW_MAIN,&open_eyes);
+    auto *astronomy_tile = launcher_tile(screen,"SUN & MOON","",-118,312,design::Weather,open_astronomy_cb);
+    auto *astronomy_caption = lv_obj_get_child(astronomy_tile,0);
+    lv_obj_set_style_text_font(astronomy_caption,design::caption(),0);
+    lv_obj_align(astronomy_caption,LV_ALIGN_TOP_MID,0,70);
+    auto *astronomy_icon = lv_obj_create(astronomy_tile); lv_obj_remove_style_all(astronomy_icon);
+    lv_obj_set_size(astronomy_icon,44,28); lv_obj_align(astronomy_icon,LV_ALIGN_TOP_MID,0,24);
+    lv_obj_remove_flag(astronomy_icon,static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+    lv_obj_add_event_cb(astronomy_icon,astronomy_icon_draw,LV_EVENT_DRAW_MAIN,nullptr);
+    auto *planets_tile=launcher_tile(screen,"PLANETS","",0,312,design::Bluetooth,open_planets_cb);
+    lv_obj_set_style_text_font(lv_obj_get_child(planets_tile,0),design::caption(),0);
+    lv_obj_align(lv_obj_get_child(planets_tile,0),LV_ALIGN_TOP_MID,0,70);
+    auto *planet_icon=lv_obj_create(planets_tile); lv_obj_remove_style_all(planet_icon);
+    lv_obj_set_size(planet_icon,44,32); lv_obj_align(planet_icon,LV_ALIGN_TOP_MID,0,24);
+    lv_obj_remove_flag(planet_icon,static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+    lv_obj_add_event_cb(planet_icon,planets_icon_draw,LV_EVENT_DRAW_MAIN,nullptr);
     for (unsigned i = 0; i < 4; ++i) {
         auto *square = lv_obj_create(game);
         lv_obj_remove_style_all(square);
-        lv_obj_set_size(square, 8, 8);
-        lv_obj_set_pos(square, 22 + (i % 2) * 12, 18 + (i / 2) * 12);
+        lv_obj_set_size(square, 12, 12);
+        lv_obj_set_pos(square, 40 + (i % 2) * 16, 24 + (i / 2) * 16);
         lv_obj_set_style_bg_color(square, lv_color_hex(design::Activity), 0);
         lv_obj_set_style_bg_opa(square, LV_OPA_COVER, 0);
         lv_obj_set_style_radius(square, 2, 0);
@@ -573,6 +737,73 @@ static void render_forecast()
     }
 }
 
+static void refresh_sound_volume()
+{
+    if (settings_volume_value) lv_label_set_text_fmt(settings_volume_value,"%u%%",sound_volume_percent);
+    if (sound_slider && !sound_dragging) {
+        lv_slider_set_value(sound_slider,sound_volume_percent,LV_ANIM_OFF);
+        lv_label_set_text_fmt(sound_percent,"%u%%",sound_volume_percent);
+    }
+}
+static void create_sound_screen()
+{
+    auto *screen=create_screen(WatchScreen::Sound,"Volume");
+    label(screen,LV_SYMBOL_VOLUME_MAX, &lv_font_montserrat_30,0xF29B85,LV_ALIGN_TOP_MID,0,88);
+    sound_status=label(screen,"WATCH SPEAKER VOLUME",design::caption(),kMuted,LV_ALIGN_TOP_MID,0,134);
+    sound_slider=lv_slider_create(screen);
+    lv_slider_set_range(sound_slider,0,100);
+    lv_obj_set_size(sound_slider,288,16); lv_obj_align(sound_slider,LV_ALIGN_TOP_MID,0,180);
+    lv_obj_set_style_bg_color(sound_slider,lv_color_hex(0xF29B85),LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(sound_slider,lv_color_hex(0xF29B85),LV_PART_KNOB);
+    sound_percent=label(screen,"--",design::caption(),0xF29B85,LV_ALIGN_TOP_MID,0,210);
+    lv_obj_add_event_cb(sound_slider,[](lv_event_t *event) {
+        const auto code=lv_event_get_code(event);
+        if (code==LV_EVENT_PRESSED) sound_dragging=true;
+        else if (code==LV_EVENT_VALUE_CHANGED) lv_label_set_text_fmt(sound_percent,"%d%%",int(lv_slider_get_value(sound_slider)));
+        else if (code==LV_EVENT_RELEASED) {
+            sound_dragging=false;
+            const auto target=uint8_t(lv_slider_get_value(sound_slider));
+            if (sound_volume_callback && !sound_volume_callback(target)) {
+                refresh_sound_volume(); lv_label_set_text(sound_status,"SAVE FAILED / RETRY");
+            } else {
+                sound_volume_percent=target;
+                lv_label_set_text(sound_status,"WATCH VOLUME SAVED");
+                refresh_sound_volume();
+            }
+        } else if (code==LV_EVENT_PRESS_LOST) { sound_dragging=false; refresh_sound_volume(); }
+    },LV_EVENT_ALL,nullptr);
+    label(screen,"MICROPHONE SENSITIVITY",design::caption(),kWhite,LV_ALIGN_TOP_MID,0,254);
+    sound_gain=lv_dropdown_create(screen);
+    lv_dropdown_set_options(sound_gain,"0 dB / Lowest\n6 dB\n12 dB\n18 dB\n24 dB / Default\n30 dB\n36 dB\n42 dB / Highest");
+    lv_obj_set_size(sound_gain,320,60); lv_obj_align(sound_gain,LV_ALIGN_TOP_MID,0,284);
+    style_surface(sound_gain);
+    style_press_feedback(sound_gain);
+    lv_obj_set_style_pad_all(sound_gain,18,0);
+    lv_obj_set_style_text_font(sound_gain,&lv_font_montserrat_20,0);
+    lv_obj_set_style_text_color(sound_gain,lv_color_hex(kWhite),0);
+    auto *gain_list=lv_dropdown_get_list(sound_gain);
+    lv_obj_set_style_bg_color(gain_list,lv_color_hex(kSurface),0);
+    lv_obj_set_style_text_color(gain_list,lv_color_hex(kWhite),0);
+    lv_obj_set_style_text_font(gain_list,&lv_font_montserrat_20,0);
+    lv_obj_set_style_pad_ver(gain_list,12,LV_PART_ITEMS);
+    lv_obj_set_style_bg_color(gain_list,lv_color_hex(design::Pressed),LV_PART_SELECTED);
+    lv_dropdown_set_selected(sound_gain,sound_gain_db/6);
+    lv_obj_add_event_cb(sound_gain,[](lv_event_t *) {
+        const uint8_t gain=lv_dropdown_get_selected(sound_gain)*6;
+        if (sound_gain_callback && !sound_gain_callback(gain)) {
+            lv_dropdown_set_selected(sound_gain,sound_gain_db/6);
+            lv_label_set_text(sound_status,"MIC SAVE FAILED / RETRY");
+            return;
+        }
+        sound_gain_db=gain;
+        lv_label_set_text(sound_status,"MIC SAVED / NEXT RECORDING");
+    },LV_EVENT_VALUE_CHANGED,nullptr);
+    auto *hint=label(screen,"Higher gain also amplifies noise.",design::caption(),kMuted,LV_ALIGN_TOP_MID,0,358);
+    lv_obj_set_style_text_align(hint,LV_TEXT_ALIGN_CENTER,0);
+    refresh_sound_volume();
+}
+#include "watch_battery_saver_ui.inc"
+
 static void create_settings_menu()
 {
     lv_obj_t *screen = create_screen(WatchScreen::Settings, "Settings");
@@ -588,7 +819,92 @@ static void create_settings_menu()
     lv_obj_t *timeout = app_tile(screen, "TIMEOUT", "", design::TileOffset, design::TileSecondY, design::Timeout, open_timeout_cb);
     lv_obj_align(settings_icon(timeout, true, design::Timeout), LV_ALIGN_TOP_MID, 0, 22);
     settings_timeout_value = label(timeout, "", design::caption(), design::Timeout, LV_ALIGN_BOTTOM_MID, 0, -16);
+    auto *sound=app_tile(screen,"VOLUME",LV_SYMBOL_VOLUME_MAX,-design::TileOffset,304,0xF29B85,
+        [](lv_event_t *) { refresh_sound_volume(); navigate_to(WatchScreen::Sound); });
+    auto *saver=app_tile(screen,"BATTERY",LV_SYMBOL_BATTERY_FULL,design::TileOffset,304,0xA8D98C,
+        [](lv_event_t *) { battery_saver_return=false; navigate_to(WatchScreen::BatterySaver); });
+    lv_obj_t *tiles[]={wifi,bluetooth,brightness,timeout,sound,saver};
+    const int tile_x[]={-62,62,-118,118,-62,62};
+    for (unsigned i=0;i<6;++i) {
+        lv_obj_set_size(tiles[i],108,108);
+        // 16 px horizontal gaps and ~16 px diagonal edge gaps (10 x 12).
+        lv_obj_align(tiles[i],LV_ALIGN_TOP_MID,tile_x[i],72+int(i/2)*120);
+        lv_obj_align(lv_obj_get_child(tiles[i],0),LV_ALIGN_TOP_MID,0,48);
+        lv_obj_set_style_text_font(lv_obj_get_child(tiles[i],0),design::caption(),0);
+        lv_obj_align(lv_obj_get_child(tiles[i],1),LV_ALIGN_TOP_MID,0,12);
+    }
+    lv_obj_align(lv_obj_get_child(brightness,2),LV_ALIGN_TOP_MID,0,12);
+    lv_obj_align(lv_obj_get_child(timeout,2),LV_ALIGN_TOP_MID,0,12);
+    for (auto *value : {launcher_wifi_label,launcher_bluetooth_label,settings_brightness_value,settings_timeout_value})
+        lv_obj_align(value,LV_ALIGN_BOTTOM_MID,0,-10);
+    settings_volume_value=label(sound,"--%",design::caption(),0xF29B85,LV_ALIGN_BOTTOM_MID,0,-10);
+    label(saver,"SAVER / TIPS",design::caption(),0xA8D98C,LV_ALIGN_BOTTOM_MID,0,-10);
+    auto *info=button(screen,"i",64,64,LV_ALIGN_TOP_MID,0,214,
+        [](lv_event_t *) { battery_saver_return=false; navigate_to(WatchScreen::Hardware); });
+    lv_obj_set_style_radius(info,LV_RADIUS_CIRCLE,0);
+    lv_obj_set_style_border_width(info,2,0);
+    lv_obj_set_style_border_color(info,lv_color_hex(kWhite),0);
+    lv_obj_set_style_bg_opa(info,LV_OPA_TRANSP,0);
+    lv_obj_set_style_pad_all(info,0,0);
+    lv_obj_set_style_border_color(info,lv_color_hex(design::Bluetooth),LV_STATE_PRESSED);
+    lv_obj_set_style_text_font(lv_obj_get_child(info,0),&lv_font_montserrat_26,0);
+    lv_obj_add_flag(lv_obj_get_child(info,0),LV_OBJ_FLAG_HIDDEN);
+    // Minimal information mark: a round dot and a straight stem, without serifs.
+    const int mark_width[]={5,4};
+    const int mark_height[]={5,22};
+    const int mark_y[]={14,25};
+    for (unsigned i=0;i<2;++i) {
+        auto *part=lv_obj_create(info);
+        lv_obj_remove_style_all(part);
+        lv_obj_set_size(part,mark_width[i],mark_height[i]);
+        lv_obj_align(part,LV_ALIGN_TOP_MID,0,mark_y[i]);
+        lv_obj_set_style_bg_color(part,lv_color_hex(kWhite),0);
+        lv_obj_set_style_bg_opa(part,LV_OPA_COVER,0);
+        if (!i) lv_obj_set_style_radius(part,LV_RADIUS_CIRCLE,0);
+        lv_obj_remove_flag(part,LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_remove_flag(part,LV_OBJ_FLAG_SCROLLABLE);
+    }
     refresh_settings_values();
+}
+
+static void create_hardware_screen()
+{
+    auto *screen=create_screen(WatchScreen::Hardware,"Hardware info");
+    label(screen,"WAVESHARE / AMOLED 2.06",design::caption(),kWhite,LV_ALIGN_TOP_MID,0,76);
+    label(screen,"BOARD SPECIFICATIONS / SCROLL",design::caption(),kWhite,LV_ALIGN_TOP_MID,0,102);
+    auto *list=lv_obj_create(screen);
+    lv_obj_remove_style_all(list);
+    lv_obj_set_size(list,design::ContentWidth,280);
+    lv_obj_align(list,LV_ALIGN_TOP_MID,0,130);
+    lv_obj_set_scroll_dir(list,LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(list,LV_SCROLLBAR_MODE_ON);
+    lv_obj_set_style_bg_color(list,lv_color_hex(design::Bluetooth),LV_PART_SCROLLBAR);
+    lv_obj_set_style_pad_right(list,8,0);
+    lv_obj_set_flex_flow(list,LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(list,10,0);
+    const char *titles[]={"PROCESSOR","MEMORY & STORAGE","DISPLAY & TOUCH","WIRELESS","MOTION & CLOCK","AUDIO","POWER & EXPANSION"};
+    const char *details[]={
+        "ESP32-S3R8\nDual-core LX7 / up to 240 MHz",
+        "512 KB SRAM / 8 MB PSRAM\n32 MB onboard flash\nFirmware uses a 16 MB layout",
+        "2.06-inch AMOLED / 410 x 502\nCO5300 display / FT3168 touch",
+        "2.4 GHz Wi-Fi / 802.11 b/g/n\nBluetooth 5 LE",
+        "QMI8658 accelerometer + gyro\nPCF85063 real-time clock",
+        "Onboard speaker + microphone\nES8311 output / ES7210 input",
+        "AXP2101 power management\nUSB-C / microSD (TF) slot"};
+    for (unsigned i=0;i<7;++i) {
+        auto *card=lv_obj_create(list);
+        lv_obj_set_size(card,design::ContentWidth-8,LV_SIZE_CONTENT);
+        style_surface(card);
+        lv_obj_set_style_pad_all(card,14,0);
+        lv_obj_set_style_pad_row(card,8,0);
+        lv_obj_set_flex_flow(card,LV_FLEX_FLOW_COLUMN);
+        lv_obj_remove_flag(card,LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(card,LV_OBJ_FLAG_EVENT_BUBBLE);
+        label(card,titles[i],design::caption(),kWhite,LV_ALIGN_TOP_LEFT,0,0);
+        auto *detail=label(card,details[i],design::caption(),kWhite,LV_ALIGN_TOP_LEFT,0,0);
+        lv_obj_set_width(detail,LV_PCT(100));
+        lv_label_set_long_mode(detail,LV_LABEL_LONG_WRAP);
+    }
 }
 
 static void create_bluetooth_screen()
@@ -600,11 +916,13 @@ static void create_bluetooth_screen()
                                    LV_ALIGN_TOP_MID, 0, 192);
     security_label = label(screen, "No paired phone", &lv_font_montserrat_16, kMuted,
           LV_ALIGN_TOP_MID, 0, 236);
-    bluetooth_action = button(screen, "Enable Bluetooth", 300, 64, LV_ALIGN_TOP_MID, 0, 314,
+    lv_obj_set_width(security_label,design::ContentWidth);
+    lv_obj_set_style_text_align(security_label,LV_TEXT_ALIGN_CENTER,0);
+    bluetooth_action = button(screen, "Enable Bluetooth", design::ContentWidth, design::TouchHeight, LV_ALIGN_TOP_MID, 0, 286,
                               bluetooth_action_cb);
     bluetooth_action_label = lv_obj_get_child(bluetooth_action, 0);
     lv_obj_add_state(bluetooth_action, LV_STATE_DISABLED);
-    forget_phone_button = button(screen, "Forget paired phone", 300, 48, LV_ALIGN_TOP_MID, 0, 388,
+    forget_phone_button = button(screen, "Forget paired phone", design::ContentWidth, design::TouchHeight, LV_ALIGN_TOP_MID, 0, 350,
         [](lv_event_t *) { navigate_to(WatchScreen::ForgetPhone); });
     lv_obj_add_state(forget_phone_button, LV_STATE_DISABLED);
 }
@@ -616,13 +934,13 @@ static void create_activity_screen()
           LV_ALIGN_TOP_LEFT, design::Margin, 78);
     activity_steps_label = label(screen, "0", design::number(), design::Activity,
                                  LV_ALIGN_TOP_LEFT, design::Margin, design::ActivityCountY);
-    goal_minus = button(screen, "-", 48, 48, LV_ALIGN_TOP_LEFT, design::Margin, 158, step_goal_changed_cb);
+    goal_minus = button(screen, "-", 56, 56, LV_ALIGN_TOP_LEFT, design::Margin, 150, step_goal_changed_cb);
     activity_goal_label = label(screen, "Goal 8,000", design::caption(), kMuted, LV_ALIGN_TOP_MID, 0, 174);
-    goal_plus = button(screen, "+", 48, 48, LV_ALIGN_TOP_RIGHT, -design::Margin, 158, step_goal_changed_cb);
+    goal_plus = button(screen, "+", 56, 56, LV_ALIGN_TOP_RIGHT, -design::Margin, 150, step_goal_changed_cb);
     label(screen, "7 DAYS / LOCAL", design::caption(), kMuted,
-          LV_ALIGN_TOP_LEFT, design::Margin, 212);
+          LV_ALIGN_TOP_LEFT, design::Margin, 218);
     for (unsigned i = 0; i < 7; ++i) {
-        const int y = 238 + i * 26;
+        const int y = 242 + i * 24;
         history_names[i] = label(screen, "--", &lv_font_montserrat_18, i ? kMuted : kWhite,
                                  LV_ALIGN_TOP_LEFT, 44, y);
         history_counts[i] = label(screen, "0", &lv_font_montserrat_20, i ? kWhite : design::Activity,
@@ -645,7 +963,7 @@ static void create_wifi_screen()
     lv_obj_set_style_text_align(wifi_name_label, LV_TEXT_ALIGN_CENTER, 0);
     wifi_signal_label = label(screen, "", &lv_font_montserrat_20, kMuted,
                                LV_ALIGN_TOP_MID, 0, 272);
-    wifi_action = button(screen, "Connect", 300, 64, LV_ALIGN_TOP_MID, 0, 314, wifi_action_cb);
+    wifi_action = button(screen, "Connect", design::ContentWidth, 64, LV_ALIGN_TOP_MID, 0, 314, wifi_action_cb);
     wifi_action_label = lv_obj_get_child(wifi_action, 0);
     lv_obj_add_state(wifi_action, LV_STATE_DISABLED);
 }
@@ -759,9 +1077,10 @@ static void create_settings_screen()
     brightness_label = label(screen, "60%", &lv_font_montserrat_26, design::Brightness,
                              LV_ALIGN_TOP_MID, 0, 157);
     brightness_slider = lv_slider_create(screen);
-    lv_obj_set_size(brightness_slider, 202, 16);
+    lv_obj_set_size(brightness_slider, 186, 16);
     lv_obj_align(brightness_slider, LV_ALIGN_TOP_MID, 0, 213);
-    lv_obj_set_ext_click_area(brightness_slider, 12);
+    lv_obj_set_ext_click_area(brightness_slider, 20); // 56px-high touch region, no overlap with +/-.
+    lv_obj_remove_flag(brightness_slider,LV_OBJ_FLAG_GESTURE_BUBBLE);
     lv_obj_t *minus = button(screen, "-", 48, 56, LV_ALIGN_TOP_LEFT, design::Margin, 193, nullptr);
     lv_obj_t *plus = button(screen, "+", 48, 56, LV_ALIGN_TOP_RIGHT, -design::Margin, 193, nullptr);
     static bool increment = true;
@@ -813,18 +1132,25 @@ static void refresh_time_tools()
     if (!display_active) return;
     char text[40];
     if (current_screen == WatchScreen::Timer && timer_value) {
-        const uint64_t duration = static_cast<uint64_t>(timer_minutes) * 60000;
+        const uint64_t duration = pomodoro_duration();
         const bool finished = countdown.elapsed_ms >= duration;
         const uint64_t remaining = finished ? 0 : duration - countdown.elapsed_ms;
-        format_elapsed(text, sizeof(text), ((remaining + 999) / 1000) * 1000, false);
+        const uint64_t seconds=(remaining+999)/1000;
+        snprintf(text,sizeof(text),"%02llu:%02llu",(unsigned long long)(seconds/60),(unsigned long long)(seconds%60));
         lv_label_set_text(timer_value, text);
-        lv_label_set_text(timer_status, finished ? "TIME'S UP" : countdown.running ? "RUNNING" : countdown.elapsed_ms ? "PAUSED" : "SET MINUTES / 1-120");
-        lv_label_set_text(timer_action_label, finished ? "RESTART" : countdown.running ? "PAUSE" : countdown.elapsed_ms ? "RESUME" : "START");
-        if (countdown.running || countdown.elapsed_ms) {
-            lv_obj_add_state(timer_minus, LV_STATE_DISABLED); lv_obj_add_state(timer_plus, LV_STATE_DISABLED);
-        } else {
-            lv_obj_remove_state(timer_minus, LV_STATE_DISABLED); lv_obj_remove_state(timer_plus, LV_STATE_DISABLED);
+        lv_arc_set_value(pomodoro_progress,static_cast<int32_t>((duration-remaining)*1000/duration));
+        lv_obj_set_style_arc_color(pomodoro_progress,lv_color_hex(pomodoro_break ? 0x86C978 : 0xEE594E),LV_PART_INDICATOR);
+        const uint32_t accent=pomodoro_break ? 0x86C978 : 0xEE594E;
+        lv_label_set_text(pomodoro_phase,pomodoro_break ? (pomodoro_completed==4 ? "LONG BREAK" : "SHORT BREAK") : "FOCUS TIME");
+        lv_obj_set_style_text_color(pomodoro_phase,lv_color_hex(accent),0);
+        lv_obj_set_style_bg_color(pomodoro_start,lv_color_hex(accent),0);
+        snprintf(text,sizeof(text),"%s",finished ? "DONE / TAKE A BREATH" : countdown.running ? (pomodoro_break ? "REST AND RECHARGE" : "ONE THING AT A TIME") : countdown.elapsed_ms ? "PAUSED" : "READY WHEN YOU ARE");
+        lv_label_set_text(timer_status,text);
+        for (unsigned i=0;i<4;++i) {
+            lv_obj_set_style_bg_color(pomodoro_sessions[i],lv_color_hex(i<pomodoro_completed ? 0xEE594E : design::Border),0);
+            lv_obj_set_style_border_color(pomodoro_sessions[i],lv_color_hex(!pomodoro_break && i==pomodoro_completed ? 0xEE594E : design::Border),0);
         }
+        lv_label_set_text(timer_action_label, finished ? "START NEXT" : countdown.running ? "PAUSE" : countdown.elapsed_ms ? "RESUME" : "START");
     }
     if (current_screen == WatchScreen::Stopwatch && stopwatch_value) {
         format_elapsed(text, sizeof(text), stopwatch.elapsed_ms, true);
@@ -838,7 +1164,7 @@ static void time_tools_tick(lv_timer_t *)
 {
     const uint32_t now = lv_tick_get();
     countdown.advance(now); stopwatch.advance(now);
-    const uint64_t duration = static_cast<uint64_t>(timer_minutes) * 60000;
+    const uint64_t duration = pomodoro_duration();
     const bool finished_now = countdown.running && countdown.elapsed_ms >= duration;
     if (countdown.elapsed_ms >= duration) { countdown.elapsed_ms = duration; countdown.running = false; }
     static uint64_t last_timer_second = UINT64_MAX;
@@ -852,15 +1178,15 @@ static void timer_control_cb(lv_event_t *)
 {
     const uint32_t now = lv_tick_get();
     countdown.advance(now);
-    if (countdown.elapsed_ms >= static_cast<uint64_t>(timer_minutes) * 60000) countdown.reset(now);
+    if (countdown.elapsed_ms >= pomodoro_duration()) pomodoro_next_cb(nullptr);
     countdown.toggle(now); refresh_time_tools();
 }
-static void timer_reset_cb(lv_event_t *) { countdown.reset(lv_tick_get()); refresh_time_tools(); }
-static void timer_adjust_cb(lv_event_t *event)
+static void timer_reset_cb(lv_event_t *) { pomodoro_break=false; pomodoro_completed=0; countdown.reset(lv_tick_get()); refresh_time_tools(); }
+static void pomodoro_next_cb(lv_event_t *)
 {
-    if (countdown.running || countdown.elapsed_ms) return;
-    int value = static_cast<int>(timer_minutes) + (lv_event_get_user_data(event) ? 1 : -1);
-    if (value >= 1 && value <= 120) timer_minutes = value;
+    if (pomodoro_break) { pomodoro_break=false; if (pomodoro_completed==4) pomodoro_completed=0; }
+    else { pomodoro_break=true; ++pomodoro_completed; }
+    countdown.reset(lv_tick_get());
     refresh_time_tools();
 }
 static void stopwatch_control_cb(lv_event_t *) { stopwatch.toggle(lv_tick_get()); refresh_time_tools(); }
@@ -868,18 +1194,43 @@ static void stopwatch_reset_cb(lv_event_t *) { stopwatch.reset(lv_tick_get()); r
 
 static void create_time_tools()
 {
-    lv_obj_t *screen = create_screen(WatchScreen::Timer, "Timer");
-    timer_status = label(screen, "SET MINUTES / 1-120", design::caption(), kMuted, LV_ALIGN_TOP_MID, 0, 116);
-    timer_value = label(screen, "00:05:00", &lv_font_montserrat_48, kWhite, LV_ALIGN_TOP_MID, 0, 162);
-    timer_minus = button(screen, "- 1 MIN", 148, 56, LV_ALIGN_TOP_MID, -84, 240, nullptr);
-    timer_plus = button(screen, "+ 1 MIN", 148, 56, LV_ALIGN_TOP_MID, 84, 240, nullptr);
-    static bool increment = true;
-    lv_obj_add_event_cb(timer_minus, timer_adjust_cb, LV_EVENT_CLICKED, nullptr);
-    lv_obj_add_event_cb(timer_plus, timer_adjust_cb, LV_EVENT_CLICKED, &increment);
-    lv_obj_t *action = button(screen, "START", 148, 56, LV_ALIGN_TOP_MID, -84, 320, timer_control_cb);
+    lv_obj_t *screen = create_screen(WatchScreen::Timer, "Pomodoro");
+    pomodoro_progress=lv_arc_create(screen);
+    lv_obj_set_size(pomodoro_progress,216,216);
+    lv_obj_align(pomodoro_progress,LV_ALIGN_TOP_MID,0,72);
+    lv_arc_set_rotation(pomodoro_progress,270);
+    lv_arc_set_bg_angles(pomodoro_progress,0,360);
+    lv_arc_set_range(pomodoro_progress,0,1000);
+    lv_arc_set_value(pomodoro_progress,0);
+    lv_obj_remove_style(pomodoro_progress,nullptr,LV_PART_KNOB);
+    lv_obj_remove_flag(pomodoro_progress,LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(pomodoro_progress,LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_arc_width(pomodoro_progress,10,LV_PART_MAIN);
+    lv_obj_set_style_arc_width(pomodoro_progress,10,LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(pomodoro_progress,lv_color_hex(design::Border),LV_PART_MAIN);
+    lv_obj_set_style_arc_color(pomodoro_progress,lv_color_hex(0xEE594E),LV_PART_INDICATOR);
+    tomato_icon(screen,LV_ALIGN_TOP_MID,0,92);
+    pomodoro_phase=label(screen,"FOCUS TIME",design::caption(),0xEE594E,LV_ALIGN_TOP_MID,0,139);
+    timer_value = label(screen, "25:00", &lv_font_montserrat_48, kWhite, LV_ALIGN_TOP_MID, 0, 164);
+    timer_status = label(screen, "READY WHEN YOU ARE", design::caption(), kMuted, LV_ALIGN_TOP_MID, 0, 224);
+    for (unsigned i=0;i<4;++i) {
+        auto *dot=pomodoro_sessions[i]=lv_obj_create(screen);
+        lv_obj_remove_style_all(dot); lv_obj_set_size(dot,10,10);
+        lv_obj_align(dot,LV_ALIGN_TOP_MID,int(i)*20-30,258);
+        lv_obj_set_style_radius(dot,LV_RADIUS_CIRCLE,0);
+        lv_obj_set_style_bg_color(dot,lv_color_hex(design::Border),0);
+        lv_obj_set_style_bg_opa(dot,LV_OPA_COVER,0);
+        lv_obj_set_style_border_width(dot,2,0);
+        lv_obj_set_style_border_color(dot,lv_color_hex(i==0 ? 0xEE594E : design::Border),0);
+        lv_obj_remove_flag(dot,LV_OBJ_FLAG_CLICKABLE);
+    }
+    lv_obj_t *action = pomodoro_start = button(screen, "START", 304, 56, LV_ALIGN_TOP_MID, 0, 294, timer_control_cb);
+    lv_obj_set_style_bg_color(action,lv_color_hex(0xEE594E),0);
+    lv_obj_set_style_bg_opa(action,LV_OPA_COVER,0);
+    lv_obj_set_style_text_color(lv_obj_get_child(action,0),lv_color_hex(0x101010),0);
     timer_action_label = lv_obj_get_child(action, 0);
-    button(screen, "RESET", 148, 56, LV_ALIGN_TOP_MID, 84, 320, timer_reset_cb);
-    label(screen, "VISUAL ALERT ONLY", design::caption(), kMuted, LV_ALIGN_TOP_MID, 0, 392);
+    button(screen, "RESET", 144, 56, LV_ALIGN_TOP_MID, -80, 358, timer_reset_cb);
+    button(screen,"SKIP PHASE",144,56,LV_ALIGN_TOP_MID,80,358,pomodoro_next_cb);
 
     screen = create_screen(WatchScreen::Stopwatch, "Stopwatch");
     stopwatch_status = label(screen, "READY", design::caption(), kMuted, LV_ALIGN_TOP_MID, 0, 116);
@@ -1014,6 +1365,235 @@ static void game_dialog_right_cb(lv_event_t *)
     if (game_dialog == GameDialog::Over) back_cb(nullptr);
     else game_reset();
 }
+static void voice_hold_cb(lv_event_t *event)
+{
+    const auto code = lv_event_get_code(event);
+    if (code == LV_EVENT_PRESSED && display_active) {
+        voice_held = voice_callback && voice_callback(1);
+        if (!voice_held) watch_ui_set_voice(5,0,0,voice_callback ? "Microphone busy or unavailable" : "Simulator: microphone unavailable");
+    } else if (code == LV_EVENT_RELEASED && voice_held) {
+        voice_held = false; if (voice_callback) voice_callback(2);
+    } else if (code == LV_EVENT_PRESS_LOST) cancel_voice();
+}
+static void voice_cancel_cb(lv_event_t *) { cancel_voice(); }
+static void microphone_draw_cb(lv_event_t *event)
+{
+    lv_area_t area; lv_obj_get_coords(static_cast<lv_obj_t *>(lv_event_get_target(event)),&area);
+    auto *layer = lv_event_get_layer(event);
+    lv_draw_rect_dsc_t capsule; lv_draw_rect_dsc_init(&capsule);
+    capsule.bg_opa = LV_OPA_TRANSP; capsule.border_color = lv_color_hex(kWhite);
+    capsule.border_width = 2; capsule.radius = 5;
+    lv_area_t body = {area.x1+9,area.y1+2,area.x1+19,area.y1+20};
+    lv_draw_rect(layer,&capsule,&body);
+    auto line = [&](int x1,int y1,int x2,int y2) {
+        lv_draw_line_dsc_t stroke; lv_draw_line_dsc_init(&stroke);
+        stroke.color = lv_color_hex(kWhite); stroke.width = 2; stroke.round_start = 1; stroke.round_end = 1;
+        stroke.p1 = {static_cast<lv_value_precise_t>(area.x1+x1),static_cast<lv_value_precise_t>(area.y1+y1)};
+        stroke.p2 = {static_cast<lv_value_precise_t>(area.x1+x2),static_cast<lv_value_precise_t>(area.y1+y2)};
+        lv_draw_line(layer,&stroke);
+    };
+    line(5,15,5,21); line(5,21,9,25); line(9,25,19,25);
+    line(19,25,23,21); line(23,21,23,15); line(14,25,14,31); line(9,31,19,31);
+}
+
+static void refresh_voice_face()
+{
+    if (!voice_face_timer) return;
+    if (display_active && current_screen == WatchScreen::Voice && voice_state != 7 && voice_state != 8 && !lv_obj_has_flag(voice_face,LV_OBJ_FLAG_HIDDEN))
+        lv_timer_resume(voice_face_timer);
+    else lv_timer_pause(voice_face_timer);
+}
+
+static void voice_face_draw(lv_event_t *event)
+{
+    lv_area_t area; lv_obj_get_coords(voice_face,&area);
+    auto *layer = lv_event_get_layer(event);
+    const int cx = (area.x1+area.x2)/2, cy = (area.y1+area.y2)/2;
+    static const lv_image_dsc_t halo = [] {
+        lv_image_dsc_t image = {};
+        image.header.magic = LV_IMAGE_HEADER_MAGIC;
+        image.header.cf = LV_COLOR_FORMAT_RGB565;
+        image.header.w = image.header.h = mochi_halo_size;
+        image.header.stride = mochi_halo_size*2;
+        image.data_size = sizeof(mochi_halo_pixels);
+        image.data = mochi_halo_pixels;
+        return image;
+    }();
+    lv_draw_image_dsc_t image; lv_draw_image_dsc_init(&image);
+    image.src = &halo;
+    lv_draw_image(layer,&image,&area);
+    const bool blink = voice_state == 7 || (voice_face_blink && voice_state != 2);
+    for (int eye = 0; eye < 2; ++eye) {
+        if (voice_state == 8) {
+            const int x=cx+(eye ? 17 : -17);
+            const int points[][2]={{-9,0},{-6,-5},{-3,-8},{0,-9},{3,-8},{6,-5},{9,0}};
+            for (unsigned segment=0;segment<6;++segment) {
+                lv_draw_line_dsc_t line; lv_draw_line_dsc_init(&line);
+                line.color=lv_color_hex(kWhite); line.width=3; line.round_start=line.round_end=1;
+                line.p1={static_cast<lv_value_precise_t>(x+points[segment][0]),static_cast<lv_value_precise_t>(cy+points[segment][1])};
+                line.p2={static_cast<lv_value_precise_t>(x+points[segment+1][0]),static_cast<lv_value_precise_t>(cy+points[segment+1][1])};
+                lv_draw_line(layer,&line);
+            }
+            continue;
+        }
+        if (voice_state == 7) {
+            // Resting eyelids: raised ends and a gently flattened curved base.
+            // Fits inside the existing eye-only invalidation rectangle.
+            const int x=cx+(eye ? 17 : -17);
+            const int points[][2]={{-10,-8},{-7,-5},{-4,-4},{4,-4},{7,-5},{10,-8}};
+            for (unsigned segment=0;segment<5;++segment) {
+                lv_draw_line_dsc_t line; lv_draw_line_dsc_init(&line);
+                line.color=lv_color_hex(kWhite); line.width=3;
+                line.round_start=line.round_end=1;
+                line.p1={static_cast<lv_value_precise_t>(x+points[segment][0]),static_cast<lv_value_precise_t>(cy+points[segment][1])};
+                line.p2={static_cast<lv_value_precise_t>(x+points[segment+1][0]),static_cast<lv_value_precise_t>(cy+points[segment+1][1])};
+                lv_draw_line(layer,&line);
+            }
+            continue;
+        }
+        lv_draw_rect_dsc_t dsc; lv_draw_rect_dsc_init(&dsc);
+        dsc.bg_color = lv_color_hex(kWhite); dsc.bg_opa = LV_OPA_COVER;
+        dsc.radius = LV_RADIUS_CIRCLE;
+        const int x = cx + (eye ? 17 : -17), height = blink ? 3 : 29 + (voice_state == 2 ? voice_face_level/20 : 0);
+        lv_area_t bounds = {x-9,cy-height/2-4,x+9,cy+height/2-4};
+        lv_draw_rect(layer,&dsc,&bounds);
+    }
+}
+
+static void voice_face_tick(lv_timer_t *)
+{
+    if (!display_active || current_screen != WatchScreen::Voice || voice_state == 7 || voice_state == 8 || lv_obj_has_flag(voice_face,LV_OBJ_FLAG_HIDDEN)) return;
+    const bool blink = lv_tick_get()%3000 < 160;
+    if (blink != voice_face_blink) {
+        voice_face_blink = blink;
+        lv_area_t eyes; lv_obj_get_coords(voice_face,&eyes);
+        const int cx = (eyes.x1+eyes.x2)/2, cy = (eyes.y1+eyes.y2)/2;
+        eyes = {cx-28,cy-24,cx+28,cy+24};
+        lv_obj_invalidate_area(voice_face,&eyes); // Blink does not invalidate the outer halo.
+    }
+}
+
+static void voice_happy_draw(lv_event_t *event)
+{
+    lv_area_t area; lv_obj_get_coords(static_cast<lv_obj_t *>(lv_event_get_target(event)),&area);
+    auto *layer=lv_event_get_layer(event);
+    const int cx=(area.x1+area.x2)/2,cy=(area.y1+area.y2)/2;
+    const int size=lv_obj_get_width(static_cast<lv_obj_t *>(lv_event_get_target(event)));
+    for (int glow=3;glow>=0;--glow) {
+        lv_draw_arc_dsc_t ring; lv_draw_arc_dsc_init(&ring);
+        ring.center={cx,cy}; ring.radius=(23+glow*2)*size/64; ring.width=glow ? 1 : 2;
+        ring.start_angle=0; ring.end_angle=360; ring.color=lv_color_hex(lv_event_get_user_data(event) ? kWhite : 0xC4A7FF);
+        ring.opa=glow ? static_cast<lv_opa_t>(32/glow) : LV_OPA_COVER;
+        lv_draw_arc(layer,&ring);
+    }
+    for (int eye=0;eye<2;++eye) {
+        const int x=cx+(eye ? 8 : -8)*size/64;
+        if (lv_event_get_user_data(event)) {
+            lv_draw_rect_dsc_t pupil; lv_draw_rect_dsc_init(&pupil);
+            pupil.bg_color=lv_color_hex(kWhite); pupil.bg_opa=LV_OPA_COVER;
+            pupil.radius=LV_RADIUS_CIRCLE;
+            const int half_width=(size+10)/20,half_height=size/10;
+            lv_area_t bounds={x-half_width,cy-half_height,x+half_width-1,cy+half_height-1};
+            lv_draw_rect(layer,&pupil,&bounds);
+            continue;
+        }
+        const int points[][2]={{-4,1},{-2,-2},{0,-3},{2,-2},{4,1}};
+        for (unsigned segment=0;segment<4;++segment) {
+            lv_draw_line_dsc_t line; lv_draw_line_dsc_init(&line);
+            line.color=lv_color_hex(kWhite); line.width=2; line.round_start=line.round_end=1;
+            line.p1={static_cast<lv_value_precise_t>(x+points[segment][0]*size/64),static_cast<lv_value_precise_t>(cy+points[segment][1]*size/64)};
+            line.p2={static_cast<lv_value_precise_t>(x+points[segment+1][0]*size/64),static_cast<lv_value_precise_t>(cy+points[segment+1][1]*size/64)};
+            lv_draw_line(layer,&line);
+        }
+    }
+}
+
+static void create_voice_screen()
+{
+    auto *screen = create_screen(WatchScreen::Voice,"AI Assistant");
+    voice_name = label(screen,"Mochi",design::body(),kWhite,LV_ALIGN_TOP_MID,0,66);
+    voice_face = lv_obj_create(screen); lv_obj_remove_style_all(voice_face);
+    lv_obj_set_size(voice_face,mochi_halo_size,mochi_halo_size); lv_obj_align(voice_face,LV_ALIGN_TOP_MID,0,64);
+    lv_obj_remove_flag(voice_face,static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+    lv_obj_add_event_cb(voice_face,voice_face_draw,LV_EVENT_DRAW_MAIN,nullptr);
+    voice_face_timer = lv_timer_create(voice_face_tick,80,nullptr);
+    lv_timer_pause(voice_face_timer);
+    voice_status = label(screen,"",design::body(),kWhite,LV_ALIGN_TOP_MID,0,84);
+    voice_happy=lv_obj_create(screen); lv_obj_remove_style_all(voice_happy);
+    lv_obj_set_size(voice_happy,64,64); lv_obj_align(voice_happy,LV_ALIGN_TOP_MID,0,68);
+    lv_obj_remove_flag(voice_happy,static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+    lv_obj_add_event_cb(voice_happy,voice_happy_draw,LV_EVENT_DRAW_MAIN,nullptr);
+    lv_obj_add_flag(voice_happy,LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_width(voice_status,design::ContentWidth);
+    lv_obj_set_style_text_align(voice_status,LV_TEXT_ALIGN_CENTER,0);
+    lv_label_set_long_mode(voice_status,LV_LABEL_LONG_WRAP);
+    auto *note = voice_note = label(screen,"",design::body(),kMuted,LV_ALIGN_TOP_MID,0,136);
+    lv_obj_set_width(note,design::ContentWidth); lv_obj_set_style_text_align(note,LV_TEXT_ALIGN_CENTER,0);
+    voice_details = label(screen,"Max 8 seconds",design::caption(),kMuted,LV_ALIGN_TOP_MID,0,190);
+    lv_obj_set_width(voice_details,design::ContentWidth); lv_obj_set_style_text_align(voice_details,LV_TEXT_ALIGN_CENTER,0);
+    voice_level = lv_bar_create(screen); lv_obj_set_size(voice_level,design::ContentWidth,12);
+    lv_obj_align(voice_level,LV_ALIGN_TOP_MID,0,224); lv_bar_set_range(voice_level,0,100);
+    lv_obj_set_style_bg_color(voice_level,lv_color_hex(design::Border),LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(voice_level,LV_OPA_COVER,LV_PART_MAIN);
+    lv_obj_remove_flag(voice_level,LV_OBJ_FLAG_CLICKABLE);
+    voice_hold = button(screen,"HOLD TO TALK",design::ContentWidth,96,LV_ALIGN_TOP_MID,0,246,nullptr);
+    lv_obj_set_style_bg_color(voice_hold,lv_color_hex(0xC4A7FF),0);
+    lv_obj_set_style_bg_opa(voice_hold,LV_OPA_20,0);
+    lv_obj_set_style_border_color(voice_hold,lv_color_hex(0x8B72B5),0);
+    lv_obj_set_style_bg_color(voice_hold,lv_color_hex(0xC4A7FF),LV_STATE_PRESSED);
+    lv_obj_set_style_bg_opa(voice_hold,LV_OPA_40,LV_STATE_PRESSED);
+    lv_obj_set_style_bg_opa(voice_hold,LV_OPA_10,LV_STATE_DISABLED);
+    lv_obj_align(lv_obj_get_child(voice_hold,0),LV_ALIGN_CENTER,18,0);
+    voice_microphone = lv_obj_create(voice_hold); lv_obj_remove_style_all(voice_microphone);
+    lv_obj_set_size(voice_microphone,28,34); lv_obj_align(voice_microphone,LV_ALIGN_CENTER,-100,0);
+    lv_obj_remove_flag(voice_microphone,LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(voice_microphone,LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(voice_microphone,microphone_draw_cb,LV_EVENT_DRAW_MAIN,nullptr);
+    lv_obj_add_event_cb(voice_hold,voice_hold_cb,LV_EVENT_ALL,nullptr);
+    lv_obj_remove_flag(voice_hold,LV_OBJ_FLAG_GESTURE_BUBBLE);
+    voice_clear = button(screen,"CLEAR",design::ContentWidth,56,LV_ALIGN_TOP_MID,0,354,voice_cancel_cb);
+    auto *results = lv_obj_create(screen);
+    lv_obj_set_size(results,design::ContentWidth,190); lv_obj_align(results,LV_ALIGN_TOP_MID,0,162);
+    style_surface(results); lv_obj_set_style_pad_all(results,12,0);
+    // Readable AMOLED card, without changing the rest of the monochrome theme.
+    lv_obj_set_style_bg_color(results,lv_color_hex(0x202020),0);
+    lv_obj_set_style_bg_opa(results,LV_OPA_COVER,0);
+    lv_obj_set_style_border_color(results,lv_color_hex(0x707070),0);
+    lv_obj_set_style_pad_row(results,10,0);
+    lv_obj_set_flex_flow(results,LV_FLEX_FLOW_COLUMN); lv_obj_set_scroll_dir(results,LV_DIR_VER);
+    lv_obj_remove_flag(results,LV_OBJ_FLAG_GESTURE_BUBBLE);
+    // Handle horizontal back locally once. Vertical scrolling remains owned by
+    // the card, without bubbling a second navigation event to the screen.
+    lv_obj_add_event_cb(results,navigation_gesture_cb,LV_EVENT_GESTURE,nullptr);
+    voice_question_heading = lv_label_create(results);
+    lv_obj_set_style_text_font(voice_question_heading,design::body(),0);
+    lv_obj_set_style_text_color(voice_question_heading,lv_color_hex(0xB8B8B8),0);
+    lv_label_set_text(voice_question_heading,"QUESTION:");
+    voice_transcription = lv_label_create(results); lv_obj_set_width(voice_transcription,LV_PCT(100));
+    lv_obj_set_style_text_font(voice_transcription,design::body(),0);
+    lv_obj_set_style_text_color(voice_transcription,lv_color_hex(0xE0E0E0),0);
+    lv_label_set_long_mode(voice_transcription,LV_LABEL_LONG_WRAP);
+    voice_answer_heading = lv_label_create(results);
+    lv_obj_set_style_text_font(voice_answer_heading,design::body(),0);
+    lv_obj_set_style_text_color(voice_answer_heading,lv_color_hex(0xB8B8B8),0);
+    lv_label_set_text(voice_answer_heading,"ANSWER:");
+    voice_answer = lv_label_create(results); lv_obj_set_width(voice_answer,LV_PCT(100));
+    lv_label_set_long_mode(voice_answer,LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(voice_answer,design::body(),0);
+    lv_obj_set_style_text_color(voice_answer,lv_color_hex(0xFFFFFF),0);
+    lv_obj_set_style_text_line_space(voice_answer,4,0);
+    lv_label_set_text(voice_transcription,""); lv_label_set_text(voice_answer,"");
+    voice_waiting = label(results,"Your phone is preparing the answer.\nCANCEL or BACK stops the request.",design::body(),kMuted,LV_ALIGN_TOP_LEFT,0,0);
+    lv_obj_set_width(voice_waiting,LV_PCT(100));
+    lv_label_set_long_mode(voice_waiting,LV_LABEL_LONG_WRAP);
+    lv_obj_add_flag(voice_waiting,LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(results,LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_user_data(voice_answer,results);
+    // The expanded halo's black image bounds overlap the name; draw the name
+    // last so the bitmap cannot cover its lower glyphs.
+    lv_obj_move_foreground(voice_name);
+    watch_ui_set_voice(0,0,0,nullptr);
+}
 static void create_game_screen()
 {
     auto *screen = create_screen(WatchScreen::Game2048, nullptr);
@@ -1036,7 +1616,9 @@ static void create_game_screen()
         game_values[i] = label(game_tiles[i], "", design::title(), kWhite, LV_ALIGN_CENTER, 0, 0);
     }
     button(screen, "NEW GAME", 160, 56, LV_ALIGN_TOP_MID, -88, 422, game_new_cb);
-    button(screen, LV_SYMBOL_LEFT "  BACK", 160, 56, LV_ALIGN_TOP_MID, 88, 422, back_cb);
+    auto *game_back = button(screen, LV_SYMBOL_LEFT "  BACK", design::BackWidth, 56, LV_ALIGN_TOP_MID, 88, 422, back_cb);
+    lv_obj_set_style_radius(game_back,design::TouchHeight/2,0);
+    center_navigation_content(game_back);
     // Full-screen input shield; all game dialogs survive notification interruption.
     game_overlay = lv_obj_create(screen);
     lv_obj_remove_style_all(game_overlay);
@@ -1105,7 +1687,7 @@ static void create_media_screen()
     lv_obj_set_style_arc_width(media_record, 2, LV_PART_MAIN);
     lv_obj_set_style_arc_color(media_record, lv_color_hex(design::Border), LV_PART_MAIN);
     lv_obj_set_style_arc_width(media_record, 3, LV_PART_INDICATOR);
-    lv_obj_set_style_arc_color(media_record, lv_color_hex(design::Timeout), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(media_record, lv_color_hex(kMediaAccent), LV_PART_INDICATOR);
     lv_obj_set_style_bg_opa(media_record, LV_OPA_TRANSP, LV_PART_KNOB);
     lv_obj_remove_flag(media_record, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_remove_flag(media_record, LV_OBJ_FLAG_SCROLLABLE);
@@ -1123,6 +1705,9 @@ void watch_ui_create(void)
     create_home_screen();
     create_launcher_screen();
     create_settings_menu();
+    create_hardware_screen();
+    create_sound_screen();
+    create_battery_saver_screen();
     create_activity_screen();
     create_settings_screen();
     create_wifi_screen();
@@ -1133,6 +1718,10 @@ void watch_ui_create(void)
     create_security_screens();
     create_media_screen();
     create_game_screen();
+    create_voice_screen();
+    create_astronomy_screen();
+    create_planets_screen();
+    watch_perf_monitor_create();
     current_screen = WatchScreen::Home;
 }
 
@@ -1140,6 +1729,11 @@ void watch_ui_set_display_active(bool active)
 {
     const bool changed = display_active != active;
     display_active = active;
+    if (changed && active) refresh_astronomy();
+    if (changed && active) refresh_planets();
+    if (changed && active) refresh_battery_saver();
+    refresh_voice_face();
+    if (changed && !active && current_screen == WatchScreen::Voice) cancel_voice();
     if (changed && !active) save_game_best(true);
     refresh_media_record();
     if (changed && active) {
@@ -1156,10 +1750,18 @@ void watch_ui_show_notification(const char *app, const char *title, const char *
     lv_label_set_text(notification_title, title ? title : "");
     lv_label_set_text(notification_body, body ? body : "");
     lv_obj_scroll_to_y(lv_obj_get_parent(notification_body), 0, LV_ANIM_OFF);
+    // Do not steal the held recording touch. The latest notification is
+    // already stored in the labels and can open once recording finishes.
+    if (current_screen == WatchScreen::Voice && (voice_held || voice_state == 1 || voice_state == 2)) {
+        voice_notification_pending = true;
+        return;
+    }
+    voice_notification_pending = false;
     navigate_to(WatchScreen::Notification);
 }
 void watch_ui_hide_notification(void)
 {
+    voice_notification_pending = false;
     if (current_screen == WatchScreen::Notification) navigate_to(notification_return);
 }
 void watch_ui_set_security_callbacks(watch_ui_pairing_cb_t pairing, watch_ui_forget_phone_cb_t forget)
@@ -1182,6 +1784,144 @@ void watch_ui_set_security_status(const char *text, bool has_phone)
     else lv_obj_add_state(forget_phone_button, LV_STATE_DISABLED);
 }
 void watch_ui_set_media_callback(watch_ui_media_command_cb_t callback) { media_callback = callback; }
+void watch_ui_set_volume(uint8_t percent,watch_ui_volume_cb_t callback)
+{
+    if (percent>100) return;
+    sound_volume_percent=percent; sound_volume_callback=callback;
+    refresh_sound_volume();
+}
+void watch_ui_set_microphone_gain(uint8_t gain_db,watch_ui_microphone_gain_cb_t callback)
+{
+    if (gain_db>42 || gain_db%6) return;
+    sound_gain_db=gain_db; sound_gain_callback=callback;
+    if (sound_gain) lv_dropdown_set_selected(sound_gain,gain_db/6);
+}
+void watch_ui_set_astronomy_time(int64_t utc_seconds, bool valid)
+{
+    valid = valid && astronomy::valid_clock(utc_seconds);
+    const bool planet_clock_changed = astronomy_clock_valid != valid ||
+        watch_planets::valid_clock(astronomy_utc) != watch_planets::valid_clock(utc_seconds);
+    const bool changed = astronomy_clock_valid != valid || astronomy_utc/60 != utc_seconds/60;
+    astronomy_utc = utc_seconds; astronomy_clock_valid = valid;
+    if (changed) refresh_astronomy();
+    // Static orbital map: refreshed on entry/wake, not each clock tick.
+    if (planet_clock_changed) refresh_planets();
+}
+void watch_ui_set_voice_callback(watch_ui_voice_cb_t callback) { voice_callback = callback; }
+bool watch_ui_open_voice()
+{
+    if (!display_active || current_screen == WatchScreen::Pairing) return false;
+    navigate_to(WatchScreen::Voice,false);
+    return true;
+}
+static void render_voice_progress()
+{
+    if (!voice_status || voice_state != 6) return;
+    const auto percent = watch_voice_feedback::percent(voice_confirmed,voice_total);
+    lv_label_set_text_fmt(voice_status,"Sending to phone · %u%%",unsigned(percent));
+    lv_label_set_text_fmt(voice_details,"%lu / %lu bytes confirmed",
+        static_cast<unsigned long>(voice_confirmed > voice_total ? voice_total : voice_confirmed),static_cast<unsigned long>(voice_total));
+    lv_bar_set_value(voice_level,percent,LV_ANIM_OFF);
+}
+void watch_ui_set_voice_progress(uint32_t confirmed_bytes, uint32_t total_bytes)
+{
+    voice_confirmed = confirmed_bytes; voice_total = total_bytes;
+    render_voice_progress();
+}
+void watch_ui_set_voice(uint8_t state, uint32_t duration_ms, uint8_t level, const char *error)
+{
+    if (state == 4) state = 5; // Removed local playback state is not actionable.
+    const bool thinking_changed = (voice_state == 7) != (state == 7);
+    voice_state = state;
+    voice_face_level = level > 100 ? 100 : level;
+    if (!voice_status) return;
+    const char *states[] = {"","Starting microphone","Recording · release to send","Waiting for phone","","Connection error","Sending to phone","Thinking...",""};
+    const bool disconnected = state == 3 && bluetooth_state != WATCH_UI_BLUETOOTH_CONNECTED;
+    lv_label_set_text(voice_status,state == 5 && error ? error : disconnected ? "Phone disconnected" : states[state < 9 ? state : 5]);
+    if (state == 8) {
+        lv_obj_add_flag(voice_status,LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(voice_happy,LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_remove_flag(voice_status,LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(voice_happy,LV_OBJ_FLAG_HIDDEN);
+    }
+    const bool test = error && strstr(error,"Test complete");
+    lv_obj_set_style_text_color(voice_status,lv_color_hex(state == 2 || (state == 5 && !test) ? kWarning : kWhite),0);
+    lv_label_set_text(voice_note,state == 5 ? watch_voice_feedback::hint(error) : disconnected ?
+        "Connect your phone and open the app.\nAudio is kept for 30 s." : state == 3 ?
+        "Waiting for the app to collect audio.\nCANCEL or BACK stops the request." : state == 6 ?
+        "Progress confirmed by your phone.\nCANCEL or BACK stops the request." :
+        "");
+    if (error) lv_label_set_text(voice_details,"Hold to retry.");
+    else lv_label_set_text_fmt(voice_details,"%lu.%lu s / max 8 s",static_cast<unsigned long>(duration_ms/1000),
+        static_cast<unsigned long>((duration_ms%1000)/100));
+    lv_bar_set_value(voice_level,level > 100 ? 100 : level,LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(voice_level,lv_color_hex(state == 6 ? design::Bluetooth : design::Activity),LV_PART_INDICATOR);
+    render_voice_progress();
+    if (state == 6 || state == 7) lv_obj_add_state(voice_hold,LV_STATE_DISABLED); else lv_obj_remove_state(voice_hold,LV_STATE_DISABLED);
+    const bool showing = state == 8 || (state == 5 && lv_label_get_text(voice_answer)[0]);
+    if (showing) lv_obj_add_flag(voice_note,LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_remove_flag(voice_note,LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(voice_answer_heading,state == 5 ? "MESSAGE" : "ANSWER:");
+    const bool question = lv_label_get_text(voice_transcription)[0] != 0;
+    if (question) { lv_obj_remove_flag(voice_question_heading,LV_OBJ_FLAG_HIDDEN); lv_obj_remove_flag(voice_transcription,LV_OBJ_FLAG_HIDDEN); }
+    else { lv_obj_add_flag(voice_question_heading,LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(voice_transcription,LV_OBJ_FLAG_HIDDEN); }
+    lv_obj_add_flag(voice_waiting,LV_OBJ_FLAG_HIDDEN);
+    if (state == 5 && showing && error) lv_label_set_text(voice_answer,watch_voice_feedback::hint(error));
+    auto *results = static_cast<lv_obj_t *>(lv_obj_get_user_data(voice_answer));
+    if (showing) { lv_obj_remove_flag(results,LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(voice_hold,LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(voice_level,LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(voice_details,LV_OBJ_FLAG_HIDDEN); }
+    else { lv_obj_add_flag(results,LV_OBJ_FLAG_HIDDEN); lv_obj_remove_flag(voice_hold,LV_OBJ_FLAG_HIDDEN); lv_obj_remove_flag(voice_level,LV_OBJ_FLAG_HIDDEN); lv_obj_remove_flag(voice_details,LV_OBJ_FLAG_HIDDEN); }
+    if (state != 2 && state != 6) lv_obj_add_flag(voice_level,LV_OBJ_FLAG_HIDDEN);
+    if (state == 0 || state == 1 || state == 7) lv_obj_add_flag(voice_details,LV_OBJ_FLAG_HIDDEN);
+    if (state == 7) lv_obj_add_flag(voice_hold,LV_OBJ_FLAG_HIDDEN);
+    if (state == 5 && !showing) lv_obj_remove_flag(voice_hold,LV_OBJ_FLAG_HIDDEN);
+    const bool retry = state == 8 || state == 5;
+    lv_label_set_text(lv_obj_get_child(voice_hold,0),retry ? "HOLD / RETRY" : state == 2 ? "RELEASE TO SEND" : "HOLD TO TALK");
+    lv_obj_align(lv_obj_get_child(voice_hold,0),LV_ALIGN_CENTER,retry || state == 2 ? 0 : 18,0);
+    if (retry || state == 2) lv_obj_add_flag(voice_microphone,LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_remove_flag(voice_microphone,LV_OBJ_FLAG_HIDDEN);
+    if (state == 8) { lv_obj_align(results,LV_ALIGN_TOP_MID,0,226); lv_obj_set_height(results,184); }
+    else if (showing) { lv_obj_align(results,LV_ALIGN_TOP_MID,0,136); lv_obj_set_height(results,274); }
+    else { lv_obj_align(results,LV_ALIGN_TOP_MID,0,162); lv_obj_set_height(results,190); }
+    if (state == 8 || state == 5) { lv_obj_set_size(voice_hold,160,56); lv_obj_align(voice_hold,LV_ALIGN_TOP_MID,-88,354); }
+    else { lv_obj_set_size(voice_hold,design::ContentWidth,72); lv_obj_align(voice_hold,LV_ALIGN_TOP_MID,0,282); }
+    lv_obj_set_style_radius(voice_hold,retry ? design::Radius : 20,0);
+    lv_obj_set_width(voice_clear,state == 8 || state == 5 ? 160 : design::ContentWidth);
+    lv_obj_align(voice_clear,LV_ALIGN_TOP_MID,state == 8 || state == 5 ? 88 : 0,state == 8 || state == 5 || state == 7 ? 354 : 362);
+    const bool cancellable = state == 1 || state == 2 || state == 3 || state == 6 || state == 7;
+    lv_label_set_text(lv_obj_get_child(voice_clear,0),cancellable ? "CANCEL" : "CLEAR");
+    if (state == 0 || state == 1 || state == 3 || state == 6 || state == 7 || showing) lv_obj_add_flag(voice_clear,LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_remove_flag(voice_clear,LV_OBJ_FLAG_HIDDEN);
+    if (showing && state != 8) { lv_obj_add_flag(voice_face,LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(voice_name,LV_OBJ_FLAG_HIDDEN); }
+    else { lv_obj_remove_flag(voice_face,LV_OBJ_FLAG_HIDDEN); lv_obj_remove_flag(voice_name,LV_OBJ_FLAG_HIDDEN); }
+    lv_obj_align(voice_name,LV_ALIGN_TOP_MID,0,66);
+    lv_obj_align(voice_face,LV_ALIGN_TOP_MID,0,64);
+    lv_obj_align(voice_status,LV_ALIGN_TOP_MID,0,showing ? 84 : 218);
+    // The face replaces the introductory space; retain errors in the result
+    // card and actual state/duration/progress below it without overlap.
+    lv_obj_add_flag(voice_note,LV_OBJ_FLAG_HIDDEN);
+    lv_obj_align(voice_details,LV_ALIGN_TOP_MID,0,246);
+    lv_obj_align(voice_level,LV_ALIGN_TOP_MID,0,268);
+    refresh_voice_face();
+    if (thinking_changed && display_active && current_screen == WatchScreen::Voice) {
+        lv_area_t eyes; lv_obj_get_coords(voice_face,&eyes);
+        const int cx=(eyes.x1+eyes.x2)/2,cy=(eyes.y1+eyes.y2)/2;
+        eyes={cx-28,cy-24,cx+28,cy+24};
+        lv_obj_invalidate_area(voice_face,&eyes);
+    }
+    if (voice_notification_pending && !voice_held && state != 1 && state != 2 && current_screen == WatchScreen::Voice) {
+        voice_notification_pending = false;
+        navigate_to(WatchScreen::Notification);
+    }
+}
+void watch_ui_set_voice_text(const char *transcription, const char *answer)
+{
+    if (!voice_answer) return;
+    lv_label_set_text(voice_transcription,transcription ? transcription : "");
+    lv_label_set_text(voice_answer,answer ? answer : "");
+    auto *results = static_cast<lv_obj_t *>(lv_obj_get_user_data(voice_answer));
+    lv_obj_scroll_to_y(results,0,LV_ANIM_OFF);
+}
 void watch_ui_configure_2048(uint32_t best, uint32_t random_seed, watch_ui_2048_best_cb_t callback)
 {
     if (best > game_2048.best) game_2048.best = best;
@@ -1224,6 +1964,7 @@ void watch_ui_set_settings(uint8_t brightness, uint32_t timeout_ms)
     if (brightness_slider != nullptr) lv_slider_set_value(brightness_slider, brightness, LV_ANIM_OFF);
     if (brightness_label != nullptr) lv_label_set_text_fmt(brightness_label, "%u%%", brightness);
     if (screen_timeout_dropdown != nullptr) lv_dropdown_set_selected(screen_timeout_dropdown, selection);
+    refresh_battery_saver();
 }
 
 void watch_ui_set_time(const char *time)
@@ -1313,6 +2054,7 @@ void watch_ui_set_wifi(bool connected, int rssi)
 void watch_ui_set_wifi_state(watch_ui_wifi_state_t state, int rssi)
 {
     wifi_state = state;
+    refresh_battery_saver();
     const bool connected = state == WATCH_UI_WIFI_CONNECTED;
     const uint32_t color = state == WATCH_UI_WIFI_DISCONNECTED ? kMuted : design::Wifi;
     const char *status = connected ? "CONNECTED" : state == WATCH_UI_WIFI_CONNECTING ? "CONNECTING" : "DISCONNECTED";
@@ -1357,6 +2099,7 @@ void watch_ui_set_wifi_name(const char *name)
 void watch_ui_set_bluetooth_state(watch_ui_bluetooth_state_t state)
 {
     bluetooth_state = state;
+    refresh_battery_saver();
     const char *text = state == WATCH_UI_BLUETOOTH_DISABLED ? "DISABLED" :
                        state == WATCH_UI_BLUETOOTH_CONNECTED ? "CONNECTED" : "AVAILABLE";
     const uint32_t color = state == WATCH_UI_BLUETOOTH_DISABLED ? kMuted : design::Bluetooth;
@@ -1437,6 +2180,9 @@ void watch_ui_set_history(const watch_ui_activity_day_t days[7])
 
 void watch_ui_set_battery(int percentage, bool charging)
 {
+    battery_saver_percent=percentage<0 ? -1 : percentage>100 ? 100 : percentage;
+    battery_saver_charging=charging;
+    refresh_battery_saver();
     if (battery_label == nullptr) return;
     if (percentage < 0) {
         lv_label_set_text(battery_label, LV_SYMBOL_BATTERY_EMPTY "  --%");

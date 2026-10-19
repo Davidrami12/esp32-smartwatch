@@ -216,3 +216,50 @@ bool watch_activity_get_history(watch_activity_day_t days[7])
     xSemaphoreGive(lock);
     return true;
 }
+
+size_t watch_activity_export(uint8_t bytes[170])
+{
+    bytes[0] = 1; bytes[1] = 0;
+    if (!lock) return 2;
+    const time_t now = time(nullptr);
+    tm local = {};
+    if (now < 946684800 || !localtime_r(&now, &local)) return 2;
+    Storage saved;
+    uint32_t today;
+    xSemaphoreTake(lock, portMAX_DELAY);
+    today = current_day;
+    saved = history;
+    if (today && encode(local) == today) {
+        for (auto &record : saved.records) if (record.day == today) record.steps = watch_steps_get_count();
+    }
+    xSemaphoreGive(lock);
+    if (!today || encode(local) != today) return 2; // Await reconciled midnight.
+    watch_activity_day_t window[7];
+    calendar_window(today, window);
+    auto offset = [](time_t instant) -> int32_t {
+        tm date = {}; char zone[8] = {};
+        localtime_r(&instant, &date); strftime(zone, sizeof(zone), "%z", &date);
+        const int seconds = ((zone[1]-'0')*10 + zone[2]-'0')*3600 + ((zone[3]-'0')*10 + zone[4]-'0')*60;
+        return zone[0] == '-' ? -seconds : seconds;
+    };
+    auto append = [&](uint32_t value, size_t at) {
+        for (unsigned i = 0; i < 4; ++i) bytes[at+i] = static_cast<uint8_t>(value >> (8*i));
+    };
+    size_t size = 2;
+    for (const auto &day : window) for (const auto &record : saved.records) {
+        if (record.day != day.date) continue;
+        tm date = {};
+        date.tm_year = day.date/10000-1900; date.tm_mon = (day.date/100)%100-1;
+        date.tm_mday = day.date%100; date.tm_isdst = -1;
+        const time_t start = mktime(&date);
+        ++date.tm_mday; date.tm_isdst = -1;
+        const time_t end = day.date == today ? now : mktime(&date);
+        if (start < 946684800 || end <= start || end > UINT32_MAX) continue;
+        append(day.date, size); append(record.steps, size+4);
+        append(static_cast<uint32_t>(start), size+8); append(static_cast<uint32_t>(end), size+12);
+        append(static_cast<uint32_t>(offset(start)), size+16);
+        append(static_cast<uint32_t>(offset(end)), size+20);
+        ++bytes[1]; size += 24;
+    }
+    return size;
+}

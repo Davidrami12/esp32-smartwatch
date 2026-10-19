@@ -59,6 +59,113 @@ class WatchRepository(context: Context) {
     private var mediaCommandHandler: ((MediaCommand) -> Unit)? = null
     private var mediaSequence: Int? = null
     private var mediaVolumeSupported = false
+    private var activitySnapshotHandler: (() -> Unit)? = null
+    private var voiceReceiver: VoiceProtocol.Receiver? = null
+    private var voiceDeadline = 0L
+    private var voiceStarted = 0L
+    private var voiceChunks = 0
+    private var voiceReadUs = 0L
+    private var voiceWriteUs = 0L
+    private var operationStartedNs = 0L
+    private var resultDeliveryStartedNs = 0L
+    private var aiSession = 0
+    private var aiAudio: ByteArray? = null
+    private var aiCall: dev.esp32.smartwatch.ai.VoiceAiClient.Call? = null
+    private var voiceConsent: dev.esp32.smartwatch.ai.PaidVoiceConsent.Ticket? = null
+    private var aiConsent: dev.esp32.smartwatch.ai.PaidVoiceConsent.Ticket? = null
+    private var voiceStream: VoiceProtocol.StreamReceiver? = null
+    private var streamCapable = false
+    private var streamCredits = 4
+    private var streamSubscribed = false
+    private var voiceLastProgress = 0L
+    private var streamNeedsGrant = false
+    private var voiceYielded = false
+    private val streamCallbacks = java.util.concurrent.atomic.AtomicInteger()
+    private fun queueGrant(retry: Boolean = false) {
+        val stream = voiceStream ?: return
+        if (pending?.uuid == VoiceProtocol.CONTROL || operations.any { it.uuid == VoiceProtocol.CONTROL }) { if (!retry) streamNeedsGrant = true; return }
+        streamNeedsGrant = false
+        operations.add(Operation(VoiceProtocol.CONTROL,writeValue=stream.nextGrant(retry)))
+        if (retry) Log.w(TAG,"Voice window retry: epoch=${stream.epoch} prefix_bytes=${stream.receiver.offset}")
+        voiceLastProgress = android.os.SystemClock.elapsedRealtime()
+        nextOperation()
+    }
+    private fun fallbackVoice() {
+        val receiver = voiceReceiver ?: return
+        voiceStream = null; streamNeedsGrant = false; handler.removeCallbacks(voiceWatchdog)
+        operations.removeAll { it.uuid == VoiceProtocol.CONTROL || it.uuid == VoiceProtocol.DATA }
+        Log.w(TAG,"Voice notifications unavailable; resuming secure pull at offset=${receiver.offset}")
+        operations.add(Operation(VoiceProtocol.CONTROL,writeValue=VoiceProtocol.control(receiver.metadata.session,receiver.offset)))
+        nextOperation()
+    }
+    private fun completeVoice(receiver: VoiceProtocol.Receiver, frameBytes: Int) {
+        if (VoiceProtocol.RESULT in characteristics) {
+            aiSession = receiver.metadata.session; aiAudio = receiver.takeAudio(); aiConsent = voiceConsent
+            operations.add(Operation(VoiceProtocol.CONTROL,writeValue=VoiceProtocol.process(aiSession,receiver.offset)))
+        } else operations.add(Operation(VoiceProtocol.CONTROL,writeValue=VoiceProtocol.control(receiver.metadata.session,receiver.offset,true)))
+        val elapsed = (android.os.SystemClock.elapsedRealtime()-voiceStarted).coerceAtLeast(1)
+        Log.i(TAG,"Voice transfer verified: bytes=${receiver.offset} chunks=$voiceChunks duration_ms=$elapsed bytes_per_second=${receiver.offset*1000L/elapsed} session_offsets_crc=PASS")
+        Log.i(TAG,"VoiceLatency trace=${receiver.metadata.session.toUInt().toString(16).padStart(8,'0')} stage=ble_audio mode=${if (voiceStream == null) "pull" else "notify"} duration_ms=$elapsed read_us=$voiceReadUs select_write_us=$voiceWriteUs mtu=$negotiatedMtu last_frame_bytes=$frameBytes")
+        clearVoice()
+    }
+    private fun abortVoice() {
+        voiceReceiver?.let { receiver ->
+            operations.removeAll { it.uuid == VoiceProtocol.CONTROL || it.uuid == VoiceProtocol.DATA }
+            operations.add(Operation(VoiceProtocol.CONTROL,writeValue=VoiceProtocol.control(receiver.metadata.session,receiver.offset,true)))
+        }
+        clearVoice(); clearAi()
+        mutableState.value = state.value.copy(message="Audio transfer failed or expired. Hold to retry.")
+        nextOperation()
+    }
+    private val voiceWatchdog = object : Runnable {
+        override fun run() {
+            if (voiceStream == null || voiceReceiver == null) return
+            val now = android.os.SystemClock.elapsedRealtime()
+            try {
+                if (now >= voiceDeadline) { abortVoice(); return }
+                if (now-voiceLastProgress >= 5000) queueGrant(true)
+            } catch (_: IllegalArgumentException) { fallbackVoice() }
+            if (voiceStream != null) handler.postDelayed(this,500)
+        }
+    }
+    private fun clearAi() {
+        aiCall?.cancel(); aiCall = null; aiAudio?.fill(0); aiAudio = null; aiSession = 0
+        operations.removeAll { if (it.uuid == VoiceProtocol.RESULT) { it.writeValue?.fill(0); true } else false }
+        aiConsent = null
+    }
+    private fun deliverAi(session: Int, result: dev.esp32.smartwatch.ai.VoiceAiClient.Result?, error: String?) {
+        if (session != aiSession || !state.value.secureLink || VoiceProtocol.RESULT !in characteristics) return
+        val accepted = if (dev.esp32.smartwatch.ai.VoiceAiClient.consentValid(aiConsent)) result else null
+        val message = if (result != null && accepted == null) "Paid AI consent revoked. Hold to retry" else error
+        val frames = if (accepted != null) VoiceProtocol.resultFrames(session,1,accepted.transcription,negotiatedMtu) +
+            VoiceProtocol.resultFrames(session,2,accepted.answer,negotiatedMtu)
+        else VoiceProtocol.resultFrames(session,3,VoiceProtocol.watchError(message),negotiatedMtu)
+        frames.forEach { operations.add(Operation(VoiceProtocol.RESULT,writeValue=it)) }
+        resultDeliveryStartedNs = System.nanoTime()
+        Log.i(TAG,"VoiceLatency trace=${session.toUInt().toString(16).padStart(8,'0')} stage=result_queued frames=${frames.size}")
+        nextOperation()
+    }
+    private var lastVoiceAvailability = -1
+    private val voicePoll = object : Runnable {
+        override fun run() {
+            if (serviceEnabled && state.value.secureLink && state.value.connectionState == ConnectionState.CONNECTED &&
+                VoiceProtocol.shouldPollMetadata(voiceReceiver != null,pending?.uuid,operations.map { it.uuid }) &&
+                VoiceProtocol.META in characteristics) {
+                // Queue behind the current operation instead of requiring an idle queue.
+                // Media/notification traffic must not hide a capture until its expiry.
+                operations.addFirst(Operation(VoiceProtocol.META))
+                Log.d(TAG, "Voice metadata poll queued: pending=${pending != null} queued=${operations.size}")
+                safely { nextOperation() }
+            }
+            if (serviceEnabled && gatt != null) handler.postDelayed(this, 2000)
+        }
+    }
+    private fun clearVoice() {
+        if (voiceReceiver != null) gatt?.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED)
+        voiceReceiver?.clear(); voiceReceiver = null; voiceDeadline = 0; voiceChunks = 0
+        voiceStream = null; voiceConsent = null; streamNeedsGrant = false; voiceYielded = false; handler.removeCallbacks(voiceWatchdog)
+    }
+    fun setActivitySnapshotHandler(handler: (() -> Unit)?) { activitySnapshotHandler = handler }
     fun setMediaCommandHandler(handler: ((MediaCommand) -> Unit)?) { mediaCommandHandler = handler }
     fun updateMedia(value: PhoneMedia) {
         latestMedia = value
@@ -68,6 +175,8 @@ class WatchRepository(context: Context) {
     private var bondReceiverRegistered = false
     private var transportConnected = false
     private var discoveryStarted = false
+    private var waitingForMtu = false
+    private var negotiatedMtu = 23
     private var automaticConnection = false
     private var adapterReceiverRegistered = false
     private val adapterReceiver = object : BroadcastReceiver() {
@@ -138,9 +247,18 @@ class WatchRepository(context: Context) {
         discoveryStarted = true
         mutableState.value = state.value.copy(connectionState = ConnectionState.DISCOVERING_SERVICES, pairingState = PairingState.VERIFYING,
             message = "Verifying authenticated, encrypted watch communication…")
+        waitingForMtu = source.requestMtu(517)
+        if (waitingForMtu) armTimeout(10_000) { unexpectedDisconnect("MTU negotiation timed out; reconnecting securely.") }
+        else startServiceDiscovery(source)
+    }
+    private fun startServiceDiscovery(source: BluetoothGatt) {
+        if (servicesInFlight || servicesConfigured) return
+        servicesInFlight = true
         if (!source.discoverServices()) unexpectedDisconnect("Secure service discovery could not start.")
         else armTimeout(20_000) { unexpectedDisconnect("Secure communication timed out. Retrying the existing bond; no pairing downgrade.") }
     }
+    private var servicesInFlight = false
+    private var servicesConfigured = false
 
     fun refreshNotificationAccess() {
         val granted = context.getSystemService(NotificationManager::class.java)
@@ -157,6 +275,11 @@ class WatchRepository(context: Context) {
                            devices: List<NearbyWatch> = state.value.devices) = WatchState(connectionState = connection,
         devices = devices, message = message, notificationAccess = state.value.notificationAccess,
         companionEnabled = serviceEnabled, savedWatchAvailable = preferences.contains("watch_address"),
+        pairingState = try { when (lastDevice?.bondState) {
+            BluetoothDevice.BOND_BONDED -> PairingState.BONDED
+            BluetoothDevice.BOND_BONDING -> PairingState.PAIRING
+            else -> PairingState.NOT_BONDED
+        } } catch (_: SecurityException) { PairingState.NOT_BONDED },
         disconnectReason = state.value.disconnectReason)
 
     fun forwardNotification(item: PhoneNotification) { handler.post {
@@ -302,6 +425,11 @@ class WatchRepository(context: Context) {
     }
 
     private val callback = object : BluetoothGattCallback() {
+        override fun onMtuChanged(source: BluetoothGatt, mtu: Int, status: Int) = onSession(source) {
+            negotiatedMtu = if (status == BluetoothGatt.GATT_SUCCESS) mtu.coerceIn(23, 517) else 23
+            Log.i(TAG, "Negotiated ATT MTU=$negotiatedMtu")
+            if (waitingForMtu) { waitingForMtu = false; clearTimeout(); startServiceDiscovery(source) }
+        }
         override fun onConnectionStateChange(source: BluetoothGatt, status: Int, newState: Int) = onSession(source) {
             Log.i(TAG, "GATT connection callback: status=$status state=$newState")
             if (status != BluetoothGatt.GATT_SUCCESS || newState == BluetoothProfile.STATE_DISCONNECTED) {
@@ -331,7 +459,10 @@ class WatchRepository(context: Context) {
         }
 
         override fun onServicesDiscovered(source: BluetoothGatt, status: Int) = onSession(source) {
+            if (servicesConfigured) { Log.i(TAG,"Duplicate service-discovery callback ignored; initialization already queued"); return@onSession }
+            servicesInFlight = false
             if (status != BluetoothGatt.GATT_SUCCESS) { unexpectedDisconnect("Service discovery failed ($status)."); return@onSession }
+            servicesConfigured = true
             Log.i(TAG, "Services discovered; verifying protocol characteristics")
             val watch = source.getService(WatchBleProtocol.WATCH_SERVICE)
             val battery = source.getService(WatchBleProtocol.BATTERY_SERVICE)
@@ -366,17 +497,38 @@ class WatchRepository(context: Context) {
             if (supportsMedia) { characteristics[media!!.uuid] = media; characteristics[command!!.uuid] = command }
             mutableState.value = state.value.copy(mediaAvailable = supportsMedia)
             val mediaCapabilities = watch?.getCharacteristic(WatchBleProtocol.MEDIA_CAPABILITIES)
+            val activity = watch?.getCharacteristic(WatchBleProtocol.ACTIVITY)
+            val activityAvailable = activity != null && activity.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0
+            if (activityAvailable) characteristics[WatchBleProtocol.ACTIVITY] = activity!!
+            mutableState.value = state.value.copy(activityAvailable = activityAvailable)
+            val goal = watch?.getCharacteristic(WatchBleProtocol.STEP_GOAL)
+            if (goal != null && goal.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0)
+                characteristics[WatchBleProtocol.STEP_GOAL] = goal
             mediaVolumeSupported = false
             if (supportsMedia && mediaCapabilities != null && mediaCapabilities.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0) {
                 characteristics[mediaCapabilities.uuid] = mediaCapabilities
             }
             // One outstanding GATT operation. Version must succeed before custom values are decoded.
+            listOf(VoiceProtocol.META, VoiceProtocol.DATA, VoiceProtocol.CONTROL, VoiceProtocol.RESULT).forEach { uuid ->
+                watch?.getCharacteristic(uuid)?.let { characteristics[uuid] = it }
+            }
+            streamCapable = false; streamSubscribed = false
+            val caps = watch?.getCharacteristic(VoiceProtocol.CAPS)
+            val stream = watch?.getCharacteristic(VoiceProtocol.STREAM)
+            if (dev.esp32.smartwatch.BuildConfig.VOICE_NOTIFY_ENABLED && caps != null && stream != null &&
+                caps.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0 &&
+                stream.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0 && stream.getDescriptor(WatchBleProtocol.CCCD) != null) {
+                characteristics[caps.uuid] = caps; characteristics[stream.uuid] = stream
+            }
+            handler.removeCallbacks(voicePoll); handler.postDelayed(voicePoll, 2000)
             operations.add(Operation(WatchBleProtocol.SECURITY))
             operations.add(Operation(WatchBleProtocol.VERSION))
+            if (VoiceProtocol.CAPS in characteristics) operations.add(Operation(VoiceProtocol.CAPS))
             if (WatchBleProtocol.MEDIA_CAPABILITIES in characteristics) operations.add(Operation(WatchBleProtocol.MEDIA_CAPABILITIES))
             WatchBleProtocol.NOTIFY.filter { it in characteristics }.forEach { operations.add(Operation(it)) }
             WatchBleProtocol.NOTIFY.filter { it in characteristics }.forEach { operations.add(Operation(it, subscribe = true)) }
             if (supportsMedia) operations.add(Operation(WatchBleProtocol.MEDIA_COMMAND, subscribe = true))
+            if (VoiceProtocol.STREAM in characteristics) operations.add(Operation(VoiceProtocol.STREAM,subscribe=true))
             val changed = source.getService(WatchBleProtocol.GATT_SERVICE)?.getCharacteristic(WatchBleProtocol.SERVICE_CHANGED)
             if (!databaseSubscriptionDone && changed != null && changed.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0 &&
                 changed.getDescriptor(WatchBleProtocol.CCCD) != null) {
@@ -391,7 +543,73 @@ class WatchRepository(context: Context) {
             onSession(source) {
                 val op = pending ?: return@onSession
                 if (op.uuid != c.uuid || op.subscribe || op.writeValue != null) return@onSession
+                if (c.uuid != WatchBleProtocol.SECURITY && (status == BluetoothGatt.GATT_INSUFFICIENT_AUTHENTICATION || status == BluetoothGatt.GATT_INSUFFICIENT_ENCRYPTION)) {
+                    snapshot.fill(0)
+                    securityFailure("Watch rejected authenticated access ($status). Secure connection lost; companion stopped to prevent repeated failures.")
+                    return@onSession
+                }
                 Log.d(TAG, "Characteristic read: ${c.uuid}, status=$status")
+                if (c.uuid == VoiceProtocol.CAPS) {
+                    streamCredits = if (status == BluetoothGatt.GATT_SUCCESS) VoiceProtocol.streamCredits(snapshot) else 0
+                    streamCapable = streamCredits != 0
+                    Log.i(TAG,"Voice notification capability supported=$streamCapable credits=$streamCredits")
+                    snapshot.fill(0); pending = null; nextOperation(); return@onSession
+                }
+                if (c.uuid == VoiceProtocol.META || c.uuid == VoiceProtocol.DATA) {
+                    try {
+                        require(status == BluetoothGatt.GATT_SUCCESS && state.value.secureLink)
+                        if (c.uuid == VoiceProtocol.META) {
+                            if (aiSession != 0) {
+                                val session = if (snapshot.size == 18) java.nio.ByteBuffer.wrap(snapshot).order(java.nio.ByteOrder.LITTLE_ENDIAN).getInt(2) else 0
+                                if (snapshot.size != 18 || snapshot[0].toInt() != 1 || snapshot[1].toInt() != 3 || session != aiSession) clearAi()
+                                snapshot.fill(0); pending = null; nextOperation(); return@onSession
+                            }
+                            if (snapshot.size == 18 && snapshot[1].toInt() == 3) { snapshot.fill(0); pending = null; nextOperation(); return@onSession }
+                            val metadata = VoiceProtocol.metadata(snapshot)
+                            val available = if (metadata == null) 0 else 1
+                            if (available != lastVoiceAvailability) {
+                                lastVoiceAvailability = available
+                                Log.i(TAG, "Voice capture available=$available")
+                            }
+                            if (metadata != null && negotiatedMtu >= 64 && VoiceProtocol.CONTROL in characteristics && VoiceProtocol.DATA in characteristics) {
+                                clearVoice(); voiceReceiver = VoiceProtocol.Receiver(metadata)
+                                voiceConsent = dev.esp32.smartwatch.ai.VoiceAiClient.consentTicket()
+                                Log.i(TAG,"Voice claim consent eligible=${voiceConsent != null}; later opt-in cannot authorize this clip")
+                                voiceStarted = android.os.SystemClock.elapsedRealtime()
+                                voiceReadUs = 0; voiceWriteUs = 0
+                                source.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
+                                // 256 kB / measured 2.18 kB/s ~= 118s; allow bounded margin.
+                                voiceDeadline = voiceStarted + 175_000
+                                Log.i(TAG, "Voice transfer started: bytes=${metadata.size} mtu=$negotiatedMtu")
+                                if (streamCapable && streamSubscribed) {
+                                    voiceStream = VoiceProtocol.StreamReceiver(requireNotNull(voiceReceiver),negotiatedMtu,streamCredits)
+                                    // Poll callback owns the current GATT read; queue its grant after clearing pending.
+                                    operations.add(Operation(VoiceProtocol.CONTROL,writeValue=requireNotNull(voiceStream).nextGrant()))
+                                    voiceLastProgress = voiceStarted
+                                    handler.postDelayed(voiceWatchdog,500)
+                                } else operations.add(Operation(VoiceProtocol.CONTROL, writeValue = VoiceProtocol.control(metadata.session, 0)))
+                            } else if (metadata != null) {
+                                Log.w(TAG, "Voice capture cannot transfer: mtu=$negotiatedMtu control=${VoiceProtocol.CONTROL in characteristics} data=${VoiceProtocol.DATA in characteristics}")
+                                mutableState.value = state.value.copy(message = "Audio transfer unavailable. Reconnect companion to negotiate MTU/services.")
+                            }
+                        } else {
+                            voiceReadUs += (System.nanoTime()-operationStartedNs)/1000
+                            val receiver = requireNotNull(voiceReceiver)
+                            require(android.os.SystemClock.elapsedRealtime() < voiceDeadline)
+                            val complete = receiver.accept(snapshot)
+                            voiceChunks++
+                            if (complete) {
+                                completeVoice(receiver,snapshot.size)
+                            } else operations.add(Operation(VoiceProtocol.CONTROL, writeValue = VoiceProtocol.control(receiver.metadata.session, receiver.offset)))
+                        }
+                    } catch (_: IllegalArgumentException) {
+                        voiceReceiver?.let { Log.w(TAG, "Voice transfer aborted: received_bytes=${it.offset} chunks=$voiceChunks elapsed_ms=${android.os.SystemClock.elapsedRealtime() - voiceStarted}") }
+                        voiceReceiver?.let { operations.add(Operation(VoiceProtocol.CONTROL,
+                            writeValue = VoiceProtocol.control(it.metadata.session, it.offset, true))) }
+                        clearVoice(); Log.w(TAG, "Voice transfer rejected or cancelled; audio discarded")
+                    }
+                    snapshot.fill(0); pending = null; nextOperation(); return@onSession
+                }
                 if (c.uuid == WatchBleProtocol.SECURITY) {
                     if (status != BluetoothGatt.GATT_SUCCESS && status != BluetoothGatt.GATT_INSUFFICIENT_AUTHENTICATION &&
                         status != BluetoothGatt.GATT_INSUFFICIENT_ENCRYPTION) {
@@ -413,6 +631,28 @@ class WatchRepository(context: Context) {
                     nextOperation()
                     return@onSession
                 }
+                if (c.uuid == WatchBleProtocol.ACTIVITY) {
+                    try {
+                        require(status == BluetoothGatt.GATT_SUCCESS)
+                        val activity = dev.esp32.smartwatch.activity.WatchActivityProtocol.decode(source.device.address, snapshot)
+                        mutableState.value = state.value.copy(activity = activity, activityUpdatedAt = System.currentTimeMillis(),
+                            activityError = if (activity.days.isEmpty()) "Watch calendar is not ready." else null)
+                        activitySnapshotHandler?.invoke()
+                    } catch (_: Exception) {
+                        mutableState.value = state.value.copy(activity = null, activityError = "Dated watch activity unavailable or malformed ($status).")
+                    }
+                    pending = null; nextOperation(); return@onSession
+                }
+                if (c.uuid == WatchBleProtocol.STEP_GOAL) {
+                    try {
+                        require(status == BluetoothGatt.GATT_SUCCESS)
+                        mutableState.value = state.value.copy(stepGoal = WatchBleProtocol.stepGoal(snapshot),
+                            stepGoalUpdatedAt = System.currentTimeMillis(), stepGoalError = null)
+                    } catch (_: IllegalArgumentException) {
+                        mutableState.value = state.value.copy(stepGoal = null, stepGoalError = "Watch goal read failed; refresh to retry.")
+                    }
+                    pending = null; nextOperation(); return@onSession
+                }
                 // Firmware intentionally returns ATT Unlikely Error when PMIC data is unavailable.
                 if (c.uuid == WatchBleProtocol.BATTERY && status == 0x0e) {
                     mutableState.value = state.value.copy(battery = null, message = "Battery measurement unavailable.")
@@ -426,6 +666,48 @@ class WatchRepository(context: Context) {
         override fun onCharacteristicWrite(source: BluetoothGatt, c: BluetoothGattCharacteristic, status: Int) = onSession(source) {
             val op = pending ?: return@onSession
             if (op.uuid != c.uuid || op.writeValue == null) return@onSession
+            if (status == BluetoothGatt.GATT_INSUFFICIENT_AUTHENTICATION || status == BluetoothGatt.GATT_INSUFFICIENT_ENCRYPTION) {
+                op.writeValue.fill(0)
+                securityFailure("Watch rejected authenticated access ($status). Secure connection lost; companion stopped to prevent repeated failures.")
+                return@onSession
+            }
+            if (c.uuid == VoiceProtocol.RESULT) {
+                op.writeValue.fill(0)
+                if (status != BluetoothGatt.GATT_SUCCESS) { clearAi(); Log.w(TAG,"AI result delivery cancelled/rejected") }
+                else if (operations.none { it.uuid == VoiceProtocol.RESULT }) {
+                    Log.i(TAG,"VoiceLatency trace=${aiSession.toUInt().toString(16).padStart(8,'0')} stage=result_delivered duration_us=${(System.nanoTime()-resultDeliveryStartedNs)/1000}")
+                    clearAi()
+                }
+                pending = null; nextOperation(); return@onSession
+            }
+            if (c.uuid == VoiceProtocol.CONTROL) {
+                if (voiceReceiver != null) voiceWriteUs += (System.nanoTime()-operationStartedNs)/1000
+                if (op.writeValue[0].toInt() == 2) {
+                    pending = null
+                    if (status != BluetoothGatt.GATT_SUCCESS && voiceReceiver != null) fallbackVoice()
+                    else {
+                        voiceLastProgress = android.os.SystemClock.elapsedRealtime()
+                        if (streamNeedsGrant && voiceStream != null) queueGrant() else nextOperation()
+                    }
+                    return@onSession
+                }
+                if (op.writeValue[1].toInt() == 3) {
+                    if (status == BluetoothGatt.GATT_SUCCESS && aiSession != 0 && aiAudio != null) {
+                        val session = aiSession; val audio = requireNotNull(aiAudio); aiAudio = null
+                        if (dev.esp32.smartwatch.BuildConfig.VOICE_TRANSFER_ONLY) {
+                            audio.fill(0)
+                            Log.i(TAG, "Voice transfer-only validation: CRC verified; backend request BLOCKED")
+                            deliverAi(session,null,"Audio transfer verified. AI paused for testing")
+                        } else {
+                            Log.i(TAG, "Voice processing acknowledged; starting authenticated backend stage")
+                            aiCall = dev.esp32.smartwatch.ai.VoiceAiClient.ask(audio,session,{ Log.i(TAG,it) },aiConsent) { result, error -> handler.post { deliverAi(session,result,error) } }
+                        }
+                    } else clearAi()
+                }
+                if (status == BluetoothGatt.GATT_SUCCESS && voiceReceiver != null) operations.add(Operation(VoiceProtocol.DATA))
+                else if (status != BluetoothGatt.GATT_SUCCESS) { clearVoice(); Log.w(TAG, "Voice control rejected ($status)") }
+                pending = null; nextOperation(); return@onSession
+            }
             Log.i(TAG, if (op.mediaChunk) "Media frame write callback: status=$status" else if (op.notificationChunk) "Notification frame write callback: status=$status" else "Control write callback: ${c.uuid}, status=$status")
             if (op.mediaChunk) {
                 if (status != BluetoothGatt.GATT_SUCCESS) {
@@ -466,6 +748,14 @@ class WatchRepository(context: Context) {
         override fun onDescriptorWrite(source: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) = onSession(source) {
             if (descriptor.uuid != WatchBleProtocol.CCCD || pending != Operation(descriptor.characteristic.uuid, true)) return@onSession
             Log.d(TAG, "Notification subscription: ${descriptor.characteristic.uuid}, status=$status")
+            if (status == BluetoothGatt.GATT_INSUFFICIENT_AUTHENTICATION || status == BluetoothGatt.GATT_INSUFFICIENT_ENCRYPTION) {
+                securityFailure("Watch rejected secure subscription ($status). Connection authentication lost."); return@onSession
+            }
+            if (descriptor.characteristic.uuid == VoiceProtocol.STREAM) {
+                streamSubscribed = status == BluetoothGatt.GATT_SUCCESS
+                if (!streamSubscribed) source.setCharacteristicNotification(descriptor.characteristic,false)
+                pending = null; nextOperation(); return@onSession
+            }
             if (status != BluetoothGatt.GATT_SUCCESS) { fail("Notification subscription failed ($status)."); return@onSession }
             pending = null
             if (descriptor.characteristic.uuid == WatchBleProtocol.SERVICE_CHANGED) {
@@ -481,6 +771,8 @@ class WatchRepository(context: Context) {
             Log.i(TAG, "Standard Service Changed received; rediscovering actual database")
             discoveryDelay?.let(handler::removeCallbacks); discoveryDelay = null
             clearTimeout()
+            waitingForMtu = false; servicesInFlight = false; servicesConfigured = false
+            clearAi(); clearVoice(); streamCapable = false; streamSubscribed = false
             operations.clear(); pending = null; characteristics.clear()
             phoneNotifications.clear()
             sentMedia = null; mediaInFlight = null; mediaSequence = null
@@ -490,12 +782,35 @@ class WatchRepository(context: Context) {
             discoveryDelay = Runnable {
                 discoveryDelay = null
                 if (gatt !== source) return@Runnable
-                if (!source.discoverServices()) fail("Changed-service discovery could not start. Reconnect.")
-                else armTimeout(15_000) { fail("Changed-service discovery timed out.") }
+                startServiceDiscovery(source)
             }.also { handler.postDelayed(it, 750) }
         }
 
         override fun onCharacteristicChanged(source: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray) {
+            if (c.uuid == VoiceProtocol.STREAM) {
+                // Bound audio callback copies even if Handler is busy. Missing frames are
+                // recovered from the contiguous prefix with a fresh grant epoch.
+                if (value.size !in 17..512) return
+                if (streamCallbacks.incrementAndGet() > 32) { streamCallbacks.decrementAndGet(); return }
+                val frame = value.copyOf()
+                handler.post {
+                    try {
+                        if (gatt !== source || !state.value.secureLink || !permitted()) return@post
+                        val stream = voiceStream ?: return@post
+                        require(android.os.SystemClock.elapsedRealtime() < voiceDeadline)
+                        when (stream.accept(frame)) {
+                            VoiceProtocol.StreamReceiver.Event.PROGRESS -> { voiceChunks++; voiceLastProgress = android.os.SystemClock.elapsedRealtime() }
+                            VoiceProtocol.StreamReceiver.Event.WINDOW -> { voiceChunks++; voiceLastProgress = android.os.SystemClock.elapsedRealtime(); queueGrant() }
+                            VoiceProtocol.StreamReceiver.Event.COMPLETE -> { voiceChunks++; completeVoice(stream.receiver,frame.size); nextOperation() }
+                            VoiceProtocol.StreamReceiver.Event.IGNORE, VoiceProtocol.StreamReceiver.Event.GAP -> Unit
+                        }
+                    } catch (_: IllegalArgumentException) {
+                        Log.w(TAG,"Voice notification integrity/expiry rejected; discarding audio")
+                        abortVoice()
+                    } finally { frame.fill(0); streamCallbacks.decrementAndGet() }
+                }
+                return
+            }
             val snapshot = value.copyOf()
             onSession(source) {
                 if (c.uuid == WatchBleProtocol.MEDIA_COMMAND && state.value.connectionState == ConnectionState.CONNECTED && state.value.secureLink && state.value.mediaAvailable) {
@@ -520,8 +835,16 @@ class WatchRepository(context: Context) {
     } }
 
     private fun nextOperation() {
+        // CONNECTED StateFlow observers can enqueue/start activity reads synchronously.
+        // A re-entrant pump must not overwrite that pending read or cancel its timer.
+        if (pending != null) return
         clearTimeout()
         val source = gatt ?: return
+        // A pull transfer always has one next voice operation queued. Let normal
+        // traffic run between chunks instead of requiring an empty queue forever.
+        val voiceNext = if (VoiceProtocol.shouldYieldVoice(voiceReceiver != null,voiceYielded,operations.size,operations.firstOrNull()?.uuid)) {
+            voiceYielded = true; operations.removeFirst()
+        } else null
         if (operations.isEmpty() && state.value.connectionState == ConnectionState.CONNECTED && state.value.secureLink &&
             state.value.mediaAvailable && latestMedia != sentMedia) {
             mediaInFlight = latestMedia
@@ -542,6 +865,7 @@ class WatchRepository(context: Context) {
             mutableState.value = state.value.copy(sendingNotification = true, notificationError = null)
             Log.i(TAG, "Notification transmission started: chunks=${frames.size}")
         }
+        if (voiceNext != null) operations.add(voiceNext)
         val op = operations.removeFirstOrNull()
         if (op == null) {
             if (!state.value.secureLink || source.device.bondState != BluetoothDevice.BOND_BONDED) {
@@ -551,6 +875,7 @@ class WatchRepository(context: Context) {
                 retryCount = 0
                 preferences.edit().putString("watch_address", source.device.address).apply()
                 Log.i(TAG, "Watch ready: initial reads and all subscriptions complete")
+                dev.esp32.smartwatch.ai.VoiceAiClient.ensureAutomaticSignIn()
                 mutableState.value = state.value.copy(connectionState = ConnectionState.CONNECTED, savedWatchAvailable = true,
                     disconnectReason = DisconnectReason.NONE, retryDelayMillis = null)
                 if (state.value.mediaAvailable) { nextOperation(); return }
@@ -558,6 +883,8 @@ class WatchRepository(context: Context) {
             return
         }
         pending = op
+        if (op.uuid == VoiceProtocol.CONTROL || op.uuid == VoiceProtocol.DATA) voiceYielded = false
+        operationStartedNs = System.nanoTime()
         val c = characteristics.getValue(op.uuid)
         val started = if (op.writeValue != null) {
             source.writeCharacteristic(c, op.writeValue, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) == BluetoothStatusCodes.SUCCESS
@@ -566,7 +893,13 @@ class WatchRepository(context: Context) {
                 if (c.uuid == WatchBleProtocol.SERVICE_CHANGED) BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
                 else BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) == BluetoothStatusCodes.SUCCESS
         } else source.readCharacteristic(c)
-        if (!started && op.mediaChunk) {
+        if (!started && (op.uuid == VoiceProtocol.CAPS || op.uuid == VoiceProtocol.STREAM)) {
+            pending = null; streamCapable = false; streamSubscribed = false
+            nextOperation()
+        } else if (!started && op.uuid == VoiceProtocol.CONTROL) {
+            pending = null
+            if (op.writeValue?.firstOrNull()?.toInt() == 2) fallbackVoice() else abortVoice()
+        } else if (!started && op.mediaChunk) {
             pending = null; operations.removeAll { it.mediaChunk }; mediaInFlight = null
             mutableState.value = state.value.copy(mediaAvailable = false, sendingMedia = false, mediaError = "Media transmission could not start; reconnect to retry.")
             nextOperation()
@@ -618,6 +951,14 @@ class WatchRepository(context: Context) {
     }
 
     fun setBrightness(value: Int) = writeControl(WatchBleProtocol.BRIGHTNESS) { WatchBleProtocol.encodeBrightness(value) }
+    fun requestActivitySnapshot() = safely {
+        if (!state.value.secureLink || state.value.connectionState != ConnectionState.CONNECTED || !state.value.activityAvailable) return@safely
+        if (pending?.uuid == WatchBleProtocol.ACTIVITY || operations.any { it.uuid == WatchBleProtocol.ACTIVITY }) return@safely
+        operations.add(Operation(WatchBleProtocol.ACTIVITY))
+        if (WatchBleProtocol.STEP_GOAL in characteristics && pending?.uuid != WatchBleProtocol.STEP_GOAL && operations.none { it.uuid == WatchBleProtocol.STEP_GOAL })
+            operations.add(Operation(WatchBleProtocol.STEP_GOAL))
+        if (pending == null) nextOperation()
+    }
     fun setScreenTimeout(value: Long) = writeControl(WatchBleProtocol.TIMEOUT) { WatchBleProtocol.encodeTimeout(value) }
     fun setWifiEnabled(value: Boolean) = writeControl(WatchBleProtocol.WIFI_ENABLED) { WatchBleProtocol.encodeWifiEnabled(value) }
 
@@ -634,6 +975,7 @@ class WatchRepository(context: Context) {
     }
 
     private fun unexpectedDisconnect(message: String) {
+        Log.w(TAG, message)
         cancelReconnect(); stopScan(); releaseGatt()
         mutableState.value = freshState(ConnectionState.RECONNECTING, message).copy(disconnectReason = DisconnectReason.UNEXPECTED_DISCONNECT)
         scheduleReconnect()
@@ -673,6 +1015,10 @@ class WatchRepository(context: Context) {
     }
 
     private fun releaseGatt() {
+        servicesInFlight = false; servicesConfigured = false
+        clearAi()
+        waitingForMtu = false; negotiatedMtu = 23
+        handler.removeCallbacks(voicePoll); clearVoice()
         if (bondReceiverRegistered) { context.unregisterReceiver(bondReceiver); bondReceiverRegistered = false }
         transportConnected = false
         discoveryStarted = false

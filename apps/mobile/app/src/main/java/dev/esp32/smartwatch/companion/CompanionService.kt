@@ -31,6 +31,17 @@ class CompanionService : Service() {
             promoted = true
             api.service = this
             repository.serviceStarted()
+            val health = (application as SmartwatchApplication).health
+            repository.setActivitySnapshotHandler(health::onSnapshotReceived)
+            scope.launch { repository.state.collect { health.onWatchState(it) } }
+            scope.launch {
+                // Refresh on secure connect and each minute, including midnight with zero new steps.
+                repository.state.map { it.connectionState == ConnectionState.CONNECTED && it.secureLink }
+                    .distinctUntilChanged().collect { if (it) repository.requestActivitySnapshot() }
+            }
+            scope.launch {
+                while (isActive) { delay(60_000); repository.requestActivitySnapshot() }
+            }
             media = MediaSessionBridge(this, repository::updateMedia)
             repository.setMediaCommandHandler { media?.execute(it) }
             scope.launch {
@@ -71,6 +82,8 @@ class CompanionService : Service() {
     }
     override fun onDestroy() {
         scope.cancel()
+        repository.setActivitySnapshotHandler(null)
+        (application as SmartwatchApplication).health.serviceStopped()
         repository.setMediaCommandHandler(null)
         media?.stop(); media = null
         repository.serviceStopped(user = !api.requested)
@@ -81,6 +94,8 @@ class CompanionService : Service() {
         super.onDestroy()
     }
     internal fun stopByUser() {
+        repository.setActivitySnapshotHandler(null)
+        (application as SmartwatchApplication).health.serviceStopped()
         repository.setMediaCommandHandler(null)
         media?.stop()
         repository.serviceStopped(user = true) // Cancel pending retry/GATT immediately, before asynchronous destruction.
