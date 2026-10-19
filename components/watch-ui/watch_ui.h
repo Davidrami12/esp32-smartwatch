@@ -50,12 +50,16 @@ void watch_ui_set_security_status(const char *text, bool has_phone);
 typedef bool (*watch_ui_media_command_cb_t)(uint8_t command, uint32_t session);
 void watch_ui_set_media_callback(watch_ui_media_command_cb_t callback);
 void watch_ui_set_media(uint8_t state, uint8_t actions, uint32_t session, const char *title, const char *artist);
+typedef bool (*watch_ui_volume_cb_t)(uint8_t percent);
+void watch_ui_set_volume(uint8_t percent, watch_ui_volume_cb_t callback);
 // Game remains RAM-only. Platform callback batches only high-score writes.
 typedef bool (*watch_ui_2048_best_cb_t)(uint32_t best, bool force);
 void watch_ui_configure_2048(uint32_t best, uint32_t random_seed, watch_ui_2048_best_cb_t callback);
 // Phase 1 local microphone validation; no upload or AI requests.
 typedef bool (*watch_ui_voice_cb_t)(uint8_t action); // 1 start, 2 release, 3 cancel
 void watch_ui_set_voice_callback(watch_ui_voice_cb_t callback);
+typedef bool (*watch_ui_microphone_gain_cb_t)(uint8_t gain_db);
+void watch_ui_set_microphone_gain(uint8_t gain_db, watch_ui_microphone_gain_cb_t callback);
 // Opens only the assistant UI; never activates the microphone or sends audio.
 bool watch_ui_open_voice();
 void watch_ui_set_voice(uint8_t state, uint32_t duration_ms, uint8_t level, const char *error);

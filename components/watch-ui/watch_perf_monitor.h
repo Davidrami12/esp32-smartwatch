@@ -11,9 +11,12 @@ static void watch_perf_observer(lv_observer_t *observer,lv_subject_t *subject)
 {
     auto *info=static_cast<const lv_sysmon_perf_info_t *>(lv_subject_get_pointer(subject));
     auto *text=static_cast<lv_obj_t *>(lv_observer_get_target(observer));
-    lv_label_set_text_fmt(text,"%lu FPS, %lu%% | %lu ms",
+    lv_label_set_text_fmt(text,"%lu FPS | %lu%% CPU | %lu ms",
         static_cast<unsigned long>(info->calculated.fps),
-        static_cast<unsigned long>(info->calculated.cpu),
+        // The FreeRTOS OS-idle metric needs task-switch hooks and otherwise
+        // reports a misleading permanent 100%. Use LVGL handler busy time on
+        // both platforms: UI workload only, not whole-device CPU utilization.
+        static_cast<unsigned long>(100-lv_timer_get_idle()),
         static_cast<unsigned long>(info->calculated.render_avg_time+info->calculated.flush_avg_time));
 }
 

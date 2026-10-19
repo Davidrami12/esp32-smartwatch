@@ -53,7 +53,7 @@ static constexpr time_t MIN_VALID_EPOCH = 946684800; // 2000-01-01 UTC
 static uint32_t last_activity;
 static uint32_t last_tap = 0;
 
-static watch_settings_t user_settings = {60, 10000, 8000};
+static watch_settings_t user_settings = {60, 10000, 8000, 24, 60};
 static uint8_t current_brightness = 60;
 static uint32_t display_timeout_ms = 10000;
 
@@ -702,8 +702,9 @@ static void media_update_cb(lv_timer_t *)
 {
     static uint32_t revision = 0;
     watch_media_t media;
-    if (watch_media_snapshot(media, revision))
+    if (watch_media_snapshot(media, revision)) {
         watch_ui_set_media(media.state, media.actions, media.session, media.title, media.artist);
+    }
 }
 static bool voice_action(uint8_t action)
 {
@@ -862,6 +863,17 @@ extern "C" void app_main(void)
     );
 
     /* Initial UI state */
+    watch_ui_set_volume(user_settings.output_volume,[](uint8_t percent) {
+        if (watch_settings_save_output_volume(percent)!=ESP_OK) return false;
+        watch_voice_preview_volume(percent);
+        return true;
+    });
+    watch_voice_set_microphone_gain(user_settings.microphone_gain_db);
+    watch_ui_set_microphone_gain(user_settings.microphone_gain_db,[](uint8_t gain_db) {
+        if (watch_settings_save_microphone_gain(gain_db)!=ESP_OK) return false;
+        watch_voice_set_microphone_gain(gain_db);
+        return true;
+    });
     watch_ui_set_step_goal(user_settings.step_goal);
     watch_ble_update_step_goal(user_settings.step_goal);
     watch_ui_set_step_goal_callback(ui_step_goal_changed);

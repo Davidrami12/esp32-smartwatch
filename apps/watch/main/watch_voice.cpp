@@ -14,18 +14,26 @@
 #include <atomic>
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 
 namespace {
 constexpr unsigned kRate = 16000, kFrames = 320, kMaxSamples = kRate * 8;
 constexpr uint32_t kStart = 1, kCancel = 4;
 constexpr uint32_t kProcess = 8;
 constexpr uint32_t kDisconnected = 16;
+constexpr uint32_t kVolumePreview = 32;
+std::atomic<bool> volume_preview_pending{false};
+std::atomic<uint8_t> preview_volume{0};
+std::atomic<const char *> preview_error{nullptr};
 std::atomic<uint32_t> confirmed_bytes{0}, total_bytes{0};
+std::atomic<uint8_t> microphone_gain_db{24};
 std::atomic<uint32_t> request_id{0};
 WatchVoiceResult result_text;
 uint32_t text_revision = 0;
 TaskHandle_t task;
 esp_codec_dev_handle_t microphone;
+esp_codec_dev_handle_t speaker;
+bool audio_bus_initialized=false;
 int16_t *pcm;
 size_t samples;
 std::atomic<int64_t> expires{0};
@@ -68,19 +76,65 @@ void clear_audio()
     stream_window.clear();
     xSemaphoreGive(audio_lock);
 }
-bool codecs()
+bool audio_bus()
 {
-    if (microphone) return true;
-    // Official board pin mapping; only initialized after explicit hold.
+    if (audio_bus_initialized) return true;
+    // Shared I2S is initialized only after an explicit recording/preview action.
     i2s_std_config_t config = {};
     config.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(kRate);
     config.slot_cfg = I2S_STD_PHILIP_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,I2S_SLOT_MODE_STEREO);
     config.gpio_cfg.mclk = BSP_I2S_MCLK; config.gpio_cfg.bclk = BSP_I2S_SCLK;
     config.gpio_cfg.ws = BSP_I2S_LCLK; config.gpio_cfg.dout = BSP_I2S_DOUT; config.gpio_cfg.din = BSP_I2S_DSIN;
     if (bsp_audio_init(&config) != ESP_OK) return false;
+    audio_bus_initialized=true;
+    return true;
+}
+bool codecs()
+{
+    if (microphone) return true;
+    if (!audio_bus()) return false;
     if (!microphone) microphone = bsp_audio_codec_microphone_init();
     if (microphone) esp_codec_dev_close(microphone);
     return microphone != nullptr;
+}
+void volume_preview()
+{
+    const auto current=state.load();
+    const uint8_t volume=preview_volume.load();
+    if (volume && !held && (current==WatchVoiceState::Idle || current==WatchVoiceState::Error || current==WatchVoiceState::Complete)) {
+        bool okay=audio_bus();
+        if (okay && !speaker) speaker=bsp_audio_codec_speaker_init();
+        okay=okay && speaker;
+        esp_codec_dev_sample_info_t format={};
+        format.sample_rate=kRate; format.channel=2; format.bits_per_sample=16;
+        if (okay) okay=esp_codec_dev_open(speaker,&format)==ESP_CODEC_DEV_OK;
+        if (okay) okay=esp_codec_dev_set_out_vol(speaker,volume)==ESP_CODEC_DEV_OK;
+        if (okay) okay=esp_codec_dev_set_out_mute(speaker,false)==ESP_CODEC_DEV_OK;
+        constexpr unsigned duration=kRate*180/1000,fade=kRate*8/1000;
+        int16_t tone[kFrames*2];
+        for (unsigned offset=0;okay && offset<duration;offset+=kFrames) {
+            const unsigned count=duration-offset<kFrames ? duration-offset : kFrames;
+            for (unsigned i=0;i<count;++i) {
+                const unsigned sample=offset+i;
+                const unsigned edge=sample<duration-1-sample ? sample : duration-1-sample;
+                const float envelope=edge<fade ? float(edge)/fade : 1.0f;
+                const int16_t value=int16_t(6000.0f*envelope*sinf(float(sample)*6.28318530718f*880.0f/kRate));
+                tone[2*i]=tone[2*i+1]=value;
+            }
+            okay=esp_codec_dev_write(speaker,tone,count*2*sizeof(int16_t))==ESP_CODEC_DEV_OK;
+        }
+        if (speaker) {
+            memset(tone,0,sizeof(tone));
+            if (okay) okay=esp_codec_dev_write(speaker,tone,sizeof(tone))==ESP_CODEC_DEV_OK;
+            if (esp_codec_dev_set_out_mute(speaker,true)!=ESP_CODEC_DEV_OK) okay=false;
+            if (esp_codec_dev_close(speaker)!=ESP_CODEC_DEV_OK) okay=false;
+        }
+        if (!okay) {
+            preview_error="Speaker preview failed";
+            ESP_LOGW("watch_voice","Speaker volume preview failed");
+        } else ESP_LOGI("watch_voice","Local volume preview completed at %u%%",volume);
+    }
+    volume_preview_pending=false;
 }
 void record()
 {
@@ -94,7 +148,7 @@ void record()
     if (esp_codec_dev_open(microphone,&format) != ESP_CODEC_DEV_OK) {
         esp_codec_dev_close(microphone); clear_audio(); publish(WatchVoiceState::Error,"Microphone unavailable"); return;
     }
-    if (esp_codec_dev_set_in_gain(microphone,24.0f) != ESP_CODEC_DEV_OK) {
+    if (esp_codec_dev_set_in_gain(microphone,float(microphone_gain_db.load())) != ESP_CODEC_DEV_OK) {
         esp_codec_dev_close(microphone); clear_audio(); publish(WatchVoiceState::Error,"Microphone setup failed"); return;
     }
     int16_t raw[kFrames*2];
@@ -135,10 +189,11 @@ void worker(void *)
     while (true) {
         uint32_t command = 0;
         xTaskNotifyWait(0,UINT32_MAX,&command,pdMS_TO_TICKS(100));
-        if ((command & kCancel) && cancelled) { clear_audio(); publish(WatchVoiceState::Idle); continue; }
-        if ((command & kDisconnected) && cancelled) { clear_audio(); publish(WatchVoiceState::Error,"Phone disconnected"); continue; }
+        if ((command & kCancel) && cancelled) { if (command & kVolumePreview) volume_preview_pending=false; clear_audio(); publish(WatchVoiceState::Idle); continue; }
+        if ((command & kDisconnected) && cancelled) { if (command & kVolumePreview) volume_preview_pending=false; clear_audio(); publish(WatchVoiceState::Error,"Phone disconnected"); continue; }
         if (command & kProcess) { clear_audio(); expires = esp_timer_get_time()+90'000'000; }
         if (command & kStart) record();
+        if (command & kVolumePreview) volume_preview();
         if (expires && esp_timer_get_time() >= expires) {
             auto ready = WatchVoiceState::Ready;
             if (state.compare_exchange_strong(ready,WatchVoiceState::Starting)) {
@@ -151,6 +206,23 @@ void worker(void *)
     }
 }
 }
+void watch_voice_set_microphone_gain(uint8_t gain_db)
+{
+    if (gain_db<=42 && gain_db%6==0) microphone_gain_db=gain_db;
+}
+bool watch_voice_preview_volume(uint8_t percent)
+{
+    if (percent>100 || !task) return false;
+    if (!percent) return true; // Mute must never initialize/enable the speaker.
+    const auto current=state.load();
+    if (held || (current!=WatchVoiceState::Idle && current!=WatchVoiceState::Error && current!=WatchVoiceState::Complete)) return false;
+    bool expected=false;
+    if (!volume_preview_pending.compare_exchange_strong(expected,true)) return false;
+    preview_volume=percent; preview_error=nullptr;
+    if (xTaskNotify(task,kVolumePreview,eSetBits)!=pdPASS) { volume_preview_pending=false; return false; }
+    return true;
+}
+const char *watch_voice_take_preview_error() { return preview_error.exchange(nullptr); }
 esp_err_t watch_voice_init()
 {
     audio_lock = xSemaphoreCreateMutex();
@@ -159,7 +231,7 @@ esp_err_t watch_voice_init()
 }
 bool watch_voice_start()
 {
-    if (!task) return false;
+    if (!task || volume_preview_pending) return false;
     auto old = state.load();
     if (old != WatchVoiceState::Idle && old != WatchVoiceState::Ready && old != WatchVoiceState::Error && old != WatchVoiceState::Complete) return false;
     if (!state.compare_exchange_strong(old,WatchVoiceState::Starting)) return false;

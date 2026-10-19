@@ -26,9 +26,19 @@ constexpr uint32_t kWarning = design::Warning;
 constexpr uint32_t kMediaAccent = 0x95D5AE;
 constexpr uint32_t kTimeouts[] = {5000, 10000, 30000, 60000, 0};
 
-enum class WatchScreen { Home, Launcher, Activity, Settings, Wifi, Bluetooth, Brightness, Timeout, Timer, Stopwatch, Weather, Notification, Pairing, ForgetPhone, Media, Game2048, Voice, Astronomy, Planets };
+enum class WatchScreen { Home, Launcher, Activity, Settings, Wifi, Bluetooth, Brightness, Timeout, Timer, Stopwatch, Weather, Notification, Pairing, ForgetPhone, Media, Game2048, Voice, Astronomy, Planets, Sound, BatterySaver, Hardware };
 static WatchScreen current_screen = WatchScreen::Home;
-static lv_obj_t *screens[19] = {};
+static lv_obj_t *screens[22] = {};
+static void refresh_battery_saver();
+static bool battery_saver_return=false;
+static lv_obj_t *sound_status, *sound_gain;
+static uint8_t sound_gain_db=24;
+static watch_ui_microphone_gain_cb_t sound_gain_callback=nullptr;
+static lv_obj_t *sound_slider, *sound_percent;
+static uint8_t sound_volume_percent=60;
+static watch_ui_volume_cb_t sound_volume_callback=nullptr;
+static lv_obj_t *settings_volume_value;
+static bool sound_dragging=false;
 static void refresh_planets();
 static void refresh_astronomy();
 static watch_ui_voice_cb_t voice_callback;
@@ -153,7 +163,7 @@ static lv_screen_load_anim_t navigation_animation(WatchScreen from, WatchScreen 
     if (from == WatchScreen::Settings && to == WatchScreen::Home) return LV_SCR_LOAD_ANIM_MOVE_LEFT;
     const auto settings_option = [](WatchScreen screen) {
         return screen == WatchScreen::Wifi || screen == WatchScreen::Bluetooth ||
-               screen == WatchScreen::Brightness || screen == WatchScreen::Timeout;
+               screen == WatchScreen::Brightness || screen == WatchScreen::Timeout || screen == WatchScreen::Sound || screen == WatchScreen::BatterySaver || screen == WatchScreen::Hardware;
     };
     if (from == WatchScreen::Settings && settings_option(to)) return LV_SCR_LOAD_ANIM_MOVE_RIGHT;
     if (settings_option(from) && to == WatchScreen::Settings) return LV_SCR_LOAD_ANIM_MOVE_LEFT;
@@ -178,6 +188,7 @@ static void navigate_to(WatchScreen screen, bool animate = true)
     refresh_time_tools();
     refresh_astronomy();
     refresh_planets();
+    refresh_battery_saver();
     if (screen == WatchScreen::Weather) render_forecast();
     if (screen == WatchScreen::Game2048) render_game();
 }
@@ -246,7 +257,10 @@ static void back_cb(lv_event_t *)
         return;
     }
     const bool settings_child = current_screen == WatchScreen::Wifi || current_screen == WatchScreen::Bluetooth ||
-        current_screen == WatchScreen::Brightness || current_screen == WatchScreen::Timeout;
+        current_screen == WatchScreen::Brightness || current_screen == WatchScreen::Timeout || current_screen == WatchScreen::Sound || current_screen == WatchScreen::BatterySaver || current_screen == WatchScreen::Hardware;
+    if (battery_saver_return && settings_child && current_screen!=WatchScreen::BatterySaver) {
+        battery_saver_return=false; navigate_to(WatchScreen::BatterySaver); return;
+    }
     navigate_to(current_screen == WatchScreen::Launcher || current_screen == WatchScreen::Settings ?
                 WatchScreen::Home : settings_child ? WatchScreen::Settings : WatchScreen::Launcher);
 }
@@ -723,6 +737,73 @@ static void render_forecast()
     }
 }
 
+static void refresh_sound_volume()
+{
+    if (settings_volume_value) lv_label_set_text_fmt(settings_volume_value,"%u%%",sound_volume_percent);
+    if (sound_slider && !sound_dragging) {
+        lv_slider_set_value(sound_slider,sound_volume_percent,LV_ANIM_OFF);
+        lv_label_set_text_fmt(sound_percent,"%u%%",sound_volume_percent);
+    }
+}
+static void create_sound_screen()
+{
+    auto *screen=create_screen(WatchScreen::Sound,"Volume");
+    label(screen,LV_SYMBOL_VOLUME_MAX, &lv_font_montserrat_30,0xF29B85,LV_ALIGN_TOP_MID,0,88);
+    sound_status=label(screen,"WATCH SPEAKER VOLUME",design::caption(),kMuted,LV_ALIGN_TOP_MID,0,134);
+    sound_slider=lv_slider_create(screen);
+    lv_slider_set_range(sound_slider,0,100);
+    lv_obj_set_size(sound_slider,288,16); lv_obj_align(sound_slider,LV_ALIGN_TOP_MID,0,180);
+    lv_obj_set_style_bg_color(sound_slider,lv_color_hex(0xF29B85),LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(sound_slider,lv_color_hex(0xF29B85),LV_PART_KNOB);
+    sound_percent=label(screen,"--",design::caption(),0xF29B85,LV_ALIGN_TOP_MID,0,210);
+    lv_obj_add_event_cb(sound_slider,[](lv_event_t *event) {
+        const auto code=lv_event_get_code(event);
+        if (code==LV_EVENT_PRESSED) sound_dragging=true;
+        else if (code==LV_EVENT_VALUE_CHANGED) lv_label_set_text_fmt(sound_percent,"%d%%",int(lv_slider_get_value(sound_slider)));
+        else if (code==LV_EVENT_RELEASED) {
+            sound_dragging=false;
+            const auto target=uint8_t(lv_slider_get_value(sound_slider));
+            if (sound_volume_callback && !sound_volume_callback(target)) {
+                refresh_sound_volume(); lv_label_set_text(sound_status,"SAVE FAILED / RETRY");
+            } else {
+                sound_volume_percent=target;
+                lv_label_set_text(sound_status,"WATCH VOLUME SAVED");
+                refresh_sound_volume();
+            }
+        } else if (code==LV_EVENT_PRESS_LOST) { sound_dragging=false; refresh_sound_volume(); }
+    },LV_EVENT_ALL,nullptr);
+    label(screen,"MICROPHONE SENSITIVITY",design::caption(),kWhite,LV_ALIGN_TOP_MID,0,254);
+    sound_gain=lv_dropdown_create(screen);
+    lv_dropdown_set_options(sound_gain,"0 dB / Lowest\n6 dB\n12 dB\n18 dB\n24 dB / Default\n30 dB\n36 dB\n42 dB / Highest");
+    lv_obj_set_size(sound_gain,320,60); lv_obj_align(sound_gain,LV_ALIGN_TOP_MID,0,284);
+    style_surface(sound_gain);
+    style_press_feedback(sound_gain);
+    lv_obj_set_style_pad_all(sound_gain,18,0);
+    lv_obj_set_style_text_font(sound_gain,&lv_font_montserrat_20,0);
+    lv_obj_set_style_text_color(sound_gain,lv_color_hex(kWhite),0);
+    auto *gain_list=lv_dropdown_get_list(sound_gain);
+    lv_obj_set_style_bg_color(gain_list,lv_color_hex(kSurface),0);
+    lv_obj_set_style_text_color(gain_list,lv_color_hex(kWhite),0);
+    lv_obj_set_style_text_font(gain_list,&lv_font_montserrat_20,0);
+    lv_obj_set_style_pad_ver(gain_list,12,LV_PART_ITEMS);
+    lv_obj_set_style_bg_color(gain_list,lv_color_hex(design::Pressed),LV_PART_SELECTED);
+    lv_dropdown_set_selected(sound_gain,sound_gain_db/6);
+    lv_obj_add_event_cb(sound_gain,[](lv_event_t *) {
+        const uint8_t gain=lv_dropdown_get_selected(sound_gain)*6;
+        if (sound_gain_callback && !sound_gain_callback(gain)) {
+            lv_dropdown_set_selected(sound_gain,sound_gain_db/6);
+            lv_label_set_text(sound_status,"MIC SAVE FAILED / RETRY");
+            return;
+        }
+        sound_gain_db=gain;
+        lv_label_set_text(sound_status,"MIC SAVED / NEXT RECORDING");
+    },LV_EVENT_VALUE_CHANGED,nullptr);
+    auto *hint=label(screen,"Higher gain also amplifies noise.",design::caption(),kMuted,LV_ALIGN_TOP_MID,0,358);
+    lv_obj_set_style_text_align(hint,LV_TEXT_ALIGN_CENTER,0);
+    refresh_sound_volume();
+}
+#include "watch_battery_saver_ui.inc"
+
 static void create_settings_menu()
 {
     lv_obj_t *screen = create_screen(WatchScreen::Settings, "Settings");
@@ -738,7 +819,92 @@ static void create_settings_menu()
     lv_obj_t *timeout = app_tile(screen, "TIMEOUT", "", design::TileOffset, design::TileSecondY, design::Timeout, open_timeout_cb);
     lv_obj_align(settings_icon(timeout, true, design::Timeout), LV_ALIGN_TOP_MID, 0, 22);
     settings_timeout_value = label(timeout, "", design::caption(), design::Timeout, LV_ALIGN_BOTTOM_MID, 0, -16);
+    auto *sound=app_tile(screen,"VOLUME",LV_SYMBOL_VOLUME_MAX,-design::TileOffset,304,0xF29B85,
+        [](lv_event_t *) { refresh_sound_volume(); navigate_to(WatchScreen::Sound); });
+    auto *saver=app_tile(screen,"BATTERY",LV_SYMBOL_BATTERY_FULL,design::TileOffset,304,0xA8D98C,
+        [](lv_event_t *) { battery_saver_return=false; navigate_to(WatchScreen::BatterySaver); });
+    lv_obj_t *tiles[]={wifi,bluetooth,brightness,timeout,sound,saver};
+    const int tile_x[]={-62,62,-118,118,-62,62};
+    for (unsigned i=0;i<6;++i) {
+        lv_obj_set_size(tiles[i],108,108);
+        // 16 px horizontal gaps and ~16 px diagonal edge gaps (10 x 12).
+        lv_obj_align(tiles[i],LV_ALIGN_TOP_MID,tile_x[i],72+int(i/2)*120);
+        lv_obj_align(lv_obj_get_child(tiles[i],0),LV_ALIGN_TOP_MID,0,48);
+        lv_obj_set_style_text_font(lv_obj_get_child(tiles[i],0),design::caption(),0);
+        lv_obj_align(lv_obj_get_child(tiles[i],1),LV_ALIGN_TOP_MID,0,12);
+    }
+    lv_obj_align(lv_obj_get_child(brightness,2),LV_ALIGN_TOP_MID,0,12);
+    lv_obj_align(lv_obj_get_child(timeout,2),LV_ALIGN_TOP_MID,0,12);
+    for (auto *value : {launcher_wifi_label,launcher_bluetooth_label,settings_brightness_value,settings_timeout_value})
+        lv_obj_align(value,LV_ALIGN_BOTTOM_MID,0,-10);
+    settings_volume_value=label(sound,"--%",design::caption(),0xF29B85,LV_ALIGN_BOTTOM_MID,0,-10);
+    label(saver,"SAVER / TIPS",design::caption(),0xA8D98C,LV_ALIGN_BOTTOM_MID,0,-10);
+    auto *info=button(screen,"i",64,64,LV_ALIGN_TOP_MID,0,214,
+        [](lv_event_t *) { battery_saver_return=false; navigate_to(WatchScreen::Hardware); });
+    lv_obj_set_style_radius(info,LV_RADIUS_CIRCLE,0);
+    lv_obj_set_style_border_width(info,2,0);
+    lv_obj_set_style_border_color(info,lv_color_hex(kWhite),0);
+    lv_obj_set_style_bg_opa(info,LV_OPA_TRANSP,0);
+    lv_obj_set_style_pad_all(info,0,0);
+    lv_obj_set_style_border_color(info,lv_color_hex(design::Bluetooth),LV_STATE_PRESSED);
+    lv_obj_set_style_text_font(lv_obj_get_child(info,0),&lv_font_montserrat_26,0);
+    lv_obj_add_flag(lv_obj_get_child(info,0),LV_OBJ_FLAG_HIDDEN);
+    // Minimal information mark: a round dot and a straight stem, without serifs.
+    const int mark_width[]={5,4};
+    const int mark_height[]={5,22};
+    const int mark_y[]={14,25};
+    for (unsigned i=0;i<2;++i) {
+        auto *part=lv_obj_create(info);
+        lv_obj_remove_style_all(part);
+        lv_obj_set_size(part,mark_width[i],mark_height[i]);
+        lv_obj_align(part,LV_ALIGN_TOP_MID,0,mark_y[i]);
+        lv_obj_set_style_bg_color(part,lv_color_hex(kWhite),0);
+        lv_obj_set_style_bg_opa(part,LV_OPA_COVER,0);
+        if (!i) lv_obj_set_style_radius(part,LV_RADIUS_CIRCLE,0);
+        lv_obj_remove_flag(part,LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_remove_flag(part,LV_OBJ_FLAG_SCROLLABLE);
+    }
     refresh_settings_values();
+}
+
+static void create_hardware_screen()
+{
+    auto *screen=create_screen(WatchScreen::Hardware,"Hardware info");
+    label(screen,"WAVESHARE / AMOLED 2.06",design::caption(),kWhite,LV_ALIGN_TOP_MID,0,76);
+    label(screen,"BOARD SPECIFICATIONS / SCROLL",design::caption(),kWhite,LV_ALIGN_TOP_MID,0,102);
+    auto *list=lv_obj_create(screen);
+    lv_obj_remove_style_all(list);
+    lv_obj_set_size(list,design::ContentWidth,280);
+    lv_obj_align(list,LV_ALIGN_TOP_MID,0,130);
+    lv_obj_set_scroll_dir(list,LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(list,LV_SCROLLBAR_MODE_ON);
+    lv_obj_set_style_bg_color(list,lv_color_hex(design::Bluetooth),LV_PART_SCROLLBAR);
+    lv_obj_set_style_pad_right(list,8,0);
+    lv_obj_set_flex_flow(list,LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(list,10,0);
+    const char *titles[]={"PROCESSOR","MEMORY & STORAGE","DISPLAY & TOUCH","WIRELESS","MOTION & CLOCK","AUDIO","POWER & EXPANSION"};
+    const char *details[]={
+        "ESP32-S3R8\nDual-core LX7 / up to 240 MHz",
+        "512 KB SRAM / 8 MB PSRAM\n32 MB onboard flash\nFirmware uses a 16 MB layout",
+        "2.06-inch AMOLED / 410 x 502\nCO5300 display / FT3168 touch",
+        "2.4 GHz Wi-Fi / 802.11 b/g/n\nBluetooth 5 LE",
+        "QMI8658 accelerometer + gyro\nPCF85063 real-time clock",
+        "Onboard speaker + microphone\nES8311 output / ES7210 input",
+        "AXP2101 power management\nUSB-C / microSD (TF) slot"};
+    for (unsigned i=0;i<7;++i) {
+        auto *card=lv_obj_create(list);
+        lv_obj_set_size(card,design::ContentWidth-8,LV_SIZE_CONTENT);
+        style_surface(card);
+        lv_obj_set_style_pad_all(card,14,0);
+        lv_obj_set_style_pad_row(card,8,0);
+        lv_obj_set_flex_flow(card,LV_FLEX_FLOW_COLUMN);
+        lv_obj_remove_flag(card,LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(card,LV_OBJ_FLAG_EVENT_BUBBLE);
+        label(card,titles[i],design::caption(),kWhite,LV_ALIGN_TOP_LEFT,0,0);
+        auto *detail=label(card,details[i],design::caption(),kWhite,LV_ALIGN_TOP_LEFT,0,0);
+        lv_obj_set_width(detail,LV_PCT(100));
+        lv_label_set_long_mode(detail,LV_LABEL_LONG_WRAP);
+    }
 }
 
 static void create_bluetooth_screen()
@@ -1539,6 +1705,9 @@ void watch_ui_create(void)
     create_home_screen();
     create_launcher_screen();
     create_settings_menu();
+    create_hardware_screen();
+    create_sound_screen();
+    create_battery_saver_screen();
     create_activity_screen();
     create_settings_screen();
     create_wifi_screen();
@@ -1562,6 +1731,7 @@ void watch_ui_set_display_active(bool active)
     display_active = active;
     if (changed && active) refresh_astronomy();
     if (changed && active) refresh_planets();
+    if (changed && active) refresh_battery_saver();
     refresh_voice_face();
     if (changed && !active && current_screen == WatchScreen::Voice) cancel_voice();
     if (changed && !active) save_game_best(true);
@@ -1614,6 +1784,18 @@ void watch_ui_set_security_status(const char *text, bool has_phone)
     else lv_obj_add_state(forget_phone_button, LV_STATE_DISABLED);
 }
 void watch_ui_set_media_callback(watch_ui_media_command_cb_t callback) { media_callback = callback; }
+void watch_ui_set_volume(uint8_t percent,watch_ui_volume_cb_t callback)
+{
+    if (percent>100) return;
+    sound_volume_percent=percent; sound_volume_callback=callback;
+    refresh_sound_volume();
+}
+void watch_ui_set_microphone_gain(uint8_t gain_db,watch_ui_microphone_gain_cb_t callback)
+{
+    if (gain_db>42 || gain_db%6) return;
+    sound_gain_db=gain_db; sound_gain_callback=callback;
+    if (sound_gain) lv_dropdown_set_selected(sound_gain,gain_db/6);
+}
 void watch_ui_set_astronomy_time(int64_t utc_seconds, bool valid)
 {
     valid = valid && astronomy::valid_clock(utc_seconds);
@@ -1782,6 +1964,7 @@ void watch_ui_set_settings(uint8_t brightness, uint32_t timeout_ms)
     if (brightness_slider != nullptr) lv_slider_set_value(brightness_slider, brightness, LV_ANIM_OFF);
     if (brightness_label != nullptr) lv_label_set_text_fmt(brightness_label, "%u%%", brightness);
     if (screen_timeout_dropdown != nullptr) lv_dropdown_set_selected(screen_timeout_dropdown, selection);
+    refresh_battery_saver();
 }
 
 void watch_ui_set_time(const char *time)
@@ -1871,6 +2054,7 @@ void watch_ui_set_wifi(bool connected, int rssi)
 void watch_ui_set_wifi_state(watch_ui_wifi_state_t state, int rssi)
 {
     wifi_state = state;
+    refresh_battery_saver();
     const bool connected = state == WATCH_UI_WIFI_CONNECTED;
     const uint32_t color = state == WATCH_UI_WIFI_DISCONNECTED ? kMuted : design::Wifi;
     const char *status = connected ? "CONNECTED" : state == WATCH_UI_WIFI_CONNECTING ? "CONNECTING" : "DISCONNECTED";
@@ -1915,6 +2099,7 @@ void watch_ui_set_wifi_name(const char *name)
 void watch_ui_set_bluetooth_state(watch_ui_bluetooth_state_t state)
 {
     bluetooth_state = state;
+    refresh_battery_saver();
     const char *text = state == WATCH_UI_BLUETOOTH_DISABLED ? "DISABLED" :
                        state == WATCH_UI_BLUETOOTH_CONNECTED ? "CONNECTED" : "AVAILABLE";
     const uint32_t color = state == WATCH_UI_BLUETOOTH_DISABLED ? kMuted : design::Bluetooth;
@@ -1995,6 +2180,9 @@ void watch_ui_set_history(const watch_ui_activity_day_t days[7])
 
 void watch_ui_set_battery(int percentage, bool charging)
 {
+    battery_saver_percent=percentage<0 ? -1 : percentage>100 ? 100 : percentage;
+    battery_saver_charging=charging;
+    refresh_battery_saver();
     if (battery_label == nullptr) return;
     if (percentage < 0) {
         lv_label_set_text(battery_label, LV_SYMBOL_BATTERY_EMPTY "  --%");

@@ -9,6 +9,9 @@ struct WatchVoiceStatus {
     uint32_t confirmed_bytes = 0, total_bytes = 0;
 };
 esp_err_t watch_voice_init(); // Task only; no microphone activation.
+void watch_voice_set_microphone_gain(uint8_t gain_db); // Applied at next capture.
+bool watch_voice_preview_volume(uint8_t percent); // Explicit local 180 ms tone; 0 is silent.
+const char *watch_voice_take_preview_error();
 bool watch_voice_start();
 void watch_voice_release();
 void watch_voice_cancel();
