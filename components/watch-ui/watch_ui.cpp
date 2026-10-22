@@ -117,7 +117,7 @@ static lv_obj_t *bluetooth_status_label;
 static lv_obj_t *wifi_name_label;
 static lv_obj_t *wifi_signal_label, *launcher_wifi_label;
 static lv_obj_t *wifi_action, *wifi_action_label;
-static lv_obj_t *history_names[7], *history_counts[7];
+static void refresh_activity();
 static lv_obj_t *weather_label, *weather_icon;
 static lv_obj_t *weather_category_label;
 static lv_obj_t *walk_icon;
@@ -192,6 +192,7 @@ static void navigate_to(WatchScreen screen, bool animate = true)
     refresh_astronomy();
     refresh_planets();
     refresh_battery_saver();
+    refresh_activity();
     refresh_motion_lab();
     if (screen == WatchScreen::Weather) render_weather_dashboard();
     if (screen == WatchScreen::WeatherWeek) render_forecast();
@@ -942,27 +943,7 @@ static void create_bluetooth_screen()
     lv_obj_add_state(forget_phone_button, LV_STATE_DISABLED);
 }
 
-static void create_activity_screen()
-{
-    lv_obj_t *screen = create_screen(WatchScreen::Activity, "Activity");
-    label(screen, "TODAY / STEPS", design::caption(), kMuted,
-          LV_ALIGN_TOP_LEFT, design::Margin, 78);
-    activity_steps_label = label(screen, "0", design::number(), design::Activity,
-                                 LV_ALIGN_TOP_LEFT, design::Margin, design::ActivityCountY);
-    goal_minus = button(screen, "-", 56, 56, LV_ALIGN_TOP_LEFT, design::Margin, 150, step_goal_changed_cb);
-    activity_goal_label = label(screen, "Goal 8,000", design::caption(), kMuted, LV_ALIGN_TOP_MID, 0, 174);
-    goal_plus = button(screen, "+", 56, 56, LV_ALIGN_TOP_RIGHT, -design::Margin, 150, step_goal_changed_cb);
-    label(screen, "7 DAYS / LOCAL", design::caption(), kMuted,
-          LV_ALIGN_TOP_LEFT, design::Margin, 218);
-    for (unsigned i = 0; i < 7; ++i) {
-        const int y = 242 + i * 24;
-        history_names[i] = label(screen, "--", &lv_font_montserrat_18, i ? kMuted : kWhite,
-                                 LV_ALIGN_TOP_LEFT, 44, y);
-        history_counts[i] = label(screen, "0", &lv_font_montserrat_20, i ? kWhite : design::Activity,
-                                   LV_ALIGN_TOP_RIGHT, -44, y);
-    }
-    refresh_step_goal();
-}
+#include "watch_activity_ui.inc"
 
 static void create_wifi_screen()
 {
@@ -1732,6 +1713,7 @@ void watch_ui_set_display_active(bool active)
     if (changed && active) refresh_astronomy();
     if (changed && active) refresh_planets();
     if (changed && active) refresh_battery_saver();
+    if (changed && active) refresh_activity();
     refresh_voice_face();
     if (changed && !active && current_screen == WatchScreen::Voice) cancel_voice();
     if (changed && !active) save_game_best(true);
@@ -2009,7 +1991,7 @@ void watch_ui_set_steps(uint32_t steps)
     }
     text[out] = '\0';
     if (steps_label) lv_obj_set_style_text_font(steps_label, steps >= 1000000 ? design::body() : &lv_font_montserrat_26, 0);
-    if (activity_steps_label) lv_obj_set_style_text_font(activity_steps_label, steps >= 1000000 ? design::title() : design::number(), 0);
+    if (activity_steps_label) lv_obj_set_style_text_font(activity_steps_label, steps >= 1000000 ? &lv_font_montserrat_14 : steps >= 100000 ? design::body() : &lv_font_montserrat_26, 0);
     if (steps_label != nullptr) lv_label_set_text(steps_label, text);
     if (activity_steps_label != nullptr) lv_label_set_text(activity_steps_label, text);
     refresh_step_goal();
@@ -2035,6 +2017,7 @@ static void refresh_step_goal()
         if (daily_step_goal == 30000) lv_obj_add_state(goal_plus, LV_STATE_DISABLED);
         else lv_obj_remove_state(goal_plus, LV_STATE_DISABLED);
     }
+    refresh_activity();
 }
 
 } // namespace
@@ -2172,20 +2155,9 @@ void watch_ui_set_weather_dashboard(const watch_weather_dashboard_t *data,bool o
 
 void watch_ui_set_history(const watch_ui_activity_day_t days[7])
 {
-    static const char *weekdays[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
-    for (unsigned i = 0; i < 7; ++i) {
-        if (!history_names[i]) return;
-        if (!days) {
-            lv_label_set_text(history_names[i], "--");
-            lv_label_set_text(history_counts[i], "--");
-        } else {
-            char day[4];
-            snprintf(day, sizeof(day), "%.3s", weekdays[days[i].weekday % 7]);
-            for (char *p = day; *p; ++p) *p = static_cast<char>(toupper(static_cast<unsigned char>(*p)));
-            lv_label_set_text_fmt(history_names[i], "%s%s", day, i == 0 ? " / TODAY" : "");
-            lv_label_set_text_fmt(history_counts[i], "%lu", static_cast<unsigned long>(days[i].steps));
-        }
-    }
+    activity_history_valid=days!=nullptr;
+    if (days) memcpy(activity_history,days,sizeof(activity_history));
+    refresh_activity();
 }
 
 void watch_ui_set_battery(int percentage, bool charging)

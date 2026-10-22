@@ -429,6 +429,54 @@ int main()
     assert(daily_step_goal == 1000 && goal_calls == 2);
     watch_ui_set_step_goal(30000);
     assert(lv_obj_has_state(goal_plus, LV_STATE_DISABLED));
+    open_activity_cb(nullptr);
+    watch_ui_set_step_goal(8000);
+    watch_ui_set_steps(5421);
+    assert(lv_arc_get_value(activity_ring)==677);
+    assert(strcmp(lv_label_get_text(activity_percent),"68% OF GOAL")==0);
+    watch_ui_activity_day_t activity_test_days[7]={{5421,4},{12000,3},{0,2},{4000,1},{8000,0},{2000,6},{1000,5}};
+    watch_ui_set_history(activity_test_days);
+    assert(activity_scale==12000);
+    assert(strstr(lv_label_get_text(activity_selection),"TODAY / 5421 STEPS"));
+    assert(strcmp(lv_label_get_text(activity_days[6]),"THU")==0);
+    assert(strcmp(lv_label_get_text(activity_days[0]),"FRI")==0);
+    lv_obj_send_event(activity_columns[5],LV_EVENT_CLICKED,nullptr);
+    assert(activity_selected==1);
+    assert(strcmp(lv_label_get_text(activity_selection),"WED / 12000 STEPS")==0);
+    lv_obj_send_event(activity_columns[4],LV_EVENT_CLICKED,nullptr);
+    assert(strcmp(lv_label_get_text(activity_selection),"TUE / 0 STEPS")==0);
+    watch_ui_set_steps(16000);
+    assert(lv_arc_get_value(activity_ring)==1000);
+    assert(strcmp(lv_label_get_text(activity_percent),"200% OF GOAL")==0);
+    assert(activity_scale==16000);
+    watch_ui_set_steps(UINT32_MAX);
+    assert(lv_arc_get_value(activity_ring)==1000);
+    assert(strcmp(lv_label_get_text(activity_percent),">999% OF GOAL")==0);
+    watch_ui_set_steps(5421);
+    watch_ui_set_history(nullptr);
+    assert(strstr(lv_label_get_text(activity_selection),"UNAVAILABLE"));
+    lv_obj_send_event(activity_columns[6],LV_EVENT_CLICKED,nullptr);
+    assert(activity_selected==2); // Missing history is not selectable or presented as zero.
+    watch_ui_set_history(activity_test_days);
+    auto *activity_screen=screen_for(WatchScreen::Activity);
+    lv_obj_update_layout(activity_screen);
+    auto activity_bottom=[](lv_obj_t *o) { return lv_obj_get_y(o)+lv_obj_get_height(o); };
+    assert(activity_bottom(activity_ring)+8<=lv_obj_get_y(goal_minus));
+    assert(activity_bottom(goal_minus)+8<=lv_obj_get_y(activity_selection));
+    assert(activity_bottom(activity_selection)+8<=lv_obj_get_y(activity_chart));
+    assert(activity_bottom(activity_chart)+8<=lv_obj_get_y(find_button(activity_screen,LV_SYMBOL_LEFT "  BACK")));
+    for (unsigned i=0;i<7;++i) {
+        assert(lv_obj_get_width(activity_columns[i])>=44);
+        assert(lv_obj_get_height(activity_columns[i])>=56);
+        assert(activity_bottom(activity_bars[i])+8<=lv_obj_get_y(activity_days[i]));
+    }
+    watch_ui_set_display_active(false);
+    watch_ui_set_steps(8000);
+    watch_ui_set_display_active(true);
+    assert(strcmp(lv_label_get_text(activity_percent),"100% OF GOAL")==0);
+    back_cb(nullptr);
+    assert(current_screen==WatchScreen::Launcher);
+    watch_ui_set_step_goal(30000); // Restore the boundary case tested below.
     lv_obj_send_event(goal_plus, LV_EVENT_CLICKED, nullptr);
     assert(daily_step_goal == 30000 && goal_calls == 2);
     watch_ui_set_step_goal(0); watch_ui_set_step_goal(3500);
