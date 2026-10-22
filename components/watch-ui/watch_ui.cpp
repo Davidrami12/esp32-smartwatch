@@ -27,9 +27,9 @@ constexpr uint32_t kWarning = design::Warning;
 constexpr uint32_t kMediaAccent = 0x95D5AE;
 constexpr uint32_t kTimeouts[] = {5000, 10000, 30000, 60000, 0};
 
-enum class WatchScreen { Home, Launcher, Activity, Settings, Wifi, Bluetooth, Brightness, Timeout, Timer, MotionLab, Weather, Notification, Pairing, ForgetPhone, Media, Game2048, Voice, Astronomy, Planets, Sound, BatterySaver, Hardware };
+enum class WatchScreen { Home, Launcher, Activity, Settings, Wifi, Bluetooth, Brightness, Timeout, Timer, MotionLab, Weather, Notification, Pairing, ForgetPhone, Media, Game2048, Voice, Astronomy, Planets, Sound, BatterySaver, Hardware, WeatherWeek };
 static WatchScreen current_screen = WatchScreen::Home;
-static lv_obj_t *screens[22] = {};
+static lv_obj_t *screens[23] = {};
 static void refresh_battery_saver();
 static bool battery_saver_return=false;
 static lv_obj_t *sound_status, *sound_gain;
@@ -98,6 +98,7 @@ static watch_ui_forecast_day_t forecast_days[7] = {};
 static bool forecast_online = false;
 static uint32_t forecast_age = 0;
 static void render_forecast();
+static void render_weather_dashboard();
 static bool display_active = true;
 static WatchTimeTool countdown;
 static bool pomodoro_break=false;
@@ -192,7 +193,8 @@ static void navigate_to(WatchScreen screen, bool animate = true)
     refresh_planets();
     refresh_battery_saver();
     refresh_motion_lab();
-    if (screen == WatchScreen::Weather) render_forecast();
+    if (screen == WatchScreen::Weather) render_weather_dashboard();
+    if (screen == WatchScreen::WeatherWeek) render_forecast();
     if (screen == WatchScreen::Game2048) render_game();
 }
 
@@ -249,6 +251,7 @@ static void wifi_action_cb(lv_event_t *)
 }
 static void back_cb(lv_event_t *)
 {
+    if (current_screen==WatchScreen::WeatherWeek) { navigate_to(WatchScreen::Weather); return; }
     if (current_screen == WatchScreen::Pairing) {
         if (pairing_callback) pairing_callback(pairing_token, false);
         return;
@@ -405,7 +408,9 @@ static uint32_t weather_icon_color(watch_ui_weather_condition_t condition)
 static void weather_draw_cb(lv_event_t *event)
 {
     lv_area_t area;
-    lv_obj_get_coords(static_cast<lv_obj_t *>(lv_event_get_target(event)), &area);
+    auto *object=static_cast<lv_obj_t *>(lv_event_get_target(event));
+    lv_obj_get_coords(object, &area);
+    const int size=lv_obj_get_width(object);
     const auto *day = static_cast<watch_ui_forecast_day_t *>(lv_event_get_user_data(event));
     const auto condition = day ? day->condition : weather_condition;
     const auto color = lv_color_hex(weather_icon_color(condition));
@@ -414,9 +419,9 @@ static void weather_draw_cb(lv_event_t *event)
         lv_draw_line_dsc_t dsc;
         lv_draw_line_dsc_init(&dsc);
         dsc.color = color;
-        dsc.width = design::IconStroke;
-        dsc.p1 = {static_cast<lv_value_precise_t>(area.x1 + x1), static_cast<lv_value_precise_t>(area.y1 + y1)};
-        dsc.p2 = {static_cast<lv_value_precise_t>(area.x1 + x2), static_cast<lv_value_precise_t>(area.y1 + y2)};
+        dsc.width = size>48 ? 3 : size<30 ? 1 : design::IconStroke;
+        dsc.p1 = {static_cast<lv_value_precise_t>(area.x1 + x1*size/36), static_cast<lv_value_precise_t>(area.y1 + y1*size/36)};
+        dsc.p2 = {static_cast<lv_value_precise_t>(area.x1 + x2*size/36), static_cast<lv_value_precise_t>(area.y1 + y2*size/36)};
         lv_draw_line(layer, &dsc);
     };
     auto disc = [&](int x, int y, int width, int height) {
@@ -424,7 +429,8 @@ static void weather_draw_cb(lv_event_t *event)
         lv_draw_rect_dsc_init(&dsc);
         dsc.bg_color = color;
         dsc.radius = LV_RADIUS_CIRCLE;
-        lv_area_t box = {area.x1 + x, area.y1 + y, area.x1 + x + width - 1, area.y1 + y + height - 1};
+        lv_area_t box = {area.x1 + x*size/36, area.y1 + y*size/36,
+            area.x1 + (x+width)*size/36-1, area.y1 + (y+height)*size/36-1};
         lv_draw_rect(layer, &dsc, &box);
     };
     if (condition == WATCH_UI_WEATHER_SUNNY) {
@@ -698,7 +704,7 @@ static void create_launcher_screen()
 
 static void create_forecast_screen()
 {
-    lv_obj_t *screen = create_screen(WatchScreen::Weather, "Madrid weather");
+    lv_obj_t *screen = create_screen(WatchScreen::WeatherWeek, "7-day forecast");
     forecast_status = label(screen, "Forecast unavailable", design::caption(), kMuted, LV_ALIGN_TOP_MID, 0, 82);
     label(screen, "7 DAYS / HIGH - LOW / \xC2\xB0" "C", design::caption(), kMuted, LV_ALIGN_TOP_MID, 0, 108);
     for (unsigned i = 0; i < 7; ++i) {
@@ -743,6 +749,8 @@ static void render_forecast()
         }
     }
 }
+
+#include "watch_weather_dashboard_ui.inc"
 
 static void refresh_sound_volume()
 {
@@ -1697,6 +1705,7 @@ void watch_ui_create(void)
     create_time_tools();
     create_motion_lab_screen();
     create_forecast_screen();
+    create_weather_dashboard();
     create_notification_screen();
     create_security_screens();
     create_media_screen();
@@ -1728,6 +1737,8 @@ void watch_ui_set_display_active(bool active)
     if (changed && !active) save_game_best(true);
     refresh_media_record();
     if (changed && active) {
+        if (current_screen==WatchScreen::Weather) render_weather_dashboard();
+        if (current_screen==WatchScreen::WeatherWeek) render_forecast();
         time_tools_tick(nullptr);
         refresh_time_tools(); // IDLE may have consumed the last changed second without drawing.
     }
@@ -2148,7 +2159,15 @@ void watch_ui_set_forecast(const watch_ui_forecast_day_t days[7], bool online, u
             forecast_days[0].high_c, forecast_days[0].low_c);
         else lv_label_set_text(weather_range_label, "H -- / L --");
     }
-    if (display_active && current_screen == WatchScreen::Weather) render_forecast();
+    if (display_active && current_screen == WatchScreen::WeatherWeek) render_forecast();
+    if (display_active && current_screen == WatchScreen::Weather) render_weather_dashboard();
+}
+
+void watch_ui_set_weather_dashboard(const watch_weather_dashboard_t *data,bool online,uint32_t age_minutes)
+{
+    weather_dashboard=data ? *data : watch_weather_dashboard_t{};
+    weather_dashboard_online=online; weather_dashboard_age=age_minutes;
+    if (display_active && current_screen==WatchScreen::Weather) render_weather_dashboard();
 }
 
 void watch_ui_set_history(const watch_ui_activity_day_t days[7])

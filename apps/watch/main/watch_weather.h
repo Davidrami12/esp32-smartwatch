@@ -1,6 +1,7 @@
 #pragma once
 #include "esp_err.h"
 #include <stdint.h>
+#include "watch_weather_dashboard.h"
 
 enum class watch_weather_condition_t { Sunny, Cloudy, Rain, Thunderstorm, Windy };
 struct watch_weather_t {
@@ -22,3 +23,4 @@ struct watch_weather_forecast_t {
     watch_weather_day_t days[7];
 };
 watch_weather_forecast_t watch_weather_forecast_get(void);
+watch_weather_dashboard_t watch_weather_dashboard_get(void);

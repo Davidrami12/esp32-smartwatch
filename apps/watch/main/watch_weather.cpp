@@ -6,6 +6,8 @@
 #include <time.h>
 #include <stdio.h>
 #include <ctype.h>
+#include <memory>
+#include <new>
 #include "cJSON.h"
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
@@ -17,7 +19,8 @@
 namespace {
 constexpr char kTag[] = "watch_weather";
 constexpr char kUrl[] = "https://api.open-meteo.com/v1/forecast?latitude=40.4168&longitude=-3.7038"
-    "&current=temperature_2m,weather_code,wind_speed_10m"
+    "&current=temperature_2m,weather_code,wind_speed_10m,wind_direction_10m,relative_humidity_2m"
+    "&hourly=temperature_2m,precipitation,weather_code"
     "&daily=weather_code,temperature_2m_max,temperature_2m_min,wind_speed_10m_max"
     "&temperature_unit=celsius&wind_speed_unit=kmh&timezone=Europe%2FMadrid&forecast_days=7";
 constexpr int64_t kRefreshUs = 30LL * 60 * 1000000;
@@ -26,7 +29,8 @@ constexpr float kWindyKmh = 30.0f; // Sustained 10m wind, km/h. Rain/thunder tak
 portMUX_TYPE cache_lock = portMUX_INITIALIZER_UNLOCKED;
 watch_weather_t cached = {};
 watch_weather_forecast_t forecast_cached = {};
-struct Response { char text[4096]; size_t length; bool overflow; };
+watch_weather_dashboard_t dashboard_cached = {};
+struct Response { char text[16384]; size_t length; bool overflow; };
 
 esp_err_t response_event(esp_http_client_event_t *event)
 {
@@ -100,9 +104,86 @@ bool parse_forecast(cJSON *root, watch_weather_forecast_t &result)
     return true;
 }
 
+bool parse_dashboard(cJSON *root,const watch_weather_forecast_t &forecast,watch_weather_dashboard_t &out)
+{
+    auto *current=cJSON_GetObjectItemCaseSensitive(root,"current");
+    auto *stamp=cJSON_GetObjectItemCaseSensitive(current,"time");
+    auto *temp=cJSON_GetObjectItemCaseSensitive(current,"temperature_2m");
+    auto *wind=cJSON_GetObjectItemCaseSensitive(current,"wind_speed_10m");
+    auto *direction=cJSON_GetObjectItemCaseSensitive(current,"wind_direction_10m");
+    auto *humidity=cJSON_GetObjectItemCaseSensitive(current,"relative_humidity_2m");
+    auto *code=cJSON_GetObjectItemCaseSensitive(current,"weather_code");
+    if (!forecast.available || !cJSON_IsString(stamp) || !stamp->valuestring || strlen(stamp->valuestring)!=16 ||
+        !valid_number(temp,-100,70) || !valid_number(wind,0,500) || !valid_number(direction,0,360) ||
+        !valid_number(humidity,0,100) || !valid_number(code,0,99) || code->valuedouble!=code->valueint) return false;
+    char today[20];
+    const uint32_t date=forecast.days[0].date;
+    snprintf(today,sizeof(today),"%04lu-%02lu-%02luT",static_cast<unsigned long>(date/10000),
+        static_cast<unsigned long>(date/100%100),static_cast<unsigned long>(date%100));
+    const char *s=stamp->valuestring;
+    if (strncmp(s,today,11) || s[13]!=':' || !isdigit(s[11]) || !isdigit(s[12]) || !isdigit(s[14]) || !isdigit(s[15]) ||
+        (s[11]-'0')*10+s[12]-'0'>23 || (s[14]-'0')*10+s[15]-'0'>59) return false;
+    auto *hourly=cJSON_GetObjectItemCaseSensitive(root,"hourly");
+    const char *names[]={"time","temperature_2m","precipitation","weather_code"};
+    cJSON *arrays[4]; int count=0;
+    for (unsigned i=0;i<4;++i) {
+        arrays[i]=cJSON_GetObjectItemCaseSensitive(hourly,names[i]);
+        if (!cJSON_IsArray(arrays[i])) return false;
+        const int n=cJSON_GetArraySize(arrays[i]);
+        if (!i) count=n;
+        if (n!=count || n<1 || n>200) return false;
+    }
+    out.available=true; out.observation_date=date;
+    out.temperature_c=temp->valuedouble; out.wind_kmh=wind->valuedouble; out.wind_degrees=direction->valuedouble;
+    out.humidity_percent=humidity->valuedouble;
+    out.condition=static_cast<uint8_t>(classify(code->valueint,out.wind_kmh));
+    out.fetched_monotonic_us=esp_timer_get_time();
+    const unsigned hours[]={8,14,20};
+    const unsigned current_hour=(s[11]-'0')*10+s[12]-'0';
+    const uint32_t next_date=current_hour==23 ? forecast.days[1].date : date;
+    char next_hour[24];
+    snprintf(next_hour,sizeof(next_hour),"%04lu-%02lu-%02luT%02u:00",static_cast<unsigned long>(next_date/10000),
+        static_cast<unsigned long>(next_date/100%100),static_cast<unsigned long>(next_date%100),(current_hour+1)%24);
+    const char *previous_time=nullptr;
+    for (int i=0;i<count;++i) {
+        auto *time=cJSON_GetArrayItem(arrays[0],i);
+        if (!cJSON_IsString(time) || !time->valuestring || strlen(time->valuestring)!=16) return false;
+        const char *ts=time->valuestring;
+        if (ts[4]!='-' || ts[7]!='-' || ts[10]!='T' || ts[13]!=':' || ts[14]!='0' || ts[15]!='0') return false;
+        for (unsigned j=0;j<16;++j) if (j!=4 && j!=7 && j!=10 && j!=13 && !isdigit(static_cast<unsigned char>(ts[j]))) return false;
+        unsigned yy,mm,dd,hh,mn;
+        if (sscanf(ts,"%4u-%2u-%2uT%2u:%2u",&yy,&mm,&dd,&hh,&mn)!=5 || hh>23 || mn) return false;
+        const uint32_t time_date=yy*10000+mm*100+dd;
+        bool valid_date=false;
+        for (const auto &day : forecast.days) valid_date|=day.date==time_date;
+        if (!valid_date || (previous_time && strcmp(previous_time,ts)>0)) return false;
+        previous_time=ts;
+        auto *t=cJSON_GetArrayItem(arrays[1],i),*p=cJSON_GetArrayItem(arrays[2],i),*c=cJSON_GetArrayItem(arrays[3],i);
+        // Null/missing hourly values remain explicitly unavailable, never zero-filled.
+        if (!strcmp(ts,next_hour)) {
+            out.rain_available=valid_number(p,0,1000);
+            if (out.rain_available) out.rain_mm=p->valuedouble;
+        }
+        for (unsigned d=0;d<3;++d) for (unsigned h=0;h<3;++h) {
+            const uint32_t key=forecast.days[d].date;
+            char target[24]; snprintf(target,sizeof(target),"%04lu-%02lu-%02luT%02u:00",
+                static_cast<unsigned long>(key/10000),static_cast<unsigned long>(key/100%100),static_cast<unsigned long>(key%100),hours[h]);
+            if (strcmp(time->valuestring,target)) continue;
+            auto &slot=out.slots[d*3+h]; slot.date=key; slot.hour=hours[h];
+            if (valid_number(t,-100,70) && valid_number(p,0,1000) && valid_number(c,0,99) && c->valuedouble==c->valueint)
+                slot={true,key,static_cast<uint8_t>(hours[h]),static_cast<uint8_t>(classify(c->valueint,0)),
+                    static_cast<float>(t->valuedouble),static_cast<float>(p->valuedouble)};
+        }
+    }
+    return true;
+}
+
 bool fetch()
 {
-    Response response = {};
+    // Larger hourly response lives on the heap, not the weather task's stack.
+    std::unique_ptr<Response> storage(new(std::nothrow) Response{});
+    if (!storage) return false;
+    auto &response=*storage;
     esp_http_client_config_t config = {};
     config.url = kUrl;
     config.crt_bundle_attach = esp_crt_bundle_attach;
@@ -130,6 +211,16 @@ bool fetch()
         code->valuedouble == code->valueint && isfinite(wind->valuedouble) && wind->valuedouble >= 0;
     watch_weather_forecast_t forecast = {};
     const bool forecast_valid = parse_forecast(root, forecast);
+    watch_weather_dashboard_t dashboard={};
+    const bool dashboard_valid=forecast_valid && parse_dashboard(root,forecast,dashboard);
+    if (dashboard_valid) {
+        portENTER_CRITICAL(&cache_lock);
+        dashboard_cached=dashboard;
+        portEXIT_CRITICAL(&cache_lock);
+        unsigned slots=0;
+        for (const auto &slot : dashboard.slots) if (slot.available) ++slots;
+        ESP_LOGI(kTag,"Weather dashboard cached: wind %.1f km/h, humidity %.0f%%, hourly slots=%u/9, rain_available=%u",dashboard.wind_kmh,dashboard.humidity_percent,slots,dashboard.rain_available);
+    } else ESP_LOGW(kTag,"Invalid dashboard data; retaining cache");
     if (valid) {
         watch_weather_t result = {true, static_cast<float>(temperature->valuedouble),
             classify(code->valueint, static_cast<float>(wind->valuedouble))};
@@ -148,7 +239,7 @@ bool fetch()
         static_cast<unsigned long>(forecast.days[0].date), static_cast<unsigned long>(forecast.days[6].date));
     else ESP_LOGW(kTag, "Invalid daily forecast; retaining cache");
     cJSON_Delete(root);
-    return valid && forecast_valid;
+    return valid && forecast_valid && dashboard_valid;
 }
 
 void worker(void *)
@@ -189,6 +280,14 @@ watch_weather_forecast_t watch_weather_forecast_get(void)
 {
     portENTER_CRITICAL(&cache_lock);
     const auto result = forecast_cached;
+    portEXIT_CRITICAL(&cache_lock);
+    return result;
+}
+
+watch_weather_dashboard_t watch_weather_dashboard_get(void)
+{
+    portENTER_CRITICAL(&cache_lock);
+    const auto result=dashboard_cached;
     portEXIT_CRITICAL(&cache_lock);
     return result;
 }

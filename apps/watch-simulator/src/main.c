@@ -106,6 +106,7 @@ static void update_clock_cb(lv_timer_t *timer)
 static watch_ui_wifi_state_t mock_wifi = WATCH_UI_WIFI_CONNECTED;
 static unsigned mock_connect_ticks = 0;
 static watch_ui_forecast_day_t mock_forecast[7];
+static watch_weather_dashboard_t mock_dashboard;
 static watch_ui_bluetooth_state_t mock_bluetooth = WATCH_UI_BLUETOOTH_ADVERTISING;
 static bool mock_bluetooth_control(bool enabled)
 {
@@ -128,6 +129,7 @@ static void update_mock_wifi_cb(lv_timer_t *timer)
     if (mock_wifi == WATCH_UI_WIFI_CONNECTING && ++mock_connect_ticks >= 3) mock_wifi = WATCH_UI_WIFI_CONNECTED;
     watch_ui_set_wifi_state(mock_wifi, mock_wifi == WATCH_UI_WIFI_CONNECTED ? -65 : 0);
     watch_ui_set_forecast(mock_forecast, mock_wifi == WATCH_UI_WIFI_CONNECTED, 12);
+    watch_ui_set_weather_dashboard(&mock_dashboard,mock_wifi==WATCH_UI_WIFI_CONNECTED,12);
     watch_ui_set_wifi_name(mock_wifi == WATCH_UI_WIFI_CONNECTED ? "Simulator Wi-Fi" : "");
     watch_ui_set_bluetooth_state(mock_bluetooth);
 }
@@ -187,6 +189,17 @@ int main(int argc, char **argv)
       ++day.tm_mday;
     }
     watch_ui_set_forecast(mock_forecast, true, 12);
+    mock_dashboard.available=true; mock_dashboard.rain_available=true;
+    mock_dashboard.observation_date=mock_forecast[0].date;
+    mock_dashboard.temperature_c=24; mock_dashboard.wind_kmh=8; mock_dashboard.wind_degrees=180;
+    mock_dashboard.humidity_percent=65; mock_dashboard.rain_mm=0;
+    for (unsigned d=0;d<3;++d) for (unsigned h=0;h<3;++h) {
+      watch_weather_slot_t *slot=&mock_dashboard.slots[d*3+h];
+      slot->available=true; slot->date=mock_forecast[d].date; slot->hour=(uint8_t)(8+h*6);
+      slot->temperature_c=14+d*2+(h==1 ? 7 : 0); slot->precipitation_mm=d==2 ? .6f : 0;
+      slot->condition=(uint8_t)(d==2 ? WATCH_UI_WEATHER_RAIN : WATCH_UI_WEATHER_SUNNY);
+    }
+    watch_ui_set_weather_dashboard(&mock_dashboard,true,12);
   }
   {
     const uint32_t counts[7] = {5421, 8140, 0, 7283, 4612, 0, 9050};

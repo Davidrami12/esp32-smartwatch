@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "lvgl.h"
+#include "watch_weather_dashboard.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -102,6 +103,7 @@ typedef struct {
 } watch_ui_forecast_day_t;
 // Seven local-calendar slots including today. NULL means no data.
 void watch_ui_set_forecast(const watch_ui_forecast_day_t days[7], bool online, uint32_t age_minutes);
+void watch_ui_set_weather_dashboard(const watch_weather_dashboard_t *data,bool online,uint32_t age_minutes);
 typedef struct { uint32_t steps; uint8_t weekday; } watch_ui_activity_day_t;
 // Seven newest-first calendar rows supplied by firmware; NULL means date unavailable.
 void watch_ui_set_history(const watch_ui_activity_day_t days[7]);

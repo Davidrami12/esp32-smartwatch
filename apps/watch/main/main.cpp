@@ -246,6 +246,16 @@ static void update_wifi_status_cb(
     const uint32_t forecast_age = forecast.available ? static_cast<uint32_t>(
         (esp_timer_get_time() - forecast.fetched_monotonic_us) / 60000000) : 0;
     watch_ui_set_forecast(forecast_rows, state == watch_wifi_state_t::Connected, forecast_age);
+    const auto dashboard=watch_weather_dashboard_get();
+    auto shown=dashboard;
+    shown.available=dashboard.available && dashboard.observation_date==forecast_rows[0].date;
+    memset(shown.slots,0,sizeof(shown.slots));
+    const unsigned slot_hours[]={8,14,20};
+    for (unsigned d=0;d<3;++d) for (unsigned h=0;h<3;++h)
+        for (const auto &slot : dashboard.slots)
+            if (slot.available && slot.date==forecast_rows[d].date && slot.hour==slot_hours[h]) shown.slots[d*3+h]=slot;
+    const uint32_t dashboard_age=dashboard.available ? static_cast<uint32_t>((esp_timer_get_time()-dashboard.fetched_monotonic_us)/60000000) : 0;
+    watch_ui_set_weather_dashboard(&shown,state==watch_wifi_state_t::Connected,dashboard_age);
     watch_ui_set_weather(weather.available, weather.temperature_c,
                          static_cast<watch_ui_weather_condition_t>(weather.condition));
 }

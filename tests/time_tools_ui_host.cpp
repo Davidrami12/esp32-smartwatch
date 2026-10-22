@@ -661,6 +661,48 @@ int main()
     watch_ui_set_forecast(forecast, false, 45);
     assert(strcmp(lv_label_get_text(weather_range_label), "H 24\xC2\xB0 / L 12\xC2\xB0") == 0);
     open_weather_cb(nullptr);
+    watch_weather_dashboard_t dashboard={};
+    dashboard.available=true; dashboard.rain_available=true; dashboard.temperature_c=16.5f;
+    dashboard.wind_kmh=8; dashboard.wind_degrees=180; dashboard.humidity_percent=65;
+    dashboard.slots[0]={true,20261003,8,WATCH_UI_WEATHER_SUNNY,12.5f,0};
+    watch_ui_set_weather_dashboard(&dashboard,true,12);
+    assert(strcmp(lv_label_get_text(wx_temp),"16.5°C")==0);
+    assert(strcmp(lv_label_get_text(wx_stats[0]),"8 km/h S")==0);
+    assert(strcmp(lv_label_get_text(wx_stats[1]),"65%")==0);
+    assert(strcmp(lv_label_get_text(wx_stats[2]),"0.0 mm")==0);
+    assert(strcmp(lv_label_get_text(wx_day_high[0]),"24°")==0);
+    assert(strcmp(lv_label_get_text(wx_day_low[0]),"12°")==0);
+    assert(strcmp(lv_label_get_text(wx_day_high[1]),"--")==0);
+    assert(lv_obj_has_flag(wx_day_icons[1],LV_OBJ_FLAG_HIDDEN));
+    auto *dashboard_screen=screen_for(WatchScreen::Weather);
+    lv_obj_update_layout(dashboard_screen);
+    auto bottom=[](lv_obj_t *obj) { return lv_obj_get_y(obj)+lv_obj_get_height(obj); };
+    assert(bottom(wx_status)+8<=lv_obj_get_y(wx_temp));
+    assert(bottom(wx_temp)+8<=174); // Current caption band.
+    assert(bottom(wx_stats[0])+8<=lv_obj_get_y(wx_grid));
+    assert(bottom(wx_grid)+8<=394); // Attribution / grid navigation hint.
+    assert(394+18+8<=lv_obj_get_y(find_button(dashboard_screen,LV_SYMBOL_LEFT "  BACK")));
+    for (unsigned i=0;i<3;++i) {
+        assert(bottom(wx_day_icons[i])+8<=lv_obj_get_y(wx_day_high[i]));
+        assert(bottom(wx_day_high[i])+2<=lv_obj_get_y(wx_day_low[i]));
+        assert(bottom(wx_day_low[i])+2<=lv_obj_get_height(wx_grid));
+    }
+    dashboard.rain_available=false;
+    watch_ui_set_weather_dashboard(&dashboard,false,45);
+    assert(strcmp(lv_label_get_text(wx_stats[2]),"-- mm")==0);
+    assert(strstr(lv_label_get_text(wx_status),"OFFLINE / CACHED"));
+    dashboard.slots[0].date=20261002;
+    watch_ui_set_weather_dashboard(&dashboard,true,40);
+    assert(strcmp(lv_label_get_text(wx_day_high[0]),"24°")==0); // Daily highs, not hourly samples.
+    forecast[1]={true,20261004,0,-5,0,WATCH_UI_WEATHER_CLOUDY};
+    watch_ui_set_forecast(forecast,true,40);
+    assert(strcmp(lv_label_get_text(wx_day_high[1]),"0°")==0);
+    assert(strcmp(lv_label_get_text(wx_day_low[1]),"-5°")==0);
+    forecast[1]={};
+    watch_ui_set_forecast(forecast,false,45);
+    assert(strstr(lv_label_get_text(wx_status),"STALE / CACHED"));
+    lv_obj_send_event(wx_grid,LV_EVENT_CLICKED,nullptr);
+    assert(current_screen==WatchScreen::WeatherWeek);
     assert(strcmp(lv_label_get_text(forecast_names[0]), "TODAY 03/10") == 0);
     assert(strcmp(lv_label_get_text(forecast_values[0]), "24 / 12") == 0);
     assert(strstr(lv_label_get_text(forecast_status), "OFFLINE / CACHED"));
@@ -668,6 +710,10 @@ int main()
     watch_ui_set_forecast(nullptr, true, 0);
     assert(strcmp(lv_label_get_text(weather_range_label), "H -- / L --") == 0);
     assert(strcmp(lv_label_get_text(forecast_values[0]), "-- / --") == 0);
+    back_cb(nullptr); assert(current_screen==WatchScreen::Weather);
+    watch_ui_set_weather_dashboard(nullptr,true,0);
+    assert(strcmp(lv_label_get_text(wx_temp),"--°C")==0);
+    assert(lv_obj_has_flag(wx_icon,LV_OBJ_FLAG_HIDDEN));
     back_cb(nullptr); assert(current_screen == WatchScreen::Launcher);
     watch_ui_set_voice_callback(voice_test_action);
     open_voice_cb(nullptr); assert(current_screen == WatchScreen::Voice);
