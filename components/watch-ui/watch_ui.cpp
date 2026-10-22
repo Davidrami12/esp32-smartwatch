@@ -1,6 +1,7 @@
 #include "watch_ui.h"
 #include "watch_design.h"
 #include "watch_time_tools.h"
+#include "watch_motion_lab.h"
 #include "watch_2048.h"
 #include "watch_voice_feedback.h"
 #include "watch_astronomy.h"
@@ -26,7 +27,7 @@ constexpr uint32_t kWarning = design::Warning;
 constexpr uint32_t kMediaAccent = 0x95D5AE;
 constexpr uint32_t kTimeouts[] = {5000, 10000, 30000, 60000, 0};
 
-enum class WatchScreen { Home, Launcher, Activity, Settings, Wifi, Bluetooth, Brightness, Timeout, Timer, Stopwatch, Weather, Notification, Pairing, ForgetPhone, Media, Game2048, Voice, Astronomy, Planets, Sound, BatterySaver, Hardware };
+enum class WatchScreen { Home, Launcher, Activity, Settings, Wifi, Bluetooth, Brightness, Timeout, Timer, MotionLab, Weather, Notification, Pairing, ForgetPhone, Media, Game2048, Voice, Astronomy, Planets, Sound, BatterySaver, Hardware };
 static WatchScreen current_screen = WatchScreen::Home;
 static lv_obj_t *screens[22] = {};
 static void refresh_battery_saver();
@@ -98,7 +99,7 @@ static bool forecast_online = false;
 static uint32_t forecast_age = 0;
 static void render_forecast();
 static bool display_active = true;
-static WatchTimeTool countdown, stopwatch;
+static WatchTimeTool countdown;
 static bool pomodoro_break=false;
 static unsigned pomodoro_completed=0;
 static uint64_t pomodoro_duration() { return uint64_t(pomodoro_break ? (pomodoro_completed==4 ? 15 : 5) : 25)*60000; }
@@ -106,7 +107,8 @@ static void pomodoro_next_cb(lv_event_t *);
 static lv_obj_t *timer_value, *timer_status, *timer_action_label;
 static lv_obj_t *pomodoro_progress;
 static lv_obj_t *pomodoro_phase, *pomodoro_sessions[4], *pomodoro_start;
-static lv_obj_t *stopwatch_value, *stopwatch_status, *stopwatch_action_label;
+static void refresh_motion_lab();
+static void motion_icon_draw(lv_event_t *event);
 static void refresh_time_tools();
 static lv_obj_t *time_label, *date_label, *steps_label, *activity_steps_label;
 static lv_obj_t *battery_label, *wifi_status_label, *wifi_detail_label;
@@ -189,6 +191,7 @@ static void navigate_to(WatchScreen screen, bool animate = true)
     refresh_astronomy();
     refresh_planets();
     refresh_battery_saver();
+    refresh_motion_lab();
     if (screen == WatchScreen::Weather) render_forecast();
     if (screen == WatchScreen::Game2048) render_game();
 }
@@ -201,7 +204,7 @@ static void open_bluetooth_cb(lv_event_t *) { navigate_to(WatchScreen::Bluetooth
 static void open_brightness_cb(lv_event_t *) { navigate_to(WatchScreen::Brightness); }
 static void open_timeout_cb(lv_event_t *) { navigate_to(WatchScreen::Timeout); }
 static void open_timer_cb(lv_event_t *) { navigate_to(WatchScreen::Timer); }
-static void open_stopwatch_cb(lv_event_t *) { navigate_to(WatchScreen::Stopwatch); }
+static void open_motion_lab_cb(lv_event_t *) { navigate_to(WatchScreen::MotionLab); }
 static void open_weather_cb(lv_event_t *) { navigate_to(WatchScreen::Weather); }
 static void open_astronomy_cb(lv_event_t *) { navigate_to(WatchScreen::Astronomy); }
 static void open_planets_cb(lv_event_t *) { navigate_to(WatchScreen::Planets); }
@@ -641,7 +644,11 @@ static void create_launcher_screen()
     lv_obj_align(activity_icon, LV_ALIGN_TOP_MID, 0, 26);
     auto *pomodoro_tile=launcher_tile(screen, "POMODORO", "", 0, 92, 0xEE594E, open_timer_cb);
     tomato_icon(pomodoro_tile,LV_ALIGN_TOP_MID,0,20);
-    launcher_tile(screen, "STOPWATCH", LV_SYMBOL_PLAY, 118, 92, design::Stopwatch, open_stopwatch_cb);
+    auto *motion_tile=launcher_tile(screen, "MOTION LAB", "", 118, 92, 0x6EDFD1, open_motion_lab_cb);
+    auto *motion_icon=lv_obj_create(motion_tile); lv_obj_remove_style_all(motion_icon);
+    lv_obj_set_size(motion_icon,40,40); lv_obj_align(motion_icon,LV_ALIGN_TOP_MID,0,22);
+    lv_obj_remove_flag(motion_icon,LV_OBJ_FLAG_CLICKABLE); lv_obj_remove_flag(motion_icon,LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(motion_icon,motion_icon_draw,LV_EVENT_DRAW_MAIN,nullptr);
     lv_obj_t *weather = launcher_tile(screen, "WEATHER", "", -118, 202, design::Weather, open_weather_cb);
     launcher_tile(screen, "MEDIA", LV_SYMBOL_AUDIO, 0, 202, kMediaAccent, open_media_cb);
     auto *game = launcher_tile(screen, "2048", "", 118, 202, design::Activity, open_game_cb);
@@ -1117,16 +1124,6 @@ static void create_settings_screen()
     lv_obj_add_event_cb(screen_timeout_dropdown, timeout_changed_cb, LV_EVENT_VALUE_CHANGED, nullptr);
 }
 
-static void format_elapsed(char *text, unsigned size, uint64_t ms, bool fractions)
-{
-    const uint64_t seconds = ms / 1000;
-    if (fractions) snprintf(text, size, "%02llu:%02llu:%02llu.%01llu",
-        (unsigned long long)(seconds / 3600), (unsigned long long)(seconds / 60 % 60),
-        (unsigned long long)(seconds % 60), (unsigned long long)(ms / 100 % 10));
-    else snprintf(text, size, "%02llu:%02llu:%02llu", (unsigned long long)(seconds / 3600),
-        (unsigned long long)(seconds / 60 % 60), (unsigned long long)(seconds % 60));
-}
-
 static void refresh_time_tools()
 {
     if (!display_active) return;
@@ -1152,25 +1149,18 @@ static void refresh_time_tools()
         }
         lv_label_set_text(timer_action_label, finished ? "START NEXT" : countdown.running ? "PAUSE" : countdown.elapsed_ms ? "RESUME" : "START");
     }
-    if (current_screen == WatchScreen::Stopwatch && stopwatch_value) {
-        format_elapsed(text, sizeof(text), stopwatch.elapsed_ms, true);
-        lv_label_set_text(stopwatch_value, text);
-        lv_label_set_text(stopwatch_status, stopwatch.running ? "RUNNING" : stopwatch.elapsed_ms ? "PAUSED" : "READY");
-        lv_label_set_text(stopwatch_action_label, stopwatch.running ? "PAUSE" : stopwatch.elapsed_ms ? "RESUME" : "START");
-    }
 }
 
 static void time_tools_tick(lv_timer_t *)
 {
     const uint32_t now = lv_tick_get();
-    countdown.advance(now); stopwatch.advance(now);
+    countdown.advance(now);
     const uint64_t duration = pomodoro_duration();
     const bool finished_now = countdown.running && countdown.elapsed_ms >= duration;
     if (countdown.elapsed_ms >= duration) { countdown.elapsed_ms = duration; countdown.running = false; }
     static uint64_t last_timer_second = UINT64_MAX;
     const uint64_t timer_second = countdown.elapsed_ms / 1000;
-    if (display_active && ((current_screen == WatchScreen::Stopwatch && stopwatch.running) ||
-        (current_screen == WatchScreen::Timer && (finished_now || last_timer_second != timer_second)))) refresh_time_tools();
+    if (display_active && current_screen == WatchScreen::Timer && (finished_now || last_timer_second != timer_second)) refresh_time_tools();
     last_timer_second = timer_second;
 }
 
@@ -1189,8 +1179,6 @@ static void pomodoro_next_cb(lv_event_t *)
     countdown.reset(lv_tick_get());
     refresh_time_tools();
 }
-static void stopwatch_control_cb(lv_event_t *) { stopwatch.toggle(lv_tick_get()); refresh_time_tools(); }
-static void stopwatch_reset_cb(lv_event_t *) { stopwatch.reset(lv_tick_get()); refresh_time_tools(); }
 
 static void create_time_tools()
 {
@@ -1232,14 +1220,7 @@ static void create_time_tools()
     button(screen, "RESET", 144, 56, LV_ALIGN_TOP_MID, -80, 358, timer_reset_cb);
     button(screen,"SKIP PHASE",144,56,LV_ALIGN_TOP_MID,80,358,pomodoro_next_cb);
 
-    screen = create_screen(WatchScreen::Stopwatch, "Stopwatch");
-    stopwatch_status = label(screen, "READY", design::caption(), kMuted, LV_ALIGN_TOP_MID, 0, 116);
-    stopwatch_value = label(screen, "00:00:00.0", &lv_font_montserrat_26, kWhite, LV_ALIGN_TOP_MID, 0, 182);
-    action = button(screen, "START", 148, 56, LV_ALIGN_TOP_MID, -84, 290, stopwatch_control_cb);
-    stopwatch_action_label = lv_obj_get_child(action, 0);
-    button(screen, "RESET", 148, 56, LV_ALIGN_TOP_MID, 84, 290, stopwatch_reset_cb);
-    label(screen, "CONTINUES WHILE SCREEN IS OFF", design::caption(), kMuted, LV_ALIGN_TOP_MID, 0, 378);
-    countdown.reset(lv_tick_get()); stopwatch.reset(lv_tick_get());
+    countdown.reset(lv_tick_get());
     lv_timer_create(time_tools_tick, 100, nullptr);
 }
 
@@ -1698,6 +1679,7 @@ static void create_media_screen()
     label(screen, LV_SYMBOL_VOLUME_MID "  VOLUME", design::caption(), kMuted, LV_ALIGN_TOP_MID, 0, 364);
     watch_ui_set_media(0, 0, 0, "", "");
 }
+#include "watch_motion_lab_ui.inc"
 } // namespace
 
 void watch_ui_create(void)
@@ -1713,6 +1695,7 @@ void watch_ui_create(void)
     create_wifi_screen();
     create_bluetooth_screen();
     create_time_tools();
+    create_motion_lab_screen();
     create_forecast_screen();
     create_notification_screen();
     create_security_screens();
@@ -1725,10 +1708,18 @@ void watch_ui_create(void)
     current_screen = WatchScreen::Home;
 }
 
+void watch_ui_set_motion(bool available,float x,float y,float z)
+{
+    if (!available) motion_lab.valid=false;
+    else motion_lab.sample(x,y,z,lv_tick_get());
+}
+void watch_ui_set_motion_demo(bool enabled) { motion_demo=enabled; motion_lab.valid=false; }
+
 void watch_ui_set_display_active(bool active)
 {
     const bool changed = display_active != active;
     display_active = active;
+    refresh_motion_lab();
     if (changed && active) refresh_astronomy();
     if (changed && active) refresh_planets();
     if (changed && active) refresh_battery_saver();

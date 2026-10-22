@@ -398,7 +398,7 @@ int main()
         lv_obj_send_event(find_button(screen_for(parent), LV_SYMBOL_HOME "  HOME"), LV_EVENT_CLICKED, nullptr);
         assert(current_screen == WatchScreen::Home);
     }
-    for (const auto child : {WatchScreen::Activity, WatchScreen::Timer, WatchScreen::Stopwatch, WatchScreen::Weather,
+    for (const auto child : {WatchScreen::Activity, WatchScreen::Timer, WatchScreen::MotionLab, WatchScreen::Weather,
                              WatchScreen::Wifi, WatchScreen::Bluetooth, WatchScreen::Brightness, WatchScreen::Timeout}) {
         navigate_to(child);
         lv_obj_send_event(find_button(screen_for(child), LV_SYMBOL_LEFT "  BACK"), LV_EVENT_CLICKED, nullptr);
@@ -576,11 +576,10 @@ int main()
     timer_control_cb(nullptr);
     lv_tick_inc(5000); time_tools_tick(nullptr);
     assert(countdown.elapsed_ms == 1000 && !countdown.running);
-    timer_control_cb(nullptr); stopwatch_control_cb(nullptr);
+    timer_control_cb(nullptr);
     watch_ui_set_display_active(false);
     lv_tick_inc(1499000); time_tools_tick(nullptr);
     assert(!countdown.running && countdown.elapsed_ms == 1500000);
-    assert(stopwatch.running && stopwatch.elapsed_ms == 1499000);
     // Expiry while IDLE must not redraw until wake.
     assert(strcmp(lv_label_get_text(timer_value), "24:59") == 0);
     watch_ui_set_display_active(true);
@@ -599,10 +598,63 @@ int main()
     timer_reset_cb(nullptr);
     assert(countdown.elapsed_ms==0 && pomodoro_duration()==1500000);
     assert(lv_arc_get_value(pomodoro_progress)==0);
-    back_cb(nullptr); open_stopwatch_cb(nullptr);
-    assert(strcmp(lv_label_get_text(stopwatch_value), "00:24:59.0") == 0);
-    stopwatch_control_cb(nullptr); stopwatch_reset_cb(nullptr);
-    assert(stopwatch.elapsed_ms == 0 && !stopwatch.running);
+    back_cb(nullptr); open_motion_lab_cb(nullptr);
+    assert(current_screen==WatchScreen::MotionLab);
+    motion_tick(nullptr);
+    assert(strstr(lv_label_get_text(motion_status),"UNAVAILABLE"));
+    watch_ui_set_motion(true,0,0,9.80665f); motion_tick(nullptr);
+    assert(motion_lab.fresh(lv_tick_get()));
+    assert(fabsf(motion_lab.roll)<.001f && fabsf(motion_lab.pitch)<.001f);
+    watch_ui_set_motion(true,0,9.80665f,0);
+    assert(motion_lab.roll>0);
+    assert(motion_lab.center(lv_tick_get()));
+    assert(fabsf(motion_lab.relative_roll())<.001f);
+    for (unsigned i=0;i<100;++i) watch_ui_set_motion(true,1,2,9);
+    assert(motion_lab.count==80 && motion_lab.next<80);
+    auto check_motion_layout=[]() {
+        auto *screen=screen_for(WatchScreen::MotionLab);
+        lv_obj_update_layout(screen);
+        auto bottom=[](lv_obj_t *obj) { return lv_obj_get_y(obj)+lv_obj_get_height(obj); };
+        auto *heading=lv_obj_get_child(screen,0);
+        auto *back=find_button(screen,LV_SYMBOL_LEFT "  BACK");
+        for (unsigned i=0;i<3;++i) {
+            assert(lv_obj_get_height(motion_tabs[i])==design::TouchHeight);
+            assert(bottom(heading)+8<=lv_obj_get_y(motion_tabs[i]));
+            assert(bottom(motion_tabs[i])+8<=lv_obj_get_y(motion_status));
+            if (i) assert(lv_obj_get_x(motion_tabs[i-1])+lv_obj_get_width(motion_tabs[i-1])+8<=lv_obj_get_x(motion_tabs[i]));
+        }
+        assert(bottom(motion_status)+8<=lv_obj_get_y(motion_canvas));
+        assert(bottom(motion_canvas)+8<=lv_obj_get_y(motion_readout));
+        auto *footer=motion_mode==2 ? motion_accel_hint : motion_center;
+        assert(bottom(motion_readout)+8<=lv_obj_get_y(footer));
+        assert(bottom(footer)+8<=lv_obj_get_y(back));
+        assert(lv_obj_has_flag(motion_center,LV_OBJ_FLAG_HIDDEN)==(motion_mode==2));
+        assert(lv_obj_has_flag(motion_accel_hint,LV_OBJ_FLAG_HIDDEN)==(motion_mode!=2));
+        assert(lv_obj_get_width(motion_status)==design::ContentWidth);
+    };
+    for (unsigned i=0;i<3;++i) {
+        lv_obj_send_event(motion_tabs[i],LV_EVENT_CLICKED,nullptr); assert(motion_mode==i);
+        check_motion_layout();
+    }
+    lv_tick_inc(601); motion_tick(nullptr);
+    assert(strstr(lv_label_get_text(motion_status),"UNAVAILABLE"));
+    check_motion_layout();
+    assert(!motion_lab.center(lv_tick_get()));
+    watch_ui_set_motion(true,NAN,0,9); assert(!motion_lab.valid);
+    watch_ui_set_motion_demo(true); motion_tick(nullptr);
+    assert(strstr(lv_label_get_text(motion_status),"DEMO"));
+    for (unsigned i=0;i<3;++i) { motion_select(i); check_motion_layout(); }
+    motion_select(1);
+    lv_obj_send_event(motion_center,LV_EVENT_CLICKED,nullptr);
+    assert(strcmp(lv_label_get_text(lv_obj_get_child(motion_center,0)),"REFERENCE SET")==0);
+    check_motion_layout();
+    lv_tick_inc(1200); motion_tick(nullptr);
+    assert(strcmp(lv_label_get_text(lv_obj_get_child(motion_center,0)),"SET LEVEL / RECENTER")==0);
+    const auto received=motion_lab.received;
+    watch_ui_set_display_active(false); lv_tick_inc(100); motion_tick(nullptr);
+    assert(motion_lab.received==received);
+    watch_ui_set_display_active(true);
+    watch_ui_set_motion_demo(false);
     back_cb(nullptr); assert(current_screen == WatchScreen::Launcher);
     watch_ui_forecast_day_t forecast[7] = {};
     forecast[0] = {true, 20261003, 6, 12, 24, WATCH_UI_WEATHER_SUNNY};
@@ -892,7 +944,7 @@ int main()
         back_cb(nullptr); assert(current_screen==WatchScreen::Launcher);
     }
     {
-        const char *names[]={"ACTIVITY","POMODORO","STOPWATCH","WEATHER","MEDIA","2048","SUN & MOON","PLANETS","AI ASSISTANT"};
+        const char *names[]={"ACTIVITY","POMODORO","MOTION LAB","WEATHER","MEDIA","2048","SUN & MOON","PLANETS","AI ASSISTANT"};
         auto *launcher=screen_for(WatchScreen::Launcher);
         lv_obj_update_layout(launcher);
         for (unsigned i=0;i<9;++i) {

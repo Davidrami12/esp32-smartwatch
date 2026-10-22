@@ -838,6 +838,18 @@ extern "C" void app_main(void)
     if (watch_voice_init() != ESP_OK) ESP_LOGW("watch_voice","Capture task unavailable");
     watch_ui_set_voice_callback(voice_action);
     lv_timer_create(voice_update_cb,100,nullptr);
+    lv_timer_create([](lv_timer_t *) {
+        if (!watch_power_is_active()) return;
+        watch_motion_data_t sample={};
+        const uint64_t now=esp_timer_get_time()/1000;
+        if (!watch_motion_read_latest(&sample) || now-sample.sampled_at_ms>500) {
+            watch_ui_set_motion(false,0,0,0); return;
+        }
+        static uint64_t previous=UINT64_MAX;
+        if (sample.sampled_at_ms==previous) return;
+        previous=sample.sampled_at_ms;
+        watch_ui_set_motion(true,sample.acceleration_x_mps2,sample.acceleration_y_mps2,sample.acceleration_z_mps2);
+    },40,nullptr);
     watch_ui_set_notification_dismiss_callback(dismiss_notification);
     watch_ui_set_security_callbacks(watch_ble_security_confirm, watch_ble_security_forget);
     watch_ui_set_media_callback(watch_ble_media_command);

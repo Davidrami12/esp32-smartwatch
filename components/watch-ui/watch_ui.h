@@ -37,6 +37,9 @@ void watch_ui_set_date(const char *date);
 // Platform UTC clock for offline Madrid Sun & Moon. No network activity here.
 void watch_ui_set_astronomy_time(int64_t utc_seconds, bool valid);
 void watch_ui_set_steps(uint32_t steps);
+// UI-thread only. SI acceleration, fresh sensor data only; false invalidates it.
+void watch_ui_set_motion(bool available, float x_mps2, float y_mps2, float z_mps2);
+void watch_ui_set_motion_demo(bool enabled); // Desktop preview only; never enabled by firmware.
 typedef void (*watch_ui_notification_dismiss_cb_t)(void);
 void watch_ui_set_notification_dismiss_callback(watch_ui_notification_dismiss_cb_t callback);
 void watch_ui_show_notification(const char *app, const char *title, const char *body);
