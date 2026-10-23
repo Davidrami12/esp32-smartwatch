@@ -48,11 +48,6 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
-            val readingPreferences = remember { getSharedPreferences("reading", MODE_PRIVATE) }
-            var largeText by remember { mutableStateOf(readingPreferences.getBoolean("large_text",false)) }
-            val density = androidx.compose.ui.platform.LocalDensity.current
-            CompositionLocalProvider(androidx.compose.ui.platform.LocalDensity provides
-                androidx.compose.ui.unit.Density(density.density,density.fontScale * if (largeText) 1.2f else 1f)) {
             MaterialTheme(colorScheme = darkColorScheme(
                 primary = Color.White, onPrimary = Color.Black,
                 background = Color.Black, surface = Color(0xFF141414),
@@ -112,11 +107,9 @@ class MainActivity : ComponentActivity() {
                     { runCatching { startActivity(Intent(HealthConnectClient.ACTION_HEALTH_CONNECT_SETTINGS)) } },
                     { showActivity = true; model.refreshActivity() },
                      { startActivity(Intent(this, dev.esp32.smartwatch.ai.VoiceAiSettingsActivity::class.java)) },
-                     largeText, { enabled -> largeText = enabled; readingPreferences.edit().putBoolean("large_text",enabled).apply() },
                      { permissions.launch(arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)) }) {
                     startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
                 }
-            }
             }
         }
     }
@@ -133,7 +126,7 @@ private fun SmartwatchScreen(
     healthAutomatic: (Boolean) -> Unit, healthPrivacy: () -> Unit, healthSettings: () -> Unit,
     openActivity: () -> Unit,
     openAi: () -> Unit,
-    largeText: Boolean, setLargeText: (Boolean) -> Unit, requestPermissions: () -> Unit,
+    requestPermissions: () -> Unit,
     appSettings: () -> Unit,
 ) {
     val busy = state.connectionState in listOf(ConnectionState.CONNECTING, ConnectionState.PAIRING, ConnectionState.DISCOVERING_SERVICES, ConnectionState.RECONNECTING)
@@ -144,17 +137,12 @@ private fun SmartwatchScreen(
             item { ReadinessCard(state,permitted,requestPermissions,appSettings,notificationSettings,
                 notificationAllowed,notificationPermission,
                 { if (state.savedWatchAvailable) resumeCompanion() else scan() },openAi) }
-            item {
-                Card(Modifier.fillMaxWidth()) {
-                    Column(Modifier.padding(16.dp)) {
-                        Text("Lectura", style = MaterialTheme.typography.titleMedium)
-                        Text("Amplía el texto de esta pantalla y del panel de actividad. Respeta también el tamaño configurado en Android.")
-                        Switch(checked = largeText,onCheckedChange = setLargeText,
-                            modifier = Modifier.semantics { contentDescription = "Texto ampliado" })
-                    }
-                }
-            }
             item { OutlinedButton(onClick = openActivity, modifier = Modifier.fillMaxWidth()) { Text("Activity dashboard") } }
+            item {
+                val context = androidx.compose.ui.platform.LocalContext.current
+                OutlinedButton(onClick = { context.startActivity(Intent(context, dev.esp32.smartwatch.calendar.CalendarSettingsActivity::class.java)) },
+                    modifier = Modifier.fillMaxWidth()) { Text("Calendar · choose calendars") }
+            }
             item { HealthConnectCard(health, state, healthPermission, syncHealth, healthAutomatic, healthPrivacy, healthSettings) }
             if (!permitted) item {
                 Text("Nearby devices permission is required to find and connect to your watch. Location is not used.")

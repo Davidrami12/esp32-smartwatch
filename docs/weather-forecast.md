@@ -1,11 +1,22 @@
 # Madrid seven-day weather
 
-Apps → WEATHER and a tap on Home's Madrid card both open the same seven-row forecast.
-Rows show TODAY or weekday with DD/MM, the existing condition icon, and high / low °C.
-Back/right-swipe returns to Apps. Weather data attribution appears beneath the list.
+Apps → WEATHER and Home's Madrid card open a portrait dashboard inspired by
+[app-pixels Weather v1.0.1](https://github.com/app-pixels/weather/tree/v1.0.1).
+It shows current temperature/condition, wind (km/h + direction), humidity and
+precipitation, followed by three daily summaries: condition icon, MAX and MIN
+temperatures in Celsius. No hours or hourly precipitation appear in the grid.
+RAIN 1h is the hourly forecast ending at the next full hour, not a rolling
+60-minute total. Zero precipitation remains visible; missing values show --.
+
+Tap the forecast grid for the original seven-row high/low view. Back there returns
+to the dashboard; Back on the dashboard returns to Apps. Attribution and freshness
+remain visible. The app-pixels MIT notice is in
+`docs/third-party/app-pixels-weather-LICENSE.txt`. This is a native LVGL adaptation;
+no SD setup, rotation, button remapping, insecure TLS, or Arduino app is installed.
 
 Firmware networking remains solely in `watch_weather.cpp`. Open-Meteo's documented
-`/v1/forecast` endpoint now requests current weather plus daily `weather_code`,
+`/v1/forecast` endpoint requests current temperature, humidity, wind speed/direction
+and weather code; hourly temperature, precipitation and code; plus daily `weather_code`,
 `temperature_2m_max`, `temperature_2m_min`, and `wind_speed_10m_max`, with
 `timezone=Europe/Madrid` and `forecast_days=7`. This means **today plus six days**.
 No API key or secret is required for the current free noncommercial endpoint.
@@ -14,7 +25,8 @@ Review licensing/commercial service terms before distributing commercially.
 
 The existing background worker, verified HTTPS certificate bundle, 30-minute success
 refresh, and five-minute retry/reconnect rate limit are retained. No request runs on a
-UI callback and forecast updates never wake the display. Response is bounded to 4096 bytes;
+UI callback and forecast updates never wake the display. Response is bounded to 16384 bytes
+on the heap, with at most 200 hourly entries and nine retained display slots;
 overflow, HTTP errors, malformed JSON, invalid dates, numbers/nulls or array lengths reject
 the new forecast and retain the last successful RAM-only cache. Worker stack is 12KiB
 to accommodate the larger response. Cache snapshots use the existing critical section.
@@ -37,6 +49,12 @@ DMA/internal-only allocations. A 256-byte preference threshold still starved the
 bounce buffer during the first hardware test. This can modestly increase PSRAM access
 latency; timing and peripheral buffers retain their explicit internal-capability policies.
 
-Physical checks: both entry points, seven-row fit, date/temperature legibility, icon clarity,
+Hourly slots are matched by Madrid ISO calendar date and hour, not array offsets.
+Platform snapshots remap slots after midnight; old dates are not relabeled today.
+Current values from the preceding date are hidden until a new fetch. Independent
+daily/current caches remain usable if dashboard validation fails.
+
+Physical checks: both entry points, dashboard/grid legibility, tap grid for seven days,
+zero vs missing precipitation, icon clarity,
 Back/swipe, disconnected cached state, network recovery, midnight slot reconciliation,
 and display timeout/wake preservation. Existing local time tools/steps must remain working.

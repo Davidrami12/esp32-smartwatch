@@ -1,5 +1,29 @@
 # Android companion — secure background BLE, controls, notifications and media
 
+## Read-only calendar
+
+Open **Calendar · choose calendars**, grant read-only calendar permission, select
+synced calendars, then enable sharing. The watch's **Apps → CALENDAR** (first tile)
+opens a month grid with your calendar/event colours, month
+arrows, Today shortcut and tappable dates. Tap the month heading for the weekly agenda.
+Weekends and imported Spain/Madrid holiday dates use pale blue-grey digits on black cells. Source
+calendars are suggested by name; each selected calendar's **Holiday calendar**
+checkbox can override this for custom imports. The small footer shows **Last refresh**.
+Only selected event titles, times, locations and display colours go
+over secure BLE; no calendar API key, AI/backend call or calendar write is needed.
+Weeks use Madrid time, handle recurring/all-day events and cache six viewed
+weeks in watch RAM. Sharing is off and calendar selection empty by default.
+See [calendar documentation](../../docs/calendar.md) for limits, privacy and tests.
+
+The selector also lists local calendars with synchronization disabled (cached data
+only). For cloud-only calendars, birthdays and Tasks, use **Connect Google · Calendar
++ Tasks** in the same page, approve read-only access and select sources separately.
+No Google source is shared automatically. Dated pending tasks appear without an
+invented scheduled hour; undated tasks cannot be placed on the watch calendar.
+An Android OAuth client matching package/signing SHA-1 and enabled Calendar/Tasks
+APIs are required. See [Google agenda setup](../../docs/google-agenda.md). This does
+not reuse or change Mochi/Firebase authentication, call AI, or store OAuth secrets.
+
 ## AI Assistant — deployed Firebase/Cloud Run configuration
 
 - Firebase project: `esp32-smartwatch-511417`.

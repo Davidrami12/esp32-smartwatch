@@ -1,6 +1,7 @@
 #include "watch_ui.h"
 #include "watch_design.h"
 #include "watch_time_tools.h"
+#include "watch_motion_lab.h"
 #include "watch_2048.h"
 #include "watch_voice_feedback.h"
 #include "watch_astronomy.h"
@@ -26,9 +27,12 @@ constexpr uint32_t kWarning = design::Warning;
 constexpr uint32_t kMediaAccent = 0x95D5AE;
 constexpr uint32_t kTimeouts[] = {5000, 10000, 30000, 60000, 0};
 
-enum class WatchScreen { Home, Launcher, Activity, Settings, Wifi, Bluetooth, Brightness, Timeout, Timer, Stopwatch, Weather, Notification, Pairing, ForgetPhone, Media, Game2048, Voice, Astronomy, Planets, Sound, BatterySaver, Hardware };
+enum class WatchScreen { Home, Launcher, Activity, Settings, Wifi, Bluetooth, Brightness, Timeout, Timer, MotionLab, Weather, Notification, Pairing, ForgetPhone, Media, Game2048, Voice, Astronomy, Planets, Sound, BatterySaver, Hardware, WeatherWeek, Calendar, CalendarDetail, CalendarMonth };
 static WatchScreen current_screen = WatchScreen::Home;
-static lv_obj_t *screens[22] = {};
+static lv_obj_t *screens[26] = {};
+static void refresh_calendar(bool force=false);
+static void calendar_month_start();
+static void open_calendar_cb(lv_event_t *);
 static void refresh_battery_saver();
 static bool battery_saver_return=false;
 static lv_obj_t *sound_status, *sound_gain;
@@ -97,8 +101,9 @@ static watch_ui_forecast_day_t forecast_days[7] = {};
 static bool forecast_online = false;
 static uint32_t forecast_age = 0;
 static void render_forecast();
+static void render_weather_dashboard();
 static bool display_active = true;
-static WatchTimeTool countdown, stopwatch;
+static WatchTimeTool countdown;
 static bool pomodoro_break=false;
 static unsigned pomodoro_completed=0;
 static uint64_t pomodoro_duration() { return uint64_t(pomodoro_break ? (pomodoro_completed==4 ? 15 : 5) : 25)*60000; }
@@ -106,7 +111,8 @@ static void pomodoro_next_cb(lv_event_t *);
 static lv_obj_t *timer_value, *timer_status, *timer_action_label;
 static lv_obj_t *pomodoro_progress;
 static lv_obj_t *pomodoro_phase, *pomodoro_sessions[4], *pomodoro_start;
-static lv_obj_t *stopwatch_value, *stopwatch_status, *stopwatch_action_label;
+static void refresh_motion_lab();
+static void motion_icon_draw(lv_event_t *event);
 static void refresh_time_tools();
 static lv_obj_t *time_label, *date_label, *steps_label, *activity_steps_label;
 static lv_obj_t *battery_label, *wifi_status_label, *wifi_detail_label;
@@ -114,7 +120,7 @@ static lv_obj_t *bluetooth_status_label;
 static lv_obj_t *wifi_name_label;
 static lv_obj_t *wifi_signal_label, *launcher_wifi_label;
 static lv_obj_t *wifi_action, *wifi_action_label;
-static lv_obj_t *history_names[7], *history_counts[7];
+static void refresh_activity();
 static lv_obj_t *weather_label, *weather_icon;
 static lv_obj_t *weather_category_label;
 static lv_obj_t *walk_icon;
@@ -189,7 +195,11 @@ static void navigate_to(WatchScreen screen, bool animate = true)
     refresh_astronomy();
     refresh_planets();
     refresh_battery_saver();
-    if (screen == WatchScreen::Weather) render_forecast();
+    refresh_activity();
+    refresh_motion_lab();
+    refresh_calendar(true);
+    if (screen == WatchScreen::Weather) render_weather_dashboard();
+    if (screen == WatchScreen::WeatherWeek) render_forecast();
     if (screen == WatchScreen::Game2048) render_game();
 }
 
@@ -201,7 +211,7 @@ static void open_bluetooth_cb(lv_event_t *) { navigate_to(WatchScreen::Bluetooth
 static void open_brightness_cb(lv_event_t *) { navigate_to(WatchScreen::Brightness); }
 static void open_timeout_cb(lv_event_t *) { navigate_to(WatchScreen::Timeout); }
 static void open_timer_cb(lv_event_t *) { navigate_to(WatchScreen::Timer); }
-static void open_stopwatch_cb(lv_event_t *) { navigate_to(WatchScreen::Stopwatch); }
+static void open_motion_lab_cb(lv_event_t *) { navigate_to(WatchScreen::MotionLab); }
 static void open_weather_cb(lv_event_t *) { navigate_to(WatchScreen::Weather); }
 static void open_astronomy_cb(lv_event_t *) { navigate_to(WatchScreen::Astronomy); }
 static void open_planets_cb(lv_event_t *) { navigate_to(WatchScreen::Planets); }
@@ -246,6 +256,9 @@ static void wifi_action_cb(lv_event_t *)
 }
 static void back_cb(lv_event_t *)
 {
+    if (current_screen==WatchScreen::CalendarDetail) { navigate_to(WatchScreen::Calendar); return; }
+    if (current_screen==WatchScreen::Calendar) { calendar_month_start(); navigate_to(WatchScreen::CalendarMonth); return; }
+    if (current_screen==WatchScreen::WeatherWeek) { navigate_to(WatchScreen::Weather); return; }
     if (current_screen == WatchScreen::Pairing) {
         if (pairing_callback) pairing_callback(pairing_token, false);
         return;
@@ -402,7 +415,9 @@ static uint32_t weather_icon_color(watch_ui_weather_condition_t condition)
 static void weather_draw_cb(lv_event_t *event)
 {
     lv_area_t area;
-    lv_obj_get_coords(static_cast<lv_obj_t *>(lv_event_get_target(event)), &area);
+    auto *object=static_cast<lv_obj_t *>(lv_event_get_target(event));
+    lv_obj_get_coords(object, &area);
+    const int size=lv_obj_get_width(object);
     const auto *day = static_cast<watch_ui_forecast_day_t *>(lv_event_get_user_data(event));
     const auto condition = day ? day->condition : weather_condition;
     const auto color = lv_color_hex(weather_icon_color(condition));
@@ -411,9 +426,9 @@ static void weather_draw_cb(lv_event_t *event)
         lv_draw_line_dsc_t dsc;
         lv_draw_line_dsc_init(&dsc);
         dsc.color = color;
-        dsc.width = design::IconStroke;
-        dsc.p1 = {static_cast<lv_value_precise_t>(area.x1 + x1), static_cast<lv_value_precise_t>(area.y1 + y1)};
-        dsc.p2 = {static_cast<lv_value_precise_t>(area.x1 + x2), static_cast<lv_value_precise_t>(area.y1 + y2)};
+        dsc.width = size>48 ? 3 : size<30 ? 1 : design::IconStroke;
+        dsc.p1 = {static_cast<lv_value_precise_t>(area.x1 + x1*size/36), static_cast<lv_value_precise_t>(area.y1 + y1*size/36)};
+        dsc.p2 = {static_cast<lv_value_precise_t>(area.x1 + x2*size/36), static_cast<lv_value_precise_t>(area.y1 + y2*size/36)};
         lv_draw_line(layer, &dsc);
     };
     auto disc = [&](int x, int y, int width, int height) {
@@ -421,7 +436,8 @@ static void weather_draw_cb(lv_event_t *event)
         lv_draw_rect_dsc_init(&dsc);
         dsc.bg_color = color;
         dsc.radius = LV_RADIUS_CIRCLE;
-        lv_area_t box = {area.x1 + x, area.y1 + y, area.x1 + x + width - 1, area.y1 + y + height - 1};
+        lv_area_t box = {area.x1 + x*size/36, area.y1 + y*size/36,
+            area.x1 + (x+width)*size/36-1, area.y1 + (y+height)*size/36-1};
         lv_draw_rect(layer, &dsc, &box);
     };
     if (condition == WATCH_UI_WEATHER_SUNNY) {
@@ -633,17 +649,28 @@ static void tomato_icon(lv_obj_t *parent,lv_align_t align,int x,int y)
     lv_obj_remove_flag(icon,LV_OBJ_FLAG_CLICKABLE); lv_obj_remove_flag(icon,LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(icon,tomato_draw_cb,LV_EVENT_DRAW_MAIN,nullptr);
 }
+#ifdef ESP_PLATFORM
+#include "esp_heap_caps.h"
+#endif
+#include "watch_calendar_ui.inc"
+
 static void create_launcher_screen()
 {
     lv_obj_t *screen = create_screen(WatchScreen::Launcher, "Apps");
-    lv_obj_t *activity = launcher_tile(screen, "ACTIVITY", "", -118, 92, design::Activity, open_activity_cb);
-    lv_obj_t *activity_icon = footprints_icon(activity, 36, design::Activity);
-    lv_obj_align(activity_icon, LV_ALIGN_TOP_MID, 0, 26);
+    auto *calendar=launcher_tile(screen,"CALENDAR","",0,202,0xA8C5DA,open_calendar_cb);
+    auto *calendar_icon=lv_obj_create(calendar); lv_obj_remove_style_all(calendar_icon);
+    lv_obj_set_size(calendar_icon,40,40); lv_obj_align(calendar_icon,LV_ALIGN_TOP_MID,0,20);
+    lv_obj_remove_flag(calendar_icon,static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_CLICKABLE|LV_OBJ_FLAG_SCROLLABLE));
+    lv_obj_add_event_cb(calendar_icon,calendar_icon_draw,LV_EVENT_DRAW_MAIN,nullptr);
     auto *pomodoro_tile=launcher_tile(screen, "POMODORO", "", 0, 92, 0xEE594E, open_timer_cb);
     tomato_icon(pomodoro_tile,LV_ALIGN_TOP_MID,0,20);
-    launcher_tile(screen, "STOPWATCH", LV_SYMBOL_PLAY, 118, 92, design::Stopwatch, open_stopwatch_cb);
-    lv_obj_t *weather = launcher_tile(screen, "WEATHER", "", -118, 202, design::Weather, open_weather_cb);
-    launcher_tile(screen, "MEDIA", LV_SYMBOL_AUDIO, 0, 202, kMediaAccent, open_media_cb);
+    auto *motion_tile=launcher_tile(screen, "MOTION LAB", "", 118, 92, 0x6EDFD1, open_motion_lab_cb);
+    auto *motion_icon=lv_obj_create(motion_tile); lv_obj_remove_style_all(motion_icon);
+    lv_obj_set_size(motion_icon,40,40); lv_obj_align(motion_icon,LV_ALIGN_TOP_MID,0,22);
+    lv_obj_remove_flag(motion_icon,LV_OBJ_FLAG_CLICKABLE); lv_obj_remove_flag(motion_icon,LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(motion_icon,motion_icon_draw,LV_EVENT_DRAW_MAIN,nullptr);
+    lv_obj_t *weather = launcher_tile(screen, "WEATHER", "", -118, 92, design::Weather, open_weather_cb);
+    auto *media=launcher_tile(screen, "MEDIA", LV_SYMBOL_AUDIO, -118, 202, kMediaAccent, open_media_cb);
     auto *game = launcher_tile(screen, "2048", "", 118, 202, design::Activity, open_game_cb);
     auto *ai = launcher_tile(screen, "AI ASSISTANT", "", 118, 312, design::Timeout, open_voice_cb);
     lv_label_set_text(lv_obj_get_child(ai,0),"AI ASSISTANT");
@@ -687,11 +714,21 @@ static void create_launcher_screen()
     lv_obj_remove_flag(icon, LV_OBJ_FLAG_SCROLLABLE);
     static watch_ui_forecast_day_t sunny = {true, 0, 0, 0, 0, WATCH_UI_WEATHER_SUNNY};
     lv_obj_add_event_cb(icon, weather_draw_cb, LV_EVENT_DRAW_MAIN, &sunny);
+    // App grid keeps the heading and Back fixed.
+    auto *grid=lv_obj_create(screen); lv_obj_remove_style_all(grid);
+    lv_obj_set_size(grid,410,328); lv_obj_set_pos(grid,0,84);
+    lv_obj_set_scroll_dir(grid,LV_DIR_VER); lv_obj_set_scrollbar_mode(grid,LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_style_bg_color(grid,lv_color_hex(design::Bluetooth),LV_PART_SCROLLBAR);
+    lv_obj_update_layout(screen);
+    for (auto *tile : {calendar,pomodoro_tile,motion_tile,weather,media,game,ai,astronomy_tile,planets_tile}) {
+        const int y=lv_obj_get_y(tile)-84;
+        lv_obj_set_parent(tile,grid); lv_obj_set_y(tile,y);
+    }
 }
 
 static void create_forecast_screen()
 {
-    lv_obj_t *screen = create_screen(WatchScreen::Weather, "Madrid weather");
+    lv_obj_t *screen = create_screen(WatchScreen::WeatherWeek, "7-day forecast");
     forecast_status = label(screen, "Forecast unavailable", design::caption(), kMuted, LV_ALIGN_TOP_MID, 0, 82);
     label(screen, "7 DAYS / HIGH - LOW / \xC2\xB0" "C", design::caption(), kMuted, LV_ALIGN_TOP_MID, 0, 108);
     for (unsigned i = 0; i < 7; ++i) {
@@ -736,6 +773,8 @@ static void render_forecast()
         }
     }
 }
+
+#include "watch_weather_dashboard_ui.inc"
 
 static void refresh_sound_volume()
 {
@@ -927,27 +966,7 @@ static void create_bluetooth_screen()
     lv_obj_add_state(forget_phone_button, LV_STATE_DISABLED);
 }
 
-static void create_activity_screen()
-{
-    lv_obj_t *screen = create_screen(WatchScreen::Activity, "Activity");
-    label(screen, "TODAY / STEPS", design::caption(), kMuted,
-          LV_ALIGN_TOP_LEFT, design::Margin, 78);
-    activity_steps_label = label(screen, "0", design::number(), design::Activity,
-                                 LV_ALIGN_TOP_LEFT, design::Margin, design::ActivityCountY);
-    goal_minus = button(screen, "-", 56, 56, LV_ALIGN_TOP_LEFT, design::Margin, 150, step_goal_changed_cb);
-    activity_goal_label = label(screen, "Goal 8,000", design::caption(), kMuted, LV_ALIGN_TOP_MID, 0, 174);
-    goal_plus = button(screen, "+", 56, 56, LV_ALIGN_TOP_RIGHT, -design::Margin, 150, step_goal_changed_cb);
-    label(screen, "7 DAYS / LOCAL", design::caption(), kMuted,
-          LV_ALIGN_TOP_LEFT, design::Margin, 218);
-    for (unsigned i = 0; i < 7; ++i) {
-        const int y = 242 + i * 24;
-        history_names[i] = label(screen, "--", &lv_font_montserrat_18, i ? kMuted : kWhite,
-                                 LV_ALIGN_TOP_LEFT, 44, y);
-        history_counts[i] = label(screen, "0", &lv_font_montserrat_20, i ? kWhite : design::Activity,
-                                   LV_ALIGN_TOP_RIGHT, -44, y);
-    }
-    refresh_step_goal();
-}
+#include "watch_activity_ui.inc"
 
 static void create_wifi_screen()
 {
@@ -1117,16 +1136,6 @@ static void create_settings_screen()
     lv_obj_add_event_cb(screen_timeout_dropdown, timeout_changed_cb, LV_EVENT_VALUE_CHANGED, nullptr);
 }
 
-static void format_elapsed(char *text, unsigned size, uint64_t ms, bool fractions)
-{
-    const uint64_t seconds = ms / 1000;
-    if (fractions) snprintf(text, size, "%02llu:%02llu:%02llu.%01llu",
-        (unsigned long long)(seconds / 3600), (unsigned long long)(seconds / 60 % 60),
-        (unsigned long long)(seconds % 60), (unsigned long long)(ms / 100 % 10));
-    else snprintf(text, size, "%02llu:%02llu:%02llu", (unsigned long long)(seconds / 3600),
-        (unsigned long long)(seconds / 60 % 60), (unsigned long long)(seconds % 60));
-}
-
 static void refresh_time_tools()
 {
     if (!display_active) return;
@@ -1152,25 +1161,18 @@ static void refresh_time_tools()
         }
         lv_label_set_text(timer_action_label, finished ? "START NEXT" : countdown.running ? "PAUSE" : countdown.elapsed_ms ? "RESUME" : "START");
     }
-    if (current_screen == WatchScreen::Stopwatch && stopwatch_value) {
-        format_elapsed(text, sizeof(text), stopwatch.elapsed_ms, true);
-        lv_label_set_text(stopwatch_value, text);
-        lv_label_set_text(stopwatch_status, stopwatch.running ? "RUNNING" : stopwatch.elapsed_ms ? "PAUSED" : "READY");
-        lv_label_set_text(stopwatch_action_label, stopwatch.running ? "PAUSE" : stopwatch.elapsed_ms ? "RESUME" : "START");
-    }
 }
 
 static void time_tools_tick(lv_timer_t *)
 {
     const uint32_t now = lv_tick_get();
-    countdown.advance(now); stopwatch.advance(now);
+    countdown.advance(now);
     const uint64_t duration = pomodoro_duration();
     const bool finished_now = countdown.running && countdown.elapsed_ms >= duration;
     if (countdown.elapsed_ms >= duration) { countdown.elapsed_ms = duration; countdown.running = false; }
     static uint64_t last_timer_second = UINT64_MAX;
     const uint64_t timer_second = countdown.elapsed_ms / 1000;
-    if (display_active && ((current_screen == WatchScreen::Stopwatch && stopwatch.running) ||
-        (current_screen == WatchScreen::Timer && (finished_now || last_timer_second != timer_second)))) refresh_time_tools();
+    if (display_active && current_screen == WatchScreen::Timer && (finished_now || last_timer_second != timer_second)) refresh_time_tools();
     last_timer_second = timer_second;
 }
 
@@ -1189,8 +1191,6 @@ static void pomodoro_next_cb(lv_event_t *)
     countdown.reset(lv_tick_get());
     refresh_time_tools();
 }
-static void stopwatch_control_cb(lv_event_t *) { stopwatch.toggle(lv_tick_get()); refresh_time_tools(); }
-static void stopwatch_reset_cb(lv_event_t *) { stopwatch.reset(lv_tick_get()); refresh_time_tools(); }
 
 static void create_time_tools()
 {
@@ -1232,14 +1232,7 @@ static void create_time_tools()
     button(screen, "RESET", 144, 56, LV_ALIGN_TOP_MID, -80, 358, timer_reset_cb);
     button(screen,"SKIP PHASE",144,56,LV_ALIGN_TOP_MID,80,358,pomodoro_next_cb);
 
-    screen = create_screen(WatchScreen::Stopwatch, "Stopwatch");
-    stopwatch_status = label(screen, "READY", design::caption(), kMuted, LV_ALIGN_TOP_MID, 0, 116);
-    stopwatch_value = label(screen, "00:00:00.0", &lv_font_montserrat_26, kWhite, LV_ALIGN_TOP_MID, 0, 182);
-    action = button(screen, "START", 148, 56, LV_ALIGN_TOP_MID, -84, 290, stopwatch_control_cb);
-    stopwatch_action_label = lv_obj_get_child(action, 0);
-    button(screen, "RESET", 148, 56, LV_ALIGN_TOP_MID, 84, 290, stopwatch_reset_cb);
-    label(screen, "CONTINUES WHILE SCREEN IS OFF", design::caption(), kMuted, LV_ALIGN_TOP_MID, 0, 378);
-    countdown.reset(lv_tick_get()); stopwatch.reset(lv_tick_get());
+    countdown.reset(lv_tick_get());
     lv_timer_create(time_tools_tick, 100, nullptr);
 }
 
@@ -1698,6 +1691,7 @@ static void create_media_screen()
     label(screen, LV_SYMBOL_VOLUME_MID "  VOLUME", design::caption(), kMuted, LV_ALIGN_TOP_MID, 0, 364);
     watch_ui_set_media(0, 0, 0, "", "");
 }
+#include "watch_motion_lab_ui.inc"
 } // namespace
 
 void watch_ui_create(void)
@@ -1713,7 +1707,10 @@ void watch_ui_create(void)
     create_wifi_screen();
     create_bluetooth_screen();
     create_time_tools();
+    create_motion_lab_screen();
     create_forecast_screen();
+    create_calendar_screens();
+    create_weather_dashboard();
     create_notification_screen();
     create_security_screens();
     create_media_screen();
@@ -1725,18 +1722,30 @@ void watch_ui_create(void)
     current_screen = WatchScreen::Home;
 }
 
+void watch_ui_set_motion(bool available,float x,float y,float z)
+{
+    if (!available) motion_lab.valid=false;
+    else motion_lab.sample(x,y,z,lv_tick_get());
+}
+void watch_ui_set_motion_demo(bool enabled) { motion_demo=enabled; motion_lab.valid=false; }
+
 void watch_ui_set_display_active(bool active)
 {
     const bool changed = display_active != active;
     display_active = active;
+    refresh_motion_lab();
     if (changed && active) refresh_astronomy();
     if (changed && active) refresh_planets();
     if (changed && active) refresh_battery_saver();
+    if (changed && active) refresh_activity();
+    if (changed && active) refresh_calendar(true);
     refresh_voice_face();
     if (changed && !active && current_screen == WatchScreen::Voice) cancel_voice();
     if (changed && !active) save_game_best(true);
     refresh_media_record();
     if (changed && active) {
+        if (current_screen==WatchScreen::Weather) render_weather_dashboard();
+        if (current_screen==WatchScreen::WeatherWeek) render_forecast();
         time_tools_tick(nullptr);
         refresh_time_tools(); // IDLE may have consumed the last changed second without drawing.
     }
@@ -1804,6 +1813,7 @@ void watch_ui_set_astronomy_time(int64_t utc_seconds, bool valid)
     const bool changed = astronomy_clock_valid != valid || astronomy_utc/60 != utc_seconds/60;
     astronomy_utc = utc_seconds; astronomy_clock_valid = valid;
     if (changed) refresh_astronomy();
+    if (changed) refresh_calendar();
     // Static orbital map: refreshed on entry/wake, not each clock tick.
     if (planet_clock_changed) refresh_planets();
 }
@@ -2007,7 +2017,7 @@ void watch_ui_set_steps(uint32_t steps)
     }
     text[out] = '\0';
     if (steps_label) lv_obj_set_style_text_font(steps_label, steps >= 1000000 ? design::body() : &lv_font_montserrat_26, 0);
-    if (activity_steps_label) lv_obj_set_style_text_font(activity_steps_label, steps >= 1000000 ? design::title() : design::number(), 0);
+    if (activity_steps_label) lv_obj_set_style_text_font(activity_steps_label, steps >= 1000000 ? &lv_font_montserrat_14 : steps >= 100000 ? design::body() : &lv_font_montserrat_26, 0);
     if (steps_label != nullptr) lv_label_set_text(steps_label, text);
     if (activity_steps_label != nullptr) lv_label_set_text(activity_steps_label, text);
     refresh_step_goal();
@@ -2033,6 +2043,7 @@ static void refresh_step_goal()
         if (daily_step_goal == 30000) lv_obj_add_state(goal_plus, LV_STATE_DISABLED);
         else lv_obj_remove_state(goal_plus, LV_STATE_DISABLED);
     }
+    refresh_activity();
 }
 
 } // namespace
@@ -2100,6 +2111,7 @@ void watch_ui_set_bluetooth_state(watch_ui_bluetooth_state_t state)
 {
     bluetooth_state = state;
     refresh_battery_saver();
+    refresh_calendar();
     const char *text = state == WATCH_UI_BLUETOOTH_DISABLED ? "DISABLED" :
                        state == WATCH_UI_BLUETOOTH_CONNECTED ? "CONNECTED" : "AVAILABLE";
     const uint32_t color = state == WATCH_UI_BLUETOOTH_DISABLED ? kMuted : design::Bluetooth;
@@ -2157,25 +2169,58 @@ void watch_ui_set_forecast(const watch_ui_forecast_day_t days[7], bool online, u
             forecast_days[0].high_c, forecast_days[0].low_c);
         else lv_label_set_text(weather_range_label, "H -- / L --");
     }
-    if (display_active && current_screen == WatchScreen::Weather) render_forecast();
+    if (display_active && current_screen == WatchScreen::WeatherWeek) render_forecast();
+    if (display_active && current_screen == WatchScreen::Weather) render_weather_dashboard();
+}
+
+void watch_ui_set_weather_dashboard(const watch_weather_dashboard_t *data,bool online,uint32_t age_minutes)
+{
+    weather_dashboard=data ? *data : watch_weather_dashboard_t{};
+    weather_dashboard_online=online; weather_dashboard_age=age_minutes;
+    if (display_active && current_screen==WatchScreen::Weather) render_weather_dashboard();
 }
 
 void watch_ui_set_history(const watch_ui_activity_day_t days[7])
 {
-    static const char *weekdays[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
-    for (unsigned i = 0; i < 7; ++i) {
-        if (!history_names[i]) return;
-        if (!days) {
-            lv_label_set_text(history_names[i], "--");
-            lv_label_set_text(history_counts[i], "--");
-        } else {
-            char day[4];
-            snprintf(day, sizeof(day), "%.3s", weekdays[days[i].weekday % 7]);
-            for (char *p = day; *p; ++p) *p = static_cast<char>(toupper(static_cast<unsigned char>(*p)));
-            lv_label_set_text_fmt(history_names[i], "%s%s", day, i == 0 ? " / TODAY" : "");
-            lv_label_set_text_fmt(history_counts[i], "%lu", static_cast<unsigned long>(days[i].steps));
-        }
+    activity_history_valid=days!=nullptr;
+    if (days) memcpy(activity_history,days,sizeof(activity_history));
+    refresh_activity();
+}
+
+void watch_ui_set_calendar_request_callback(watch_ui_calendar_request_cb_t callback) { calendar_request_cb=callback; }
+void watch_ui_clear_calendar(void)
+{
+    memset(calendar_cache,0,sizeof(calendar_cache)); calendar_cache_next=0;
+    calendar_pending=false; calendar_dirty=true; calendar_failed=false;
+    calendar_month_sync=false; calendar_month_requested=0;
+    calendar_month_invalidated=true;
+    if (calendar_detail_text) lv_label_set_text(calendar_detail_text,"");
+    if (current_screen==WatchScreen::CalendarDetail) navigate_to(WatchScreen::Calendar);
+    refresh_calendar();
+}
+void watch_ui_set_calendar_week(const watch_calendar_week_t *week)
+{
+    if (!week || !watch_calendar_valid_date(week->monday) || watch_calendar_monday(week->monday)!=week->monday ||
+        week->count>WATCH_CALENDAR_MAX_EVENTS || week->status>CalendarGoogleAuth) return;
+    if (week->status==CalendarOff || week->status==CalendarPermission || week->status==CalendarNoSelection || week->status==CalendarGoogleAuth) watch_ui_clear_calendar();
+    const auto *existing=calendar_find_week(week->monday);
+    if (week->status==CalendarError && existing && existing->status==CalendarReady) {
+        calendar_pending=false; calendar_failed=true; calendar_month_failed=true;
+        calendar_month_sync=false; refresh_calendar(); return;
     }
+    unsigned slot=6;
+    for (unsigned i=0;i<6;++i) if (calendar_cache[i].monday==week->monday) slot=i;
+    if (slot==6) { slot=calendar_cache_next; calendar_cache_next=(calendar_cache_next+1)%6; }
+    calendar_cache[slot]=*week;
+    if (week->monday==calendar_selected_week) { calendar_pending=false; calendar_dirty=true; }
+    if (calendar_month_sync && week->monday==calendar_month_requested) {
+        calendar_pending=false;
+        if (week->status!=CalendarReady) calendar_month_sync=false;
+    }
+    if (calendar_month_invalidated && week->status==CalendarReady && current_screen==WatchScreen::CalendarMonth) {
+        calendar_month_invalidated=false; calendar_month_start();
+    }
+    refresh_calendar();
 }
 
 void watch_ui_set_battery(int percentage, bool charging)

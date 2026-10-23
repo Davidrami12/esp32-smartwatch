@@ -54,6 +54,24 @@
 
 #if LV_USE_OS != LV_OS_FREERTOS
 
+static void calendar_demo_request(uint32_t monday)
+{
+    watch_calendar_week_t week={0}; week.monday=monday; week.fetched_at=(uint32_t)time(NULL);
+    week.count=3;
+    week.events[0].color=0x4285F4; week.events[1].color=0xF6BF26; week.events[2].color=0xD50000;
+    week.holiday_days=4; // Explicit demo holiday, not an actual Spain/Madrid date.
+    week.events[0].days=1; snprintf(week.events[0].title,sizeof(week.events[0].title),"DEMO / Weekly planning");
+    snprintf(week.events[0].location,sizeof(week.events[0].location),"Meeting room");
+    snprintf(week.events[0].time,sizeof(week.events[0].time),"09:00 - 09:30");
+    week.events[1].days=4; week.events[1].all_day=true;
+    snprintf(week.events[1].title,sizeof(week.events[1].title),"DEMO / Holiday");
+    snprintf(week.events[1].time,sizeof(week.events[1].time),"All day");
+    week.events[2].days=96;
+    snprintf(week.events[2].title,sizeof(week.events[2].title),"DEMO / Weekend trip");
+    snprintf(week.events[2].time,sizeof(week.events[2].time),"Multi-day event");
+    watch_ui_set_calendar_week(&week);
+}
+
 static void brightness_changed(uint8_t brightness)
 {
     printf(
@@ -106,6 +124,7 @@ static void update_clock_cb(lv_timer_t *timer)
 static watch_ui_wifi_state_t mock_wifi = WATCH_UI_WIFI_CONNECTED;
 static unsigned mock_connect_ticks = 0;
 static watch_ui_forecast_day_t mock_forecast[7];
+static watch_weather_dashboard_t mock_dashboard;
 static watch_ui_bluetooth_state_t mock_bluetooth = WATCH_UI_BLUETOOTH_ADVERTISING;
 static bool mock_bluetooth_control(bool enabled)
 {
@@ -128,6 +147,7 @@ static void update_mock_wifi_cb(lv_timer_t *timer)
     if (mock_wifi == WATCH_UI_WIFI_CONNECTING && ++mock_connect_ticks >= 3) mock_wifi = WATCH_UI_WIFI_CONNECTED;
     watch_ui_set_wifi_state(mock_wifi, mock_wifi == WATCH_UI_WIFI_CONNECTED ? -65 : 0);
     watch_ui_set_forecast(mock_forecast, mock_wifi == WATCH_UI_WIFI_CONNECTED, 12);
+    watch_ui_set_weather_dashboard(&mock_dashboard,mock_wifi==WATCH_UI_WIFI_CONNECTED,12);
     watch_ui_set_wifi_name(mock_wifi == WATCH_UI_WIFI_CONNECTED ? "Simulator Wi-Fi" : "");
     watch_ui_set_bluetooth_state(mock_bluetooth);
 }
@@ -144,6 +164,7 @@ int main(int argc, char **argv)
   sdl_hal_init(410, 502);
 
   watch_ui_create();
+  watch_ui_set_motion_demo(true);
   // Same game module as firmware; simulator best stays process-local (no NVS).
   watch_ui_configure_2048(0, (uint32_t)time(NULL), NULL);
 
@@ -165,6 +186,7 @@ int main(int argc, char **argv)
   watch_ui_set_wifi_state(WATCH_UI_WIFI_CONNECTED, -65);
   lv_timer_create(update_mock_wifi_cb, 1000, NULL);
   watch_ui_set_weather(true, 24, WATCH_UI_WEATHER_SUNNY);
+  watch_ui_set_calendar_request_callback(calendar_demo_request);
   {
     time_t now = time(NULL);
     struct tm day;
@@ -186,6 +208,17 @@ int main(int argc, char **argv)
       ++day.tm_mday;
     }
     watch_ui_set_forecast(mock_forecast, true, 12);
+    mock_dashboard.available=true; mock_dashboard.rain_available=true;
+    mock_dashboard.observation_date=mock_forecast[0].date;
+    mock_dashboard.temperature_c=24; mock_dashboard.wind_kmh=8; mock_dashboard.wind_degrees=180;
+    mock_dashboard.humidity_percent=65; mock_dashboard.rain_mm=0;
+    for (unsigned d=0;d<3;++d) for (unsigned h=0;h<3;++h) {
+      watch_weather_slot_t *slot=&mock_dashboard.slots[d*3+h];
+      slot->available=true; slot->date=mock_forecast[d].date; slot->hour=(uint8_t)(8+h*6);
+      slot->temperature_c=14+d*2+(h==1 ? 7 : 0); slot->precipitation_mm=d==2 ? .6f : 0;
+      slot->condition=(uint8_t)(d==2 ? WATCH_UI_WEATHER_RAIN : WATCH_UI_WEATHER_SUNNY);
+    }
+    watch_ui_set_weather_dashboard(&mock_dashboard,true,12);
   }
   {
     const uint32_t counts[7] = {5421, 8140, 0, 7283, 4612, 0, 9050};

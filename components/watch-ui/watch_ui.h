@@ -3,10 +3,17 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "lvgl.h"
+#include "watch_calendar.h"
+#include "watch_weather_dashboard.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+typedef void (*watch_ui_calendar_request_cb_t)(uint32_t monday);
+void watch_ui_set_calendar_request_callback(watch_ui_calendar_request_cb_t callback);
+void watch_ui_set_calendar_week(const watch_calendar_week_t *week);
+void watch_ui_clear_calendar(void);
 
 typedef void (*watch_ui_brightness_cb_t)(uint8_t brightness);
 typedef void (*watch_ui_brightness_committed_cb_t)(uint8_t brightness);
@@ -37,6 +44,9 @@ void watch_ui_set_date(const char *date);
 // Platform UTC clock for offline Madrid Sun & Moon. No network activity here.
 void watch_ui_set_astronomy_time(int64_t utc_seconds, bool valid);
 void watch_ui_set_steps(uint32_t steps);
+// UI-thread only. SI acceleration, fresh sensor data only; false invalidates it.
+void watch_ui_set_motion(bool available, float x_mps2, float y_mps2, float z_mps2);
+void watch_ui_set_motion_demo(bool enabled); // Desktop preview only; never enabled by firmware.
 typedef void (*watch_ui_notification_dismiss_cb_t)(void);
 void watch_ui_set_notification_dismiss_callback(watch_ui_notification_dismiss_cb_t callback);
 void watch_ui_show_notification(const char *app, const char *title, const char *body);
@@ -99,6 +109,7 @@ typedef struct {
 } watch_ui_forecast_day_t;
 // Seven local-calendar slots including today. NULL means no data.
 void watch_ui_set_forecast(const watch_ui_forecast_day_t days[7], bool online, uint32_t age_minutes);
+void watch_ui_set_weather_dashboard(const watch_weather_dashboard_t *data,bool online,uint32_t age_minutes);
 typedef struct { uint32_t steps; uint8_t weekday; } watch_ui_activity_day_t;
 // Seven newest-first calendar rows supplied by firmware; NULL means date unavailable.
 void watch_ui_set_history(const watch_ui_activity_day_t days[7]);

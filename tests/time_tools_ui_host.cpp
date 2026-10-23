@@ -10,6 +10,83 @@
 #include "../components/watch-ui/watch_voice_result.h"
 #include "../components/watch-ui/watch_touch_gate.h"
 
+static void calendar_protocol_tests()
+{
+    assert(watch_calendar_valid_date(20240229));
+    assert(!watch_calendar_valid_date(20260229));
+    assert(!watch_calendar_valid_date(20261301));
+    assert(watch_calendar_monday(20261025)==20261019);
+    assert(watch_calendar_monday(20270101)==20261228);
+    assert(watch_calendar_date(watch_calendar_day(20261228)+7)==20270104);
+    assert(watch_calendar_crc(reinterpret_cast<const uint8_t *>("123456789"),9)==0xCBF43926u);
+    std::vector<uint8_t> payload={0,1,0,0,0,0,0,0,1,0,7,6,5};
+    for (const char *s : {"Meeting","Madrid","09:00"}) payload.insert(payload.end(),s,s+strlen(s));
+    auto seal=[](std::vector<uint8_t> p) {
+        const uint32_t crc=watch_calendar_crc(p.data(),p.size());
+        for (unsigned i=0;i<4;++i) p.push_back(uint8_t(crc>>(8*i))); return p;
+    };
+    auto frame=[](const std::vector<uint8_t> &p,unsigned offset,uint32_t id=41) {
+        std::vector<uint8_t> f={1,1,uint8_t(id),uint8_t(id>>8),uint8_t(id>>16),uint8_t(id>>24),uint8_t(offset),uint8_t(offset>>8),uint8_t(p.size()),uint8_t(p.size()>>8)};
+        const size_t end=offset+10<p.size() ? offset+10 : p.size();
+        f.insert(f.end(),p.begin()+offset,p.begin()+end); return f;
+    };
+    const auto valid=seal(payload);
+    WatchCalendarReceiver receiver; watch_calendar_week_t result={};
+    receiver.select(41,20261019);
+    auto stale=frame(valid,0,42); assert(!receiver.accept(stale.data(),stale.size(),result));
+    auto gap=frame(valid,10); assert(!receiver.accept(gap.data(),gap.size(),result));
+    for (unsigned offset=0;offset<valid.size();offset+=10) {
+        const auto f=frame(valid,offset); assert(receiver.accept(f.data(),f.size(),result));
+        if (offset+10<valid.size()) assert(result.monday==0);
+    }
+    assert(result.monday==20261019 && result.count==1 && !strcmp(result.events[0].title,"Meeting"));
+    auto corrupt=valid; corrupt[13]^=1;
+    receiver.select(41,20261019);
+    for (unsigned offset=0;offset<corrupt.size();offset+=10) {
+        const auto f=frame(corrupt,offset);
+        assert(receiver.accept(f.data(),f.size(),result)==(offset+10<corrupt.size()));
+    }
+    payload[13]=0xc0; const auto bad_utf8=seal(payload);
+    receiver.select(41,20261019);
+    for (unsigned offset=0;offset<bad_utf8.size();offset+=10) {
+        const auto f=frame(bad_utf8,offset);
+        assert(receiver.accept(f.data(),f.size(),result)==(offset+10<bad_utf8.size()));
+    }
+    receiver.reset(); assert(receiver.used==0 && receiver.bytes[13]==0);
+    auto oversized=frame(valid,0); oversized[8]=0xff; oversized[9]=0xff;
+    assert(!receiver.accept(oversized.data(),oversized.size(),result));
+    receiver.select(42,20261026);
+    auto old=frame(valid,0); assert(!receiver.accept(old.data(),old.size(),result));
+    payload[13]='M'; payload[3]=1;
+    payload.insert(payload.begin()+13,{0x34,0xab,0x12});
+    const auto colored=seal(payload);
+    receiver.select(41,20261019);
+    for (unsigned offset=0;offset<colored.size();offset+=10) {
+        const auto f=frame(colored,offset); assert(receiver.accept(f.data(),f.size(),result));
+    }
+    assert(result.events[0].color==0x12ab34 && !strcmp(result.events[0].title,"Meeting"));
+    payload[3]=2; payload.insert(payload.begin()+8,0x45);
+    const auto holidays=seal(payload);
+    receiver.select(41,20261019);
+    for (unsigned offset=0;offset<holidays.size();offset+=10) {
+        const auto f=frame(holidays,offset); assert(receiver.accept(f.data(),f.size(),result));
+    }
+    assert(result.holiday_days==0x45 && result.events[0].color==0x12ab34);
+    payload[8]=128;
+    const auto invalid_holidays=seal(payload);
+    receiver.select(41,20261019);
+    for (unsigned offset=0;offset<invalid_holidays.size();offset+=10) {
+        const auto f=frame(invalid_holidays,offset);
+        assert(receiver.accept(f.data(),f.size(),result)==(offset+10<invalid_holidays.size()));
+    }
+    const auto google_auth=seal({5,0,0,2,0,0,0,0,0});
+    receiver.select(41,20261019);
+    for (unsigned offset=0;offset<google_auth.size();offset+=10) {
+        const auto f=frame(google_auth,offset); assert(receiver.accept(f.data(),f.size(),result));
+    }
+    assert(result.status==CalendarGoogleAuth && result.count==0 && result.holiday_days==0);
+}
+
 static void notification_protocol_tests()
 {
     WatchNotificationAssembler assembler;
@@ -74,10 +151,13 @@ static bool goal_test(uint32_t) { ++goal_calls; return goal_save_ok; }
 static void brightness_test(uint8_t) { ++brightness_calls; }
 static void commit_test(uint8_t value) { ++commit_calls; committed = value; }
 
-static lv_obj_t *find_button(lv_obj_t *screen, const char *text)
+static lv_obj_t *search_button(lv_obj_t *screen, const char *text)
 {
     for (uint32_t i = 0; i < lv_obj_get_child_count(screen); ++i) {
         lv_obj_t *object = lv_obj_get_child(screen, i);
+        if (!lv_obj_check_type(object,&lv_button_class)) {
+            if (auto *match=search_button(object,text)) return match;
+        }
         if (!lv_obj_check_type(object, &lv_button_class) || !lv_obj_get_child_count(object)) continue;
         lv_obj_t *child = lv_obj_get_child(object, 0);
         if (lv_obj_check_type(child, &lv_label_class) && strcmp(lv_label_get_text(child), text) == 0) return object;
@@ -89,14 +169,19 @@ static lv_obj_t *find_button(lv_obj_t *screen, const char *text)
             }
         }
     }
-    assert(false && "Button not found");
     return nullptr;
+}
+static lv_obj_t *find_button(lv_obj_t *screen,const char *text)
+{
+    auto *found=search_button(screen,text);
+    assert(found && "Button not found"); return found;
 }
 static void check_touch_targets(lv_obj_t *parent)
 {
     if (lv_obj_check_type(parent,&lv_button_class)) {
-        assert(lv_obj_get_width(parent) >= design::TouchHeight);
-        assert(lv_obj_get_height(parent) >= design::TouchHeight);
+        bool month_cell=false; for (auto *cell : calendar_cells) month_cell|=parent==cell;
+        assert(lv_obj_get_width(parent) >= (month_cell ? 44 : design::TouchHeight));
+        assert(lv_obj_get_height(parent) >= (month_cell ? 36 : design::TouchHeight));
     }
     for (uint32_t i = 0; i < lv_obj_get_child_count(parent); ++i) check_touch_targets(lv_obj_get_child(parent,i));
 }
@@ -198,6 +283,7 @@ int main()
     assert(!watch_ble_can_pair(0, true, false));
     assert(!watch_ble_can_pair(0, false, true));
     notification_protocol_tests();
+    calendar_protocol_tests();
     lv_init();
     lv_display_create(410, 502);
     watch_ui_create();
@@ -398,7 +484,7 @@ int main()
         lv_obj_send_event(find_button(screen_for(parent), LV_SYMBOL_HOME "  HOME"), LV_EVENT_CLICKED, nullptr);
         assert(current_screen == WatchScreen::Home);
     }
-    for (const auto child : {WatchScreen::Activity, WatchScreen::Timer, WatchScreen::Stopwatch, WatchScreen::Weather,
+    for (const auto child : {WatchScreen::Activity, WatchScreen::Timer, WatchScreen::MotionLab, WatchScreen::Weather,
                              WatchScreen::Wifi, WatchScreen::Bluetooth, WatchScreen::Brightness, WatchScreen::Timeout}) {
         navigate_to(child);
         lv_obj_send_event(find_button(screen_for(child), LV_SYMBOL_LEFT "  BACK"), LV_EVENT_CLICKED, nullptr);
@@ -429,6 +515,54 @@ int main()
     assert(daily_step_goal == 1000 && goal_calls == 2);
     watch_ui_set_step_goal(30000);
     assert(lv_obj_has_state(goal_plus, LV_STATE_DISABLED));
+    open_activity_cb(nullptr);
+    watch_ui_set_step_goal(8000);
+    watch_ui_set_steps(5421);
+    assert(lv_arc_get_value(activity_ring)==677);
+    assert(strcmp(lv_label_get_text(activity_percent),"68% OF GOAL")==0);
+    watch_ui_activity_day_t activity_test_days[7]={{5421,4},{12000,3},{0,2},{4000,1},{8000,0},{2000,6},{1000,5}};
+    watch_ui_set_history(activity_test_days);
+    assert(activity_scale==12000);
+    assert(strstr(lv_label_get_text(activity_selection),"TODAY / 5421 STEPS"));
+    assert(strcmp(lv_label_get_text(activity_days[6]),"THU")==0);
+    assert(strcmp(lv_label_get_text(activity_days[0]),"FRI")==0);
+    lv_obj_send_event(activity_columns[5],LV_EVENT_CLICKED,nullptr);
+    assert(activity_selected==1);
+    assert(strcmp(lv_label_get_text(activity_selection),"WED / 12000 STEPS")==0);
+    lv_obj_send_event(activity_columns[4],LV_EVENT_CLICKED,nullptr);
+    assert(strcmp(lv_label_get_text(activity_selection),"TUE / 0 STEPS")==0);
+    watch_ui_set_steps(16000);
+    assert(lv_arc_get_value(activity_ring)==1000);
+    assert(strcmp(lv_label_get_text(activity_percent),"200% OF GOAL")==0);
+    assert(activity_scale==16000);
+    watch_ui_set_steps(UINT32_MAX);
+    assert(lv_arc_get_value(activity_ring)==1000);
+    assert(strcmp(lv_label_get_text(activity_percent),">999% OF GOAL")==0);
+    watch_ui_set_steps(5421);
+    watch_ui_set_history(nullptr);
+    assert(strstr(lv_label_get_text(activity_selection),"UNAVAILABLE"));
+    lv_obj_send_event(activity_columns[6],LV_EVENT_CLICKED,nullptr);
+    assert(activity_selected==2); // Missing history is not selectable or presented as zero.
+    watch_ui_set_history(activity_test_days);
+    auto *activity_screen=screen_for(WatchScreen::Activity);
+    lv_obj_update_layout(activity_screen);
+    auto activity_bottom=[](lv_obj_t *o) { return lv_obj_get_y(o)+lv_obj_get_height(o); };
+    assert(activity_bottom(activity_ring)+8<=lv_obj_get_y(goal_minus));
+    assert(activity_bottom(goal_minus)+8<=lv_obj_get_y(activity_selection));
+    assert(activity_bottom(activity_selection)+8<=lv_obj_get_y(activity_chart));
+    assert(activity_bottom(activity_chart)+8<=lv_obj_get_y(find_button(activity_screen,LV_SYMBOL_LEFT "  BACK")));
+    for (unsigned i=0;i<7;++i) {
+        assert(lv_obj_get_width(activity_columns[i])>=44);
+        assert(lv_obj_get_height(activity_columns[i])>=56);
+        assert(activity_bottom(activity_bars[i])+8<=lv_obj_get_y(activity_days[i]));
+    }
+    watch_ui_set_display_active(false);
+    watch_ui_set_steps(8000);
+    watch_ui_set_display_active(true);
+    assert(strcmp(lv_label_get_text(activity_percent),"100% OF GOAL")==0);
+    back_cb(nullptr);
+    assert(current_screen==WatchScreen::Launcher);
+    watch_ui_set_step_goal(30000); // Restore the boundary case tested below.
     lv_obj_send_event(goal_plus, LV_EVENT_CLICKED, nullptr);
     assert(daily_step_goal == 30000 && goal_calls == 2);
     watch_ui_set_step_goal(0); watch_ui_set_step_goal(3500);
@@ -576,11 +710,10 @@ int main()
     timer_control_cb(nullptr);
     lv_tick_inc(5000); time_tools_tick(nullptr);
     assert(countdown.elapsed_ms == 1000 && !countdown.running);
-    timer_control_cb(nullptr); stopwatch_control_cb(nullptr);
+    timer_control_cb(nullptr);
     watch_ui_set_display_active(false);
     lv_tick_inc(1499000); time_tools_tick(nullptr);
     assert(!countdown.running && countdown.elapsed_ms == 1500000);
-    assert(stopwatch.running && stopwatch.elapsed_ms == 1499000);
     // Expiry while IDLE must not redraw until wake.
     assert(strcmp(lv_label_get_text(timer_value), "24:59") == 0);
     watch_ui_set_display_active(true);
@@ -599,16 +732,111 @@ int main()
     timer_reset_cb(nullptr);
     assert(countdown.elapsed_ms==0 && pomodoro_duration()==1500000);
     assert(lv_arc_get_value(pomodoro_progress)==0);
-    back_cb(nullptr); open_stopwatch_cb(nullptr);
-    assert(strcmp(lv_label_get_text(stopwatch_value), "00:24:59.0") == 0);
-    stopwatch_control_cb(nullptr); stopwatch_reset_cb(nullptr);
-    assert(stopwatch.elapsed_ms == 0 && !stopwatch.running);
+    back_cb(nullptr); open_motion_lab_cb(nullptr);
+    assert(current_screen==WatchScreen::MotionLab);
+    motion_tick(nullptr);
+    assert(strstr(lv_label_get_text(motion_status),"UNAVAILABLE"));
+    watch_ui_set_motion(true,0,0,9.80665f); motion_tick(nullptr);
+    assert(motion_lab.fresh(lv_tick_get()));
+    assert(fabsf(motion_lab.roll)<.001f && fabsf(motion_lab.pitch)<.001f);
+    watch_ui_set_motion(true,0,9.80665f,0);
+    assert(motion_lab.roll>0);
+    assert(motion_lab.center(lv_tick_get()));
+    assert(fabsf(motion_lab.relative_roll())<.001f);
+    for (unsigned i=0;i<100;++i) watch_ui_set_motion(true,1,2,9);
+    assert(motion_lab.count==80 && motion_lab.next<80);
+    auto check_motion_layout=[]() {
+        auto *screen=screen_for(WatchScreen::MotionLab);
+        lv_obj_update_layout(screen);
+        auto bottom=[](lv_obj_t *obj) { return lv_obj_get_y(obj)+lv_obj_get_height(obj); };
+        auto *heading=lv_obj_get_child(screen,0);
+        auto *back=find_button(screen,LV_SYMBOL_LEFT "  BACK");
+        for (unsigned i=0;i<3;++i) {
+            assert(lv_obj_get_height(motion_tabs[i])==design::TouchHeight);
+            assert(bottom(heading)+8<=lv_obj_get_y(motion_tabs[i]));
+            assert(bottom(motion_tabs[i])+8<=lv_obj_get_y(motion_status));
+            if (i) assert(lv_obj_get_x(motion_tabs[i-1])+lv_obj_get_width(motion_tabs[i-1])+8<=lv_obj_get_x(motion_tabs[i]));
+        }
+        assert(bottom(motion_status)+8<=lv_obj_get_y(motion_canvas));
+        assert(bottom(motion_canvas)+8<=lv_obj_get_y(motion_readout));
+        auto *footer=motion_mode==2 ? motion_accel_hint : motion_center;
+        assert(bottom(motion_readout)+8<=lv_obj_get_y(footer));
+        assert(bottom(footer)+8<=lv_obj_get_y(back));
+        assert(lv_obj_has_flag(motion_center,LV_OBJ_FLAG_HIDDEN)==(motion_mode==2));
+        assert(lv_obj_has_flag(motion_accel_hint,LV_OBJ_FLAG_HIDDEN)==(motion_mode!=2));
+        assert(lv_obj_get_width(motion_status)==design::ContentWidth);
+    };
+    for (unsigned i=0;i<3;++i) {
+        lv_obj_send_event(motion_tabs[i],LV_EVENT_CLICKED,nullptr); assert(motion_mode==i);
+        check_motion_layout();
+    }
+    lv_tick_inc(601); motion_tick(nullptr);
+    assert(strstr(lv_label_get_text(motion_status),"UNAVAILABLE"));
+    check_motion_layout();
+    assert(!motion_lab.center(lv_tick_get()));
+    watch_ui_set_motion(true,NAN,0,9); assert(!motion_lab.valid);
+    watch_ui_set_motion_demo(true); motion_tick(nullptr);
+    assert(strstr(lv_label_get_text(motion_status),"DEMO"));
+    for (unsigned i=0;i<3;++i) { motion_select(i); check_motion_layout(); }
+    motion_select(1);
+    lv_obj_send_event(motion_center,LV_EVENT_CLICKED,nullptr);
+    assert(strcmp(lv_label_get_text(lv_obj_get_child(motion_center,0)),"REFERENCE SET")==0);
+    check_motion_layout();
+    lv_tick_inc(1200); motion_tick(nullptr);
+    assert(strcmp(lv_label_get_text(lv_obj_get_child(motion_center,0)),"SET LEVEL / RECENTER")==0);
+    const auto received=motion_lab.received;
+    watch_ui_set_display_active(false); lv_tick_inc(100); motion_tick(nullptr);
+    assert(motion_lab.received==received);
+    watch_ui_set_display_active(true);
+    watch_ui_set_motion_demo(false);
     back_cb(nullptr); assert(current_screen == WatchScreen::Launcher);
     watch_ui_forecast_day_t forecast[7] = {};
     forecast[0] = {true, 20261003, 6, 12, 24, WATCH_UI_WEATHER_SUNNY};
     watch_ui_set_forecast(forecast, false, 45);
     assert(strcmp(lv_label_get_text(weather_range_label), "H 24\xC2\xB0 / L 12\xC2\xB0") == 0);
     open_weather_cb(nullptr);
+    watch_weather_dashboard_t dashboard={};
+    dashboard.available=true; dashboard.rain_available=true; dashboard.temperature_c=16.5f;
+    dashboard.wind_kmh=8; dashboard.wind_degrees=180; dashboard.humidity_percent=65;
+    dashboard.slots[0]={true,20261003,8,WATCH_UI_WEATHER_SUNNY,12.5f,0};
+    watch_ui_set_weather_dashboard(&dashboard,true,12);
+    assert(strcmp(lv_label_get_text(wx_temp),"16.5°C")==0);
+    assert(strcmp(lv_label_get_text(wx_stats[0]),"8 km/h S")==0);
+    assert(strcmp(lv_label_get_text(wx_stats[1]),"65%")==0);
+    assert(strcmp(lv_label_get_text(wx_stats[2]),"0.0 mm")==0);
+    assert(strcmp(lv_label_get_text(wx_day_high[0]),"24°")==0);
+    assert(strcmp(lv_label_get_text(wx_day_low[0]),"12°")==0);
+    assert(strcmp(lv_label_get_text(wx_day_high[1]),"--")==0);
+    assert(lv_obj_has_flag(wx_day_icons[1],LV_OBJ_FLAG_HIDDEN));
+    auto *dashboard_screen=screen_for(WatchScreen::Weather);
+    lv_obj_update_layout(dashboard_screen);
+    auto bottom=[](lv_obj_t *obj) { return lv_obj_get_y(obj)+lv_obj_get_height(obj); };
+    assert(bottom(wx_status)+8<=lv_obj_get_y(wx_temp));
+    assert(bottom(wx_temp)+8<=174); // Current caption band.
+    assert(bottom(wx_stats[0])+8<=lv_obj_get_y(wx_grid));
+    assert(bottom(wx_grid)+8<=394); // Attribution / grid navigation hint.
+    assert(394+18+8<=lv_obj_get_y(find_button(dashboard_screen,LV_SYMBOL_LEFT "  BACK")));
+    for (unsigned i=0;i<3;++i) {
+        assert(bottom(wx_day_icons[i])+8<=lv_obj_get_y(wx_day_high[i]));
+        assert(bottom(wx_day_high[i])+2<=lv_obj_get_y(wx_day_low[i]));
+        assert(bottom(wx_day_low[i])+2<=lv_obj_get_height(wx_grid));
+    }
+    dashboard.rain_available=false;
+    watch_ui_set_weather_dashboard(&dashboard,false,45);
+    assert(strcmp(lv_label_get_text(wx_stats[2]),"-- mm")==0);
+    assert(strstr(lv_label_get_text(wx_status),"OFFLINE / CACHED"));
+    dashboard.slots[0].date=20261002;
+    watch_ui_set_weather_dashboard(&dashboard,true,40);
+    assert(strcmp(lv_label_get_text(wx_day_high[0]),"24°")==0); // Daily highs, not hourly samples.
+    forecast[1]={true,20261004,0,-5,0,WATCH_UI_WEATHER_CLOUDY};
+    watch_ui_set_forecast(forecast,true,40);
+    assert(strcmp(lv_label_get_text(wx_day_high[1]),"0°")==0);
+    assert(strcmp(lv_label_get_text(wx_day_low[1]),"-5°")==0);
+    forecast[1]={};
+    watch_ui_set_forecast(forecast,false,45);
+    assert(strstr(lv_label_get_text(wx_status),"STALE / CACHED"));
+    lv_obj_send_event(wx_grid,LV_EVENT_CLICKED,nullptr);
+    assert(current_screen==WatchScreen::WeatherWeek);
     assert(strcmp(lv_label_get_text(forecast_names[0]), "TODAY 03/10") == 0);
     assert(strcmp(lv_label_get_text(forecast_values[0]), "24 / 12") == 0);
     assert(strstr(lv_label_get_text(forecast_status), "OFFLINE / CACHED"));
@@ -616,6 +844,10 @@ int main()
     watch_ui_set_forecast(nullptr, true, 0);
     assert(strcmp(lv_label_get_text(weather_range_label), "H -- / L --") == 0);
     assert(strcmp(lv_label_get_text(forecast_values[0]), "-- / --") == 0);
+    back_cb(nullptr); assert(current_screen==WatchScreen::Weather);
+    watch_ui_set_weather_dashboard(nullptr,true,0);
+    assert(strcmp(lv_label_get_text(wx_temp),"--°C")==0);
+    assert(lv_obj_has_flag(wx_icon,LV_OBJ_FLAG_HIDDEN));
     back_cb(nullptr); assert(current_screen == WatchScreen::Launcher);
     watch_ui_set_voice_callback(voice_test_action);
     open_voice_cb(nullptr); assert(current_screen == WatchScreen::Voice);
@@ -892,16 +1124,126 @@ int main()
         back_cb(nullptr); assert(current_screen==WatchScreen::Launcher);
     }
     {
-        const char *names[]={"ACTIVITY","POMODORO","STOPWATCH","WEATHER","MEDIA","2048","SUN & MOON","PLANETS","AI ASSISTANT"};
+        const char *names[]={"WEATHER","POMODORO","MOTION LAB","MEDIA","CALENDAR","2048","SUN & MOON","PLANETS","AI ASSISTANT"};
         auto *launcher=screen_for(WatchScreen::Launcher);
         lv_obj_update_layout(launcher);
         for (unsigned i=0;i<9;++i) {
             auto *tile=find_button(launcher,names[i]);
             assert(lv_obj_get_width(tile)==108 && lv_obj_get_height(tile)==100);
-            assert(lv_obj_get_y(tile)==92+int(i/3)*110);
+            assert(lv_obj_get_y(tile)==8+int(i/3)*110);
             assert(lv_obj_get_x(tile)==lv_obj_get_x(find_button(launcher,names[i%3])));
             assert(lv_obj_get_y(lv_obj_get_child(tile,0))==70);
         }
+        auto *calendar_tile=find_button(launcher,"CALENDAR");
+        assert(lv_obj_get_y(calendar_tile)==118);
+        assert(!search_button(launcher,"ACTIVITY"));
+        auto *calendar_icon=lv_obj_get_child(calendar_tile,2);
+        assert(lv_obj_get_width(calendar_icon)==40 && lv_obj_get_height(calendar_icon)==40);
+        assert(lv_obj_get_height(lv_obj_get_parent(calendar_tile))==328);
+    }
+    {
+        watch_ui_clear_calendar();
+        watch_ui_set_astronomy_time(1792756800,true); // 2026-10-23; explicit clock for deterministic week tests.
+        watch_ui_set_bluetooth_state(WATCH_UI_BLUETOOTH_CONNECTED);
+        watch_ui_set_calendar_request_callback([](uint32_t monday) { assert(watch_calendar_monday(monday)==monday); });
+        calendar_selected_week=0;
+        open_calendar_cb(nullptr);
+        assert(current_screen==WatchScreen::CalendarMonth && calendar_month==20261001);
+        calendar_month_sync=false; calendar_request(); navigate_to(WatchScreen::Calendar);
+        assert(current_screen==WatchScreen::Calendar && calendar_selected_week==20261019);
+        assert(calendar_selected_day==4);
+        static watch_calendar_week_t week={};
+        week.monday=20261019; week.fetched_at=1792756800; week.count=2;
+        week.events[0].days=16; strcpy(week.events[0].title,"Reunión de equipo"); strcpy(week.events[0].time,"09:00 - 10:00"); strcpy(week.events[0].location,"Madrid");
+        week.events[1].days=96; week.events[1].all_day=true; strcpy(week.events[1].title,"Weekend trip"); strcpy(week.events[1].time,"All day");
+        watch_ui_set_calendar_week(&week);
+        assert(calendar_day_headers[0] && calendar_day_headers[6]);
+        assert(!strstr(lv_label_get_text(calendar_week_label),"TODAY"));
+        lv_obj_t *friday_row=nullptr;
+        for (unsigned i=0;i<lv_obj_get_child_count(calendar_list);++i) {
+            auto *child=lv_obj_get_child(calendar_list,i);
+            if (lv_obj_check_type(child,&lv_button_class)) { friday_row=child; break; }
+        }
+        assert(friday_row);
+        lv_obj_send_event(friday_row,LV_EVENT_CLICKED,nullptr);
+        assert(current_screen==WatchScreen::CalendarDetail);
+        assert(strstr(lv_label_get_text(calendar_detail_text),"Madrid"));
+        back_cb(nullptr); assert(current_screen==WatchScreen::Calendar);
+        assert(strstr(lv_label_get_text(calendar_day_headers[5]),"Saturday"));
+        lv_obj_scroll_to_y(calendar_list,80,LV_ANIM_OFF);
+        const auto scroll_before=lv_obj_get_scroll_y(calendar_list);
+        calendar_dirty=true; refresh_calendar();
+        assert(lv_obj_get_scroll_y(calendar_list)==scroll_before);
+        calendar_move(1); assert(calendar_selected_week==20261026 && !calendar_cached());
+        assert(strstr(lv_label_get_text(calendar_status),"SYNCING"));
+        calendar_move(-1); assert(calendar_cached() && calendar_cached()->count==2);
+        watch_ui_set_bluetooth_state(WATCH_UI_BLUETOOTH_ADVERTISING);
+        assert(strstr(lv_label_get_text(calendar_status),"OFFLINE / CACHED"));
+        calendar_select_today(); assert(calendar_selected_day==4 && calendar_selected_week==20261019);
+        auto *screen=screen_for(WatchScreen::Calendar); lv_obj_update_layout(screen);
+        assert(lv_obj_get_y(calendar_status)>=lv_obj_get_y(calendar_previous)+lv_obj_get_height(calendar_previous)+8);
+        assert(lv_obj_get_y(calendar_list)+lv_obj_get_height(calendar_list)+8<=lv_obj_get_y(find_button(screen,LV_SYMBOL_LEFT "  BACK")));
+        week.status=CalendarError; week.count=0; watch_ui_set_calendar_week(&week);
+        assert(calendar_cached()->count==2); // Transient errors do not destroy a usable cache.
+        week.status=CalendarPermission; watch_ui_set_calendar_week(&week);
+        assert(calendar_cached()->count==0 && calendar_cached()->status==CalendarPermission);
+        watch_ui_set_bluetooth_state(WATCH_UI_BLUETOOTH_CONNECTED);
+        week.status=CalendarGoogleAuth; watch_ui_set_calendar_week(&week);
+        assert(calendar_cached()->status==CalendarGoogleAuth);
+        assert(strstr(lv_label_get_text(calendar_status),"CONNECT GOOGLE"));
+        assert(!*lv_label_get_text(calendar_detail_text));
+        watch_ui_clear_calendar(); for (const auto &cached : calendar_cache) assert(cached.monday==0);
+        week.status=CalendarReady;
+        for (unsigned i=0;i<7;++i) { week.monday=watch_calendar_date(watch_calendar_day(20261019)+i*7); watch_ui_set_calendar_week(&week); }
+        calendar_selected_week=20261019; assert(!calendar_cached());
+        calendar_selected_week=20261026; assert(calendar_cached());
+        calendar_selected_week=20261228; calendar_move(1); assert(calendar_selected_week==20270104);
+        back_cb(nullptr); assert(current_screen==WatchScreen::CalendarMonth);
+        back_cb(nullptr); assert(current_screen==WatchScreen::Launcher);
+        watch_ui_set_calendar_request_callback([](uint32_t monday) {
+            static watch_calendar_week_t demo={}; demo.monday=monday; demo.status=CalendarReady; demo.count=4;
+            demo.holiday_days=4; demo.fetched_at=uint32_t(astronomy_utc-3600);
+            for (unsigned i=0;i<4;++i) { demo.events[i].days=127; demo.events[i].color=0x12ab34+i; strcpy(demo.events[i].title,"Demo"); strcpy(demo.events[i].time,"09:00"); }
+            watch_ui_set_calendar_week(&demo); // Simulator callbacks are synchronous/re-entrant.
+        });
+        calendar_was_connected=false;
+        watch_ui_set_bluetooth_state(WATCH_UI_BLUETOOTH_CONNECTED);
+        open_calendar_cb(nullptr); assert(calendar_find_week(20260928));
+        assert(!calendar_month_sync && calendar_month_index==6);
+        assert(!strcmp(lv_label_get_text(calendar_cell_dates[0]),"28"));
+        assert(lv_obj_get_style_bg_opa(calendar_cell_bars[0][0],LV_PART_MAIN)==LV_OPA_20);
+        assert(lv_obj_get_style_text_font(calendar_month_heading,LV_PART_MAIN)==&lv_font_montserrat_22);
+        assert(!strstr(lv_label_get_text(calendar_month_heading),"WEEK VIEW"));
+        assert(strstr(lv_label_get_text(calendar_month_status),"Last refresh 1h ago"));
+        assert(lv_obj_get_style_text_font(calendar_month_status,LV_PART_MAIN)==&lv_font_montserrat_12);
+        const auto holiday_text=lv_color_to_u32(lv_obj_get_style_text_color(calendar_cell_dates[9],LV_PART_MAIN));
+        const auto weekend_text=lv_color_to_u32(lv_obj_get_style_text_color(calendar_cell_dates[12],LV_PART_MAIN));
+        assert(holiday_text==weekend_text && holiday_text==lv_color_to_u32(lv_color_hex(CalendarRestDayColor)));
+        assert(lv_color_to_u32(lv_obj_get_style_bg_color(calendar_cells[9],LV_PART_MAIN))==lv_color_to_u32(lv_obj_get_style_bg_color(calendar_cells[12],LV_PART_MAIN)));
+        assert(lv_color_to_u32(lv_obj_get_style_bg_color(calendar_cells[12],LV_PART_MAIN))==lv_color_to_u32(lv_color_hex(0x101418)));
+        assert(lv_color_to_u32(lv_obj_get_style_bg_color(calendar_cells[8],LV_PART_MAIN))==lv_color_to_u32(lv_color_hex(0)));
+        assert(lv_color_to_u32(lv_obj_get_style_text_color(calendar_cell_dates[8],LV_PART_MAIN))!=holiday_text);
+        watch_ui_set_bluetooth_state(WATCH_UI_BLUETOOTH_ADVERTISING);
+        assert(strstr(lv_label_get_text(calendar_month_status),"offline"));
+        for (auto *text : calendar_cell_dates) assert(!strchr(lv_label_get_text(text),'?'));
+        watch_ui_set_bluetooth_state(WATCH_UI_BLUETOOTH_CONNECTED);
+        assert(lv_color_to_u32(lv_obj_get_style_bg_color(calendar_cell_bars[0][0],LV_PART_MAIN))==lv_color_to_u32(lv_color_hex(0x12ab34)));
+        assert(!lv_obj_has_flag(calendar_cell_bars[0][2],LV_OBJ_FLAG_HIDDEN));
+        assert(!strcmp(lv_label_get_text(calendar_cell_more[0]),"+"));
+        lv_obj_update_layout(screen_for(WatchScreen::CalendarMonth));
+        assert(lv_obj_get_y(calendar_cells[41])+lv_obj_get_height(calendar_cells[41])<lv_obj_get_y(calendar_month_status));
+        calendar_month_move(3); assert(calendar_month==20270101);
+        calendar_month_move(-1); assert(calendar_month==20261201);
+        lv_obj_send_event(lv_obj_get_parent(calendar_month_heading),LV_EVENT_CLICKED,nullptr);
+        assert(calendar_month==20261001 && current_screen==WatchScreen::CalendarMonth);
+        calendar_month_move(2); assert(calendar_month==20261201);
+        calendar_month_open_day(0); assert(current_screen==WatchScreen::Calendar && calendar_selected_week==20261130);
+        back_cb(nullptr); assert(current_screen==WatchScreen::CalendarMonth);
+        calendar_month=20240201; calendar_month_start(); refresh_calendar_month();
+        assert(!strcmp(lv_label_get_text(calendar_cell_dates[31]),"29"));
+        assert(!strcmp(lv_label_get_text(calendar_cell_dates[32]),"1"));
+        back_cb(nullptr);
+        watch_ui_set_calendar_request_callback(nullptr);
     }
     {
         open_voice_cb(nullptr);
