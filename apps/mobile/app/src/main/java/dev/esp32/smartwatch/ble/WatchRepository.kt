@@ -24,6 +24,8 @@ import dev.esp32.smartwatch.notifications.NotificationTransport
 import dev.esp32.smartwatch.notifications.WatchNotificationListener
 import dev.esp32.smartwatch.companion.ReconnectPolicy
 import dev.esp32.smartwatch.media.*
+import dev.esp32.smartwatch.calendar.CalendarBridge
+import dev.esp32.smartwatch.calendar.CalendarProtocol
 
 /** All mutable BLE/session state is confined to the main looper, including callbacks. */
 @SuppressLint("MissingPermission") // Every entry point/callback checks permissions; revocation is caught.
@@ -157,6 +159,13 @@ class WatchRepository(context: Context) {
                 Log.d(TAG, "Voice metadata poll queued: pending=${pending != null} queued=${operations.size}")
                 safely { nextOperation() }
             }
+            if (serviceEnabled && state.value.secureLink && state.value.connectionState == ConnectionState.CONNECTED &&
+                CalendarProtocol.UUID in characteristics) {
+                if (calendarAllowed != calendarBridge.allowed()) refreshCalendar()
+                if (voiceReceiver == null && pending?.uuid != CalendarProtocol.UUID && operations.none { it.uuid == CalendarProtocol.UUID }) {
+                    operations.add(Operation(CalendarProtocol.UUID)); safely { nextOperation() }
+                }
+            }
             if (serviceEnabled && gatt != null) handler.postDelayed(this, 2000)
         }
     }
@@ -177,6 +186,36 @@ class WatchRepository(context: Context) {
     private var discoveryStarted = false
     private var waitingForMtu = false
     private var negotiatedMtu = 23
+    private var calendarRequest: CalendarProtocol.Request? = null
+    private val calendarFrames = ArrayDeque<ByteArray>()
+    private var calendarClear = false
+    private var calendarClearAttempts = 0
+    private var calendarAllowed = false
+    private val calendarBridge = CalendarBridge(this.context) { refreshCalendar() }
+    private fun clearCalendarFrames() { calendarFrames.forEach { it.fill(0) }; calendarFrames.clear() }
+    private fun refreshCalendar() {
+        clearCalendarFrames(); calendarClear = true; calendarClearAttempts = 0
+        calendarAllowed = calendarBridge.allowed()
+        calendarRequest?.let { loadCalendar(it) }
+        if (pending == null && gatt != null) safely { nextOperation() }
+    }
+    private fun calendarWriteFailed(privacyClear: Boolean) {
+        clearCalendarFrames()
+        if (privacyClear && ++calendarClearAttempts < 2) calendarClear = true
+        else if (privacyClear) {
+            calendarBridge.invalidate(); characteristics.remove(CalendarProtocol.UUID)
+            Log.w(TAG,"Calendar privacy clear failed; reconnect to retry")
+        } else Log.w(TAG,"Calendar write rejected; select week again to retry")
+    }
+    private fun loadCalendar(request: CalendarProtocol.Request) {
+        val source = gatt ?: return
+        calendarBridge.query(request) { week ->
+            if (gatt !== source || !state.value.secureLink || calendarRequest != request) return@query
+            clearCalendarFrames()
+            CalendarProtocol.frames(request, week, negotiatedMtu).forEach(calendarFrames::add)
+            safely { nextOperation() }
+        }
+    }
     private var automaticConnection = false
     private var adapterReceiverRegistered = false
     private val adapterReceiver = object : BroadcastReceiver() {
@@ -521,6 +560,13 @@ class WatchRepository(context: Context) {
                 characteristics[caps.uuid] = caps; characteristics[stream.uuid] = stream
             }
             handler.removeCallbacks(voicePoll); handler.postDelayed(voicePoll, 2000)
+            watch?.getCharacteristic(CalendarProtocol.UUID)?.let { calendar ->
+                if (calendar.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0 &&
+                    calendar.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0) {
+                    characteristics[calendar.uuid] = calendar
+                    Log.i(TAG,"Read-only calendar extension available")
+                }
+            }
             operations.add(Operation(WatchBleProtocol.SECURITY))
             operations.add(Operation(WatchBleProtocol.VERSION))
             if (VoiceProtocol.CAPS in characteristics) operations.add(Operation(VoiceProtocol.CAPS))
@@ -549,6 +595,17 @@ class WatchRepository(context: Context) {
                     return@onSession
                 }
                 Log.d(TAG, "Characteristic read: ${c.uuid}, status=$status")
+                if (c.uuid == CalendarProtocol.UUID) {
+                    if (status == BluetoothGatt.GATT_SUCCESS && state.value.secureLink) {
+                        try {
+                            val request = CalendarProtocol.request(snapshot)
+                            if (request != null && request != calendarRequest) {
+                                calendarRequest = request; clearCalendarFrames(); loadCalendar(request)
+                            }
+                        } catch (_: Exception) { Log.w(TAG,"Invalid calendar request ignored") }
+                    } else characteristics.remove(CalendarProtocol.UUID)
+                    snapshot.fill(0); pending = null; nextOperation(); return@onSession
+                }
                 if (c.uuid == VoiceProtocol.CAPS) {
                     streamCredits = if (status == BluetoothGatt.GATT_SUCCESS) VoiceProtocol.streamCredits(snapshot) else 0
                     streamCapable = streamCredits != 0
@@ -679,6 +736,15 @@ class WatchRepository(context: Context) {
                     clearAi()
                 }
                 pending = null; nextOperation(); return@onSession
+            }
+            if (c.uuid == CalendarProtocol.UUID) {
+                if (status != BluetoothGatt.GATT_SUCCESS) calendarWriteFailed(op.writeValue.size == 2)
+                else if (op.writeValue.size == 2) {
+                    val retry = calendarClearAttempts > 0; calendarClearAttempts = 0
+                    if (retry) calendarRequest?.let { loadCalendar(it) }
+                }
+                else if (op.writeValue.size>10 && calendarFrames.isEmpty()) Log.i(TAG,"Calendar snapshot delivered")
+                op.writeValue.fill(0); pending = null; nextOperation(); return@onSession
             }
             if (c.uuid == VoiceProtocol.CONTROL) {
                 if (voiceReceiver != null) voiceWriteUs += (System.nanoTime()-operationStartedNs)/1000
@@ -866,6 +932,14 @@ class WatchRepository(context: Context) {
             Log.i(TAG, "Notification transmission started: chunks=${frames.size}")
         }
         if (voiceNext != null) operations.add(voiceNext)
+        // One low-priority calendar frame at a time, never queued ahead of voice,
+        // notification, media or control traffic. Calendar cannot authorize AI.
+        if (state.value.connectionState == ConnectionState.CONNECTED && state.value.secureLink && CalendarProtocol.UUID in characteristics) {
+            // Privacy revocation is a single short write and need not wait for audio.
+            if (calendarClear) { calendarClear = false; operations.addFirst(Operation(CalendarProtocol.UUID, writeValue = byteArrayOf(1,0x7f))) }
+            else if (operations.isEmpty() && voiceReceiver == null && aiSession == 0)
+                calendarFrames.removeFirstOrNull()?.let { operations.add(Operation(CalendarProtocol.UUID, writeValue = it)) }
+        }
         val op = operations.removeFirstOrNull()
         if (op == null) {
             if (!state.value.secureLink || source.device.bondState != BluetoothDevice.BOND_BONDED) {
@@ -893,7 +967,12 @@ class WatchRepository(context: Context) {
                 if (c.uuid == WatchBleProtocol.SERVICE_CHANGED) BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
                 else BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) == BluetoothStatusCodes.SUCCESS
         } else source.readCharacteristic(c)
-        if (!started && (op.uuid == VoiceProtocol.CAPS || op.uuid == VoiceProtocol.STREAM)) {
+        if (!started && op.uuid == CalendarProtocol.UUID) {
+            pending = null; calendarWriteFailed(op.writeValue?.size == 2); op.writeValue?.fill(0)
+            if (op.writeValue == null) characteristics.remove(CalendarProtocol.UUID)
+            Log.w(TAG,"Calendar operation could not start; select week again to retry")
+            nextOperation()
+        } else if (!started && (op.uuid == VoiceProtocol.CAPS || op.uuid == VoiceProtocol.STREAM)) {
             pending = null; streamCapable = false; streamSubscribed = false
             nextOperation()
         } else if (!started && op.uuid == VoiceProtocol.CONTROL) {
@@ -1015,6 +1094,7 @@ class WatchRepository(context: Context) {
     }
 
     private fun releaseGatt() {
+        calendarBridge.invalidate(); calendarRequest = null; clearCalendarFrames(); calendarClear = true; calendarClearAttempts = 0
         servicesInFlight = false; servicesConfigured = false
         clearAi()
         waitingForMtu = false; negotiatedMtu = 23

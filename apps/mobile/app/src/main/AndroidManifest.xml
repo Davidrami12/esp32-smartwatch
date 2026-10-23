@@ -6,10 +6,12 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.READ_CALENDAR" />
     <uses-permission android:name="android.permission.health.WRITE_STEPS" />
     <queries><package android:name="com.google.android.apps.healthdata" /></queries>
     <application android:name=".SmartwatchApplication" android:label="Smartwatch" android:icon="@mipmap/ic_launcher" android:theme="@android:style/Theme.Material.NoActionBar" android:allowBackup="false" android:dataExtractionRules="@xml/data_extraction_rules" android:supportsRtl="true">
         <activity android:name=".ai.VoiceAiSettingsActivity" android:exported="false" />
+        <activity android:name=".calendar.CalendarSettingsActivity" android:exported="false" />
         <service android:name=".companion.CompanionService" android:exported="false"
             android:foregroundServiceType="connectedDevice" android:stopWithTask="false" />
         <service android:name=".notifications.WatchNotificationListener" android:label="Smartwatch notification forwarding"

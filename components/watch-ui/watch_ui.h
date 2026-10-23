@@ -3,11 +3,17 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "lvgl.h"
+#include "watch_calendar.h"
 #include "watch_weather_dashboard.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+typedef void (*watch_ui_calendar_request_cb_t)(uint32_t monday);
+void watch_ui_set_calendar_request_callback(watch_ui_calendar_request_cb_t callback);
+void watch_ui_set_calendar_week(const watch_calendar_week_t *week);
+void watch_ui_clear_calendar(void);
 
 typedef void (*watch_ui_brightness_cb_t)(uint8_t brightness);
 typedef void (*watch_ui_brightness_committed_cb_t)(uint8_t brightness);

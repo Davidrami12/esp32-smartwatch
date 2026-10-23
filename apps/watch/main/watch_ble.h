@@ -2,6 +2,10 @@
 #include <stdint.h>
 #include "esp_err.h"
 #include "watch_ble_control_protocol.h"
+#include "watch_calendar.h"
+void watch_ble_calendar_request(uint32_t monday);
+bool watch_ble_calendar_take(watch_calendar_week_t *week,bool *clear);
+void watch_ble_calendar_clear(void);
 
 enum class watch_ble_state_t { Disabled, Advertising, Connected };
 esp_err_t watch_ble_init(void);

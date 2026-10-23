@@ -67,7 +67,10 @@ const ble_uuid128_t voice_control_uuid = BLE_UUID128_INIT(0x00,0x10,0x2f,0x3e,0x
 const ble_uuid128_t voice_result_uuid = BLE_UUID128_INIT(0x00,0x10,0x2f,0x3e,0x4d,0x6c,0x2a,0x9f,0x6d,0x4b,0x7a,0x8e,0x12,0x00,0x57,0x7e);
 const ble_uuid128_t voice_caps_uuid = BLE_UUID128_INIT(0x00,0x10,0x2f,0x3e,0x4d,0x6c,0x2a,0x9f,0x6d,0x4b,0x7a,0x8e,0x13,0x00,0x57,0x7e);
 const ble_uuid128_t voice_stream_uuid = BLE_UUID128_INIT(0x00,0x10,0x2f,0x3e,0x4d,0x6c,0x2a,0x9f,0x6d,0x4b,0x7a,0x8e,0x14,0x00,0x57,0x7e);
-enum class Value { Battery, Version, Steps, Wifi, Brightness, Timeout, WifiEnabled, Notification, Security, Media, MediaCommand, MediaCapabilities, Activity, StepGoal, VoiceMeta, VoiceData, VoiceControl, VoiceResult, VoiceCaps, VoiceStream };
+const ble_uuid128_t calendar_uuid = BLE_UUID128_INIT(0x00,0x10,0x2f,0x3e,0x4d,0x6c,0x2a,0x9f,0x6d,0x4b,0x7a,0x8e,0x15,0x00,0x57,0x7e);
+enum class Value { Battery, Version, Steps, Wifi, Brightness, Timeout, WifiEnabled, Notification, Security, Media, MediaCommand, MediaCapabilities, Activity, StepGoal, VoiceMeta, VoiceData, VoiceControl, VoiceResult, VoiceCaps, VoiceStream, Calendar };
+Value calendar_id=Value::Calendar;
+#include "watch_calendar_transport.inc"
 Value voice_caps_id = Value::VoiceCaps, voice_stream_id = Value::VoiceStream;
 uint16_t voice_stream_handle;
 bool voice_stream_subscribed = false;
@@ -149,6 +152,7 @@ int read_value(uint16_t conn_handle, uint16_t, ble_gatt_access_ctxt *context, vo
     // NimBLE reads locally (NONE) to build notifications; only a secure peer can trigger them.
     if (!watch_ble_security_ready(conn_handle == BLE_HS_CONN_HANDLE_NONE ? connection : conn_handle)) return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
     const auto id = *static_cast<Value *>(arg);
+    if (id==Value::Calendar) return calendar_access(context);
     if (id == Value::VoiceResult) {
         if (context->op != BLE_GATT_ACCESS_OP_WRITE_CHR) return BLE_ATT_ERR_READ_NOT_PERMITTED;
         uint8_t bytes[244]; const size_t length = OS_MBUF_PKTLEN(context->om);
@@ -304,7 +308,7 @@ int read_value(uint16_t conn_handle, uint16_t, ble_gatt_access_ctxt *context, vo
 }
 
 ble_gatt_chr_def battery_characteristics[2] = {};
-ble_gatt_chr_def watch_characteristics[20] = {};
+ble_gatt_chr_def watch_characteristics[21] = {};
 ble_gatt_svc_def services[3] = {};
 
 void define_characteristic(ble_gatt_chr_def &definition, const ble_uuid_t *uuid, Value *id,
@@ -456,6 +460,9 @@ int gap_event(ble_gap_event *event, void *)
             }
             break;
         case BLE_GAP_EVENT_DISCONNECT:
+            portENTER_CRITICAL(&calendar_lock);
+            calendar_receiver.reset(); calendar_started=0;
+            portEXIT_CRITICAL(&calendar_lock);
             voice_stream_subscribed = false; ble_npl_callout_stop(&voice_callout);
             watch_voice_disconnected();
             watch_media_reset(); media_command_subscribed = false;
@@ -567,6 +574,9 @@ void register_attribute(ble_gatt_register_ctxt *context, void *)
 
 esp_err_t watch_ble_init(void)
 {
+    // Keep bounded calendar payloads out of scarce internal/DMA memory.
+    calendar_storage=static_cast<CalendarTransportStorage *>(heap_caps_calloc(1,sizeof(CalendarTransportStorage),MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT));
+    if (!calendar_storage) return ESP_ERR_NO_MEM;
     esp_err_t error = nimble_port_init();
     if (error != ESP_OK) { ESP_LOGE(kTag, "NimBLE init: %s", esp_err_to_name(error)); return error; }
     ble_hs_cfg.sync_cb = host_sync;
@@ -600,6 +610,7 @@ esp_err_t watch_ble_init(void)
     watch_characteristics[16].flags &= ~BLE_GATT_CHR_F_READ;
     define_characteristic(watch_characteristics[17], &voice_caps_uuid.u, &voice_caps_id, nullptr, false);
     define_characteristic(watch_characteristics[18], &voice_stream_uuid.u, &voice_stream_id, &voice_stream_handle, true);
+    define_characteristic(watch_characteristics[19], &calendar_uuid.u, &calendar_id, nullptr, false, true);
     services[0].type = services[1].type = BLE_GATT_SVC_TYPE_PRIMARY;
     services[0].uuid = &battery_service.u;
     services[0].characteristics = battery_characteristics;
@@ -626,6 +637,32 @@ esp_err_t watch_ble_init(void)
 }
 
 watch_ble_state_t watch_ble_get_state(void) { return state.load(); }
+void watch_ble_calendar_request(uint32_t monday)
+{
+    if (!calendar_storage) return;
+    if (!watch_calendar_valid_date(monday) || watch_calendar_monday(monday)!=monday) return;
+    portENTER_CRITICAL(&calendar_lock);
+    uint32_t id=calendar_receiver.request+1; if (!id) ++id;
+    calendar_receiver.select(id,monday); calendar_received_ready=false;
+    portEXIT_CRITICAL(&calendar_lock);
+}
+bool watch_ble_calendar_take(watch_calendar_week_t *week,bool *clear)
+{
+    if (!calendar_storage) { *clear=false; return false; }
+    portENTER_CRITICAL(&calendar_lock);
+    *clear=calendar_clear_pending; calendar_clear_pending=false;
+    const bool ready=calendar_received_ready;
+    if (ready) { *week=calendar_received; calendar_received_ready=false; }
+    portEXIT_CRITICAL(&calendar_lock); return ready;
+}
+void watch_ble_calendar_clear(void)
+{
+    if (!calendar_storage) return;
+    portENTER_CRITICAL(&calendar_lock);
+    calendar_receiver.reset(); memset(&calendar_received,0,sizeof(calendar_received));
+    calendar_received_ready=false; calendar_clear_pending=true;
+    portEXIT_CRITICAL(&calendar_lock);
+}
 bool watch_ble_media_command(uint8_t command, uint32_t session)
 {
     if (state.load() != watch_ble_state_t::Connected || !watch_media_queue_command(command, session)) return false;

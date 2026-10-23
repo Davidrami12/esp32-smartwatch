@@ -8,6 +8,61 @@ Credentials, accounts, DFU and weather transfer remain excluded. Optional dated 
 history is exposed by the secured read-only extension below.
 All application values are complete snapshots, not increments.
 
+## Read-only calendar extension (`0015`)
+
+Optional UUID `7e570015-8e7a-4b6d-9f2a-6c4d3e2f1000`, READ/WRITE only, with the
+same authenticated/encrypted 16-byte-key security gate as the other app values.
+Older firmware/companions ignore this optional extension. No calendar credentials
+or Google tokens cross BLE. See [calendar.md](calendar.md) for UX/privacy/setup.
+
+All integers are little-endian. READ returns ten bytes:
+`[version=4, kind=0, requestId:u32, mondayYYYYMMDD:u32]`; request ID zero means no
+request. IDs change on week selection/retry. The Android companion polls at two
+seconds when connected, deferring to voice. It queries only a changed request or
+an observed calendar/configuration change, and discards stale asynchronous results.
+
+WRITE event fragments:
+`[version=1, kind=1, requestId:u32, offset:u16, total:u16, payload...]`.
+Frames are at most min(244, MTU-3) bytes; offsets are contiguous; offset zero starts
+or restarts a transaction. Request ID must match. Total is at most 7,000 bytes.
+Assembly expires after 120 seconds, resets on disconnect and never publishes a
+partial week. A rejected transfer is not endlessly retried; select the week again.
+
+Complete payload: `[status:u8, count:u8, truncated:u8, colourSchema:u8, fetchedUnix:u32,
+events..., crc32:u32]`. CRC is standard IEEE CRC32 over everything before the CRC.
+Statuses: 0 success, 1 sharing off, 2 read permission missing, 3 no calendars
+selected, 4 source/provider/network error, 5 Google authorization required (v4).
+Nonzero statuses contain zero events. At most 32 events:
+`[dayMask:u8, allDay:u8, titleBytes:u8, locationBytes:u8, timeBytes:u8, titleUTF8,
+locationUTF8, timeUTF8]`. Day mask is Monday bit 0 through Sunday bit 6; text limits
+are 80/80/40 bytes with valid UTF-8 and no control characters. Colour schema 1 adds
+`rgb24:u24` immediately after the three text lengths and before the text. It is
+Android's effective `DISPLAY_COLOR` (event override, otherwise calendar colour),
+without alpha. Fragment framing and CRC remain unchanged. The new phone supports
+legacy version-1 requests with schema 0 / no RGB; the new receiver also accepts
+schema 0 using a blue fallback. Version-3 requests use colour schema 2: one extra
+`holidayDays:u8` immediately after `fetchedUnix` and before the events, Monday bit 0
+through Sunday bit 6. Only masks 0..127 are valid; error statuses require zero.
+Events retain the schema-1 RGB field. Masks come from selected imported holiday
+calendars, independently of the 32-event agenda limit (within the bounded provider
+scan). Updated companions continue answering v1/v2 requests in their legacy schemas.
+Version-4 requests retain schema 2 and add status 5 for Google account authorization.
+Companions map status 5 to legacy permission status 2 for v1-v3 requesters. Updated
+firmware clears private caches for status 5 and shows Connect Google on phone.
+Sources can now include explicitly selected Google calendars, primary-calendar
+birthday occurrences and dated pending Google Tasks. They use the same bounded
+week snapshots; Google OAuth tokens/account credentials never cross BLE. See
+[google-agenda.md](google-agenda.md) for phone-only OAuth/security/setup/limitations.
+Recurrences, Madrid
+DST, all-day UTC dates and exclusive ends are resolved on the phone.
+
+WRITE `[1, 0x7f]` clears the receiver and all UI week/detail caches on the next UI
+tick without waking the screen. Phone selection/sharing/permission changes enqueue
+this short privacy clear ahead of ordinary work; event frames remain low priority,
+one at a time behind other traffic. Reconnect also clears old cached data before
+loading from the current configuration. RAM-only six-week caching is not an
+authoritative calendar; disconnected data can be stale and is labelled accordingly.
+
 ## AI voice extension (`000f`–`0012`)
 
 All characteristics share the service UUID suffix and the existing trusted-phone,

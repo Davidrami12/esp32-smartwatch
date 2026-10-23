@@ -10,6 +10,83 @@
 #include "../components/watch-ui/watch_voice_result.h"
 #include "../components/watch-ui/watch_touch_gate.h"
 
+static void calendar_protocol_tests()
+{
+    assert(watch_calendar_valid_date(20240229));
+    assert(!watch_calendar_valid_date(20260229));
+    assert(!watch_calendar_valid_date(20261301));
+    assert(watch_calendar_monday(20261025)==20261019);
+    assert(watch_calendar_monday(20270101)==20261228);
+    assert(watch_calendar_date(watch_calendar_day(20261228)+7)==20270104);
+    assert(watch_calendar_crc(reinterpret_cast<const uint8_t *>("123456789"),9)==0xCBF43926u);
+    std::vector<uint8_t> payload={0,1,0,0,0,0,0,0,1,0,7,6,5};
+    for (const char *s : {"Meeting","Madrid","09:00"}) payload.insert(payload.end(),s,s+strlen(s));
+    auto seal=[](std::vector<uint8_t> p) {
+        const uint32_t crc=watch_calendar_crc(p.data(),p.size());
+        for (unsigned i=0;i<4;++i) p.push_back(uint8_t(crc>>(8*i))); return p;
+    };
+    auto frame=[](const std::vector<uint8_t> &p,unsigned offset,uint32_t id=41) {
+        std::vector<uint8_t> f={1,1,uint8_t(id),uint8_t(id>>8),uint8_t(id>>16),uint8_t(id>>24),uint8_t(offset),uint8_t(offset>>8),uint8_t(p.size()),uint8_t(p.size()>>8)};
+        const size_t end=offset+10<p.size() ? offset+10 : p.size();
+        f.insert(f.end(),p.begin()+offset,p.begin()+end); return f;
+    };
+    const auto valid=seal(payload);
+    WatchCalendarReceiver receiver; watch_calendar_week_t result={};
+    receiver.select(41,20261019);
+    auto stale=frame(valid,0,42); assert(!receiver.accept(stale.data(),stale.size(),result));
+    auto gap=frame(valid,10); assert(!receiver.accept(gap.data(),gap.size(),result));
+    for (unsigned offset=0;offset<valid.size();offset+=10) {
+        const auto f=frame(valid,offset); assert(receiver.accept(f.data(),f.size(),result));
+        if (offset+10<valid.size()) assert(result.monday==0);
+    }
+    assert(result.monday==20261019 && result.count==1 && !strcmp(result.events[0].title,"Meeting"));
+    auto corrupt=valid; corrupt[13]^=1;
+    receiver.select(41,20261019);
+    for (unsigned offset=0;offset<corrupt.size();offset+=10) {
+        const auto f=frame(corrupt,offset);
+        assert(receiver.accept(f.data(),f.size(),result)==(offset+10<corrupt.size()));
+    }
+    payload[13]=0xc0; const auto bad_utf8=seal(payload);
+    receiver.select(41,20261019);
+    for (unsigned offset=0;offset<bad_utf8.size();offset+=10) {
+        const auto f=frame(bad_utf8,offset);
+        assert(receiver.accept(f.data(),f.size(),result)==(offset+10<bad_utf8.size()));
+    }
+    receiver.reset(); assert(receiver.used==0 && receiver.bytes[13]==0);
+    auto oversized=frame(valid,0); oversized[8]=0xff; oversized[9]=0xff;
+    assert(!receiver.accept(oversized.data(),oversized.size(),result));
+    receiver.select(42,20261026);
+    auto old=frame(valid,0); assert(!receiver.accept(old.data(),old.size(),result));
+    payload[13]='M'; payload[3]=1;
+    payload.insert(payload.begin()+13,{0x34,0xab,0x12});
+    const auto colored=seal(payload);
+    receiver.select(41,20261019);
+    for (unsigned offset=0;offset<colored.size();offset+=10) {
+        const auto f=frame(colored,offset); assert(receiver.accept(f.data(),f.size(),result));
+    }
+    assert(result.events[0].color==0x12ab34 && !strcmp(result.events[0].title,"Meeting"));
+    payload[3]=2; payload.insert(payload.begin()+8,0x45);
+    const auto holidays=seal(payload);
+    receiver.select(41,20261019);
+    for (unsigned offset=0;offset<holidays.size();offset+=10) {
+        const auto f=frame(holidays,offset); assert(receiver.accept(f.data(),f.size(),result));
+    }
+    assert(result.holiday_days==0x45 && result.events[0].color==0x12ab34);
+    payload[8]=128;
+    const auto invalid_holidays=seal(payload);
+    receiver.select(41,20261019);
+    for (unsigned offset=0;offset<invalid_holidays.size();offset+=10) {
+        const auto f=frame(invalid_holidays,offset);
+        assert(receiver.accept(f.data(),f.size(),result)==(offset+10<invalid_holidays.size()));
+    }
+    const auto google_auth=seal({5,0,0,2,0,0,0,0,0});
+    receiver.select(41,20261019);
+    for (unsigned offset=0;offset<google_auth.size();offset+=10) {
+        const auto f=frame(google_auth,offset); assert(receiver.accept(f.data(),f.size(),result));
+    }
+    assert(result.status==CalendarGoogleAuth && result.count==0 && result.holiday_days==0);
+}
+
 static void notification_protocol_tests()
 {
     WatchNotificationAssembler assembler;
@@ -74,10 +151,13 @@ static bool goal_test(uint32_t) { ++goal_calls; return goal_save_ok; }
 static void brightness_test(uint8_t) { ++brightness_calls; }
 static void commit_test(uint8_t value) { ++commit_calls; committed = value; }
 
-static lv_obj_t *find_button(lv_obj_t *screen, const char *text)
+static lv_obj_t *search_button(lv_obj_t *screen, const char *text)
 {
     for (uint32_t i = 0; i < lv_obj_get_child_count(screen); ++i) {
         lv_obj_t *object = lv_obj_get_child(screen, i);
+        if (!lv_obj_check_type(object,&lv_button_class)) {
+            if (auto *match=search_button(object,text)) return match;
+        }
         if (!lv_obj_check_type(object, &lv_button_class) || !lv_obj_get_child_count(object)) continue;
         lv_obj_t *child = lv_obj_get_child(object, 0);
         if (lv_obj_check_type(child, &lv_label_class) && strcmp(lv_label_get_text(child), text) == 0) return object;
@@ -89,14 +169,19 @@ static lv_obj_t *find_button(lv_obj_t *screen, const char *text)
             }
         }
     }
-    assert(false && "Button not found");
     return nullptr;
+}
+static lv_obj_t *find_button(lv_obj_t *screen,const char *text)
+{
+    auto *found=search_button(screen,text);
+    assert(found && "Button not found"); return found;
 }
 static void check_touch_targets(lv_obj_t *parent)
 {
     if (lv_obj_check_type(parent,&lv_button_class)) {
-        assert(lv_obj_get_width(parent) >= design::TouchHeight);
-        assert(lv_obj_get_height(parent) >= design::TouchHeight);
+        bool month_cell=false; for (auto *cell : calendar_cells) month_cell|=parent==cell;
+        assert(lv_obj_get_width(parent) >= (month_cell ? 44 : design::TouchHeight));
+        assert(lv_obj_get_height(parent) >= (month_cell ? 36 : design::TouchHeight));
     }
     for (uint32_t i = 0; i < lv_obj_get_child_count(parent); ++i) check_touch_targets(lv_obj_get_child(parent,i));
 }
@@ -198,6 +283,7 @@ int main()
     assert(!watch_ble_can_pair(0, true, false));
     assert(!watch_ble_can_pair(0, false, true));
     notification_protocol_tests();
+    calendar_protocol_tests();
     lv_init();
     lv_display_create(410, 502);
     watch_ui_create();
@@ -1038,16 +1124,126 @@ int main()
         back_cb(nullptr); assert(current_screen==WatchScreen::Launcher);
     }
     {
-        const char *names[]={"ACTIVITY","POMODORO","MOTION LAB","WEATHER","MEDIA","2048","SUN & MOON","PLANETS","AI ASSISTANT"};
+        const char *names[]={"WEATHER","POMODORO","MOTION LAB","MEDIA","CALENDAR","2048","SUN & MOON","PLANETS","AI ASSISTANT"};
         auto *launcher=screen_for(WatchScreen::Launcher);
         lv_obj_update_layout(launcher);
         for (unsigned i=0;i<9;++i) {
             auto *tile=find_button(launcher,names[i]);
             assert(lv_obj_get_width(tile)==108 && lv_obj_get_height(tile)==100);
-            assert(lv_obj_get_y(tile)==92+int(i/3)*110);
+            assert(lv_obj_get_y(tile)==8+int(i/3)*110);
             assert(lv_obj_get_x(tile)==lv_obj_get_x(find_button(launcher,names[i%3])));
             assert(lv_obj_get_y(lv_obj_get_child(tile,0))==70);
         }
+        auto *calendar_tile=find_button(launcher,"CALENDAR");
+        assert(lv_obj_get_y(calendar_tile)==118);
+        assert(!search_button(launcher,"ACTIVITY"));
+        auto *calendar_icon=lv_obj_get_child(calendar_tile,2);
+        assert(lv_obj_get_width(calendar_icon)==40 && lv_obj_get_height(calendar_icon)==40);
+        assert(lv_obj_get_height(lv_obj_get_parent(calendar_tile))==328);
+    }
+    {
+        watch_ui_clear_calendar();
+        watch_ui_set_astronomy_time(1792756800,true); // 2026-10-23; explicit clock for deterministic week tests.
+        watch_ui_set_bluetooth_state(WATCH_UI_BLUETOOTH_CONNECTED);
+        watch_ui_set_calendar_request_callback([](uint32_t monday) { assert(watch_calendar_monday(monday)==monday); });
+        calendar_selected_week=0;
+        open_calendar_cb(nullptr);
+        assert(current_screen==WatchScreen::CalendarMonth && calendar_month==20261001);
+        calendar_month_sync=false; calendar_request(); navigate_to(WatchScreen::Calendar);
+        assert(current_screen==WatchScreen::Calendar && calendar_selected_week==20261019);
+        assert(calendar_selected_day==4);
+        static watch_calendar_week_t week={};
+        week.monday=20261019; week.fetched_at=1792756800; week.count=2;
+        week.events[0].days=16; strcpy(week.events[0].title,"Reunión de equipo"); strcpy(week.events[0].time,"09:00 - 10:00"); strcpy(week.events[0].location,"Madrid");
+        week.events[1].days=96; week.events[1].all_day=true; strcpy(week.events[1].title,"Weekend trip"); strcpy(week.events[1].time,"All day");
+        watch_ui_set_calendar_week(&week);
+        assert(calendar_day_headers[0] && calendar_day_headers[6]);
+        assert(!strstr(lv_label_get_text(calendar_week_label),"TODAY"));
+        lv_obj_t *friday_row=nullptr;
+        for (unsigned i=0;i<lv_obj_get_child_count(calendar_list);++i) {
+            auto *child=lv_obj_get_child(calendar_list,i);
+            if (lv_obj_check_type(child,&lv_button_class)) { friday_row=child; break; }
+        }
+        assert(friday_row);
+        lv_obj_send_event(friday_row,LV_EVENT_CLICKED,nullptr);
+        assert(current_screen==WatchScreen::CalendarDetail);
+        assert(strstr(lv_label_get_text(calendar_detail_text),"Madrid"));
+        back_cb(nullptr); assert(current_screen==WatchScreen::Calendar);
+        assert(strstr(lv_label_get_text(calendar_day_headers[5]),"Saturday"));
+        lv_obj_scroll_to_y(calendar_list,80,LV_ANIM_OFF);
+        const auto scroll_before=lv_obj_get_scroll_y(calendar_list);
+        calendar_dirty=true; refresh_calendar();
+        assert(lv_obj_get_scroll_y(calendar_list)==scroll_before);
+        calendar_move(1); assert(calendar_selected_week==20261026 && !calendar_cached());
+        assert(strstr(lv_label_get_text(calendar_status),"SYNCING"));
+        calendar_move(-1); assert(calendar_cached() && calendar_cached()->count==2);
+        watch_ui_set_bluetooth_state(WATCH_UI_BLUETOOTH_ADVERTISING);
+        assert(strstr(lv_label_get_text(calendar_status),"OFFLINE / CACHED"));
+        calendar_select_today(); assert(calendar_selected_day==4 && calendar_selected_week==20261019);
+        auto *screen=screen_for(WatchScreen::Calendar); lv_obj_update_layout(screen);
+        assert(lv_obj_get_y(calendar_status)>=lv_obj_get_y(calendar_previous)+lv_obj_get_height(calendar_previous)+8);
+        assert(lv_obj_get_y(calendar_list)+lv_obj_get_height(calendar_list)+8<=lv_obj_get_y(find_button(screen,LV_SYMBOL_LEFT "  BACK")));
+        week.status=CalendarError; week.count=0; watch_ui_set_calendar_week(&week);
+        assert(calendar_cached()->count==2); // Transient errors do not destroy a usable cache.
+        week.status=CalendarPermission; watch_ui_set_calendar_week(&week);
+        assert(calendar_cached()->count==0 && calendar_cached()->status==CalendarPermission);
+        watch_ui_set_bluetooth_state(WATCH_UI_BLUETOOTH_CONNECTED);
+        week.status=CalendarGoogleAuth; watch_ui_set_calendar_week(&week);
+        assert(calendar_cached()->status==CalendarGoogleAuth);
+        assert(strstr(lv_label_get_text(calendar_status),"CONNECT GOOGLE"));
+        assert(!*lv_label_get_text(calendar_detail_text));
+        watch_ui_clear_calendar(); for (const auto &cached : calendar_cache) assert(cached.monday==0);
+        week.status=CalendarReady;
+        for (unsigned i=0;i<7;++i) { week.monday=watch_calendar_date(watch_calendar_day(20261019)+i*7); watch_ui_set_calendar_week(&week); }
+        calendar_selected_week=20261019; assert(!calendar_cached());
+        calendar_selected_week=20261026; assert(calendar_cached());
+        calendar_selected_week=20261228; calendar_move(1); assert(calendar_selected_week==20270104);
+        back_cb(nullptr); assert(current_screen==WatchScreen::CalendarMonth);
+        back_cb(nullptr); assert(current_screen==WatchScreen::Launcher);
+        watch_ui_set_calendar_request_callback([](uint32_t monday) {
+            static watch_calendar_week_t demo={}; demo.monday=monday; demo.status=CalendarReady; demo.count=4;
+            demo.holiday_days=4; demo.fetched_at=uint32_t(astronomy_utc-3600);
+            for (unsigned i=0;i<4;++i) { demo.events[i].days=127; demo.events[i].color=0x12ab34+i; strcpy(demo.events[i].title,"Demo"); strcpy(demo.events[i].time,"09:00"); }
+            watch_ui_set_calendar_week(&demo); // Simulator callbacks are synchronous/re-entrant.
+        });
+        calendar_was_connected=false;
+        watch_ui_set_bluetooth_state(WATCH_UI_BLUETOOTH_CONNECTED);
+        open_calendar_cb(nullptr); assert(calendar_find_week(20260928));
+        assert(!calendar_month_sync && calendar_month_index==6);
+        assert(!strcmp(lv_label_get_text(calendar_cell_dates[0]),"28"));
+        assert(lv_obj_get_style_bg_opa(calendar_cell_bars[0][0],LV_PART_MAIN)==LV_OPA_20);
+        assert(lv_obj_get_style_text_font(calendar_month_heading,LV_PART_MAIN)==&lv_font_montserrat_22);
+        assert(!strstr(lv_label_get_text(calendar_month_heading),"WEEK VIEW"));
+        assert(strstr(lv_label_get_text(calendar_month_status),"Last refresh 1h ago"));
+        assert(lv_obj_get_style_text_font(calendar_month_status,LV_PART_MAIN)==&lv_font_montserrat_12);
+        const auto holiday_text=lv_color_to_u32(lv_obj_get_style_text_color(calendar_cell_dates[9],LV_PART_MAIN));
+        const auto weekend_text=lv_color_to_u32(lv_obj_get_style_text_color(calendar_cell_dates[12],LV_PART_MAIN));
+        assert(holiday_text==weekend_text && holiday_text==lv_color_to_u32(lv_color_hex(CalendarRestDayColor)));
+        assert(lv_color_to_u32(lv_obj_get_style_bg_color(calendar_cells[9],LV_PART_MAIN))==lv_color_to_u32(lv_obj_get_style_bg_color(calendar_cells[12],LV_PART_MAIN)));
+        assert(lv_color_to_u32(lv_obj_get_style_bg_color(calendar_cells[12],LV_PART_MAIN))==lv_color_to_u32(lv_color_hex(0x101418)));
+        assert(lv_color_to_u32(lv_obj_get_style_bg_color(calendar_cells[8],LV_PART_MAIN))==lv_color_to_u32(lv_color_hex(0)));
+        assert(lv_color_to_u32(lv_obj_get_style_text_color(calendar_cell_dates[8],LV_PART_MAIN))!=holiday_text);
+        watch_ui_set_bluetooth_state(WATCH_UI_BLUETOOTH_ADVERTISING);
+        assert(strstr(lv_label_get_text(calendar_month_status),"offline"));
+        for (auto *text : calendar_cell_dates) assert(!strchr(lv_label_get_text(text),'?'));
+        watch_ui_set_bluetooth_state(WATCH_UI_BLUETOOTH_CONNECTED);
+        assert(lv_color_to_u32(lv_obj_get_style_bg_color(calendar_cell_bars[0][0],LV_PART_MAIN))==lv_color_to_u32(lv_color_hex(0x12ab34)));
+        assert(!lv_obj_has_flag(calendar_cell_bars[0][2],LV_OBJ_FLAG_HIDDEN));
+        assert(!strcmp(lv_label_get_text(calendar_cell_more[0]),"+"));
+        lv_obj_update_layout(screen_for(WatchScreen::CalendarMonth));
+        assert(lv_obj_get_y(calendar_cells[41])+lv_obj_get_height(calendar_cells[41])<lv_obj_get_y(calendar_month_status));
+        calendar_month_move(3); assert(calendar_month==20270101);
+        calendar_month_move(-1); assert(calendar_month==20261201);
+        lv_obj_send_event(lv_obj_get_parent(calendar_month_heading),LV_EVENT_CLICKED,nullptr);
+        assert(calendar_month==20261001 && current_screen==WatchScreen::CalendarMonth);
+        calendar_month_move(2); assert(calendar_month==20261201);
+        calendar_month_open_day(0); assert(current_screen==WatchScreen::Calendar && calendar_selected_week==20261130);
+        back_cb(nullptr); assert(current_screen==WatchScreen::CalendarMonth);
+        calendar_month=20240201; calendar_month_start(); refresh_calendar_month();
+        assert(!strcmp(lv_label_get_text(calendar_cell_dates[31]),"29"));
+        assert(!strcmp(lv_label_get_text(calendar_cell_dates[32]),"1"));
+        back_cb(nullptr);
+        watch_ui_set_calendar_request_callback(nullptr);
     }
     {
         open_voice_cb(nullptr);

@@ -54,6 +54,24 @@
 
 #if LV_USE_OS != LV_OS_FREERTOS
 
+static void calendar_demo_request(uint32_t monday)
+{
+    watch_calendar_week_t week={0}; week.monday=monday; week.fetched_at=(uint32_t)time(NULL);
+    week.count=3;
+    week.events[0].color=0x4285F4; week.events[1].color=0xF6BF26; week.events[2].color=0xD50000;
+    week.holiday_days=4; // Explicit demo holiday, not an actual Spain/Madrid date.
+    week.events[0].days=1; snprintf(week.events[0].title,sizeof(week.events[0].title),"DEMO / Weekly planning");
+    snprintf(week.events[0].location,sizeof(week.events[0].location),"Meeting room");
+    snprintf(week.events[0].time,sizeof(week.events[0].time),"09:00 - 09:30");
+    week.events[1].days=4; week.events[1].all_day=true;
+    snprintf(week.events[1].title,sizeof(week.events[1].title),"DEMO / Holiday");
+    snprintf(week.events[1].time,sizeof(week.events[1].time),"All day");
+    week.events[2].days=96;
+    snprintf(week.events[2].title,sizeof(week.events[2].title),"DEMO / Weekend trip");
+    snprintf(week.events[2].time,sizeof(week.events[2].time),"Multi-day event");
+    watch_ui_set_calendar_week(&week);
+}
+
 static void brightness_changed(uint8_t brightness)
 {
     printf(
@@ -168,6 +186,7 @@ int main(int argc, char **argv)
   watch_ui_set_wifi_state(WATCH_UI_WIFI_CONNECTED, -65);
   lv_timer_create(update_mock_wifi_cb, 1000, NULL);
   watch_ui_set_weather(true, 24, WATCH_UI_WEATHER_SUNNY);
+  watch_ui_set_calendar_request_callback(calendar_demo_request);
   {
     time_t now = time(NULL);
     struct tm day;

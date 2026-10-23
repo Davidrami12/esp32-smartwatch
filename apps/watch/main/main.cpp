@@ -209,6 +209,11 @@ static void update_wifi_status_cb(
 {
     (void)timer;
 
+    static auto *calendar_week=static_cast<watch_calendar_week_t *>(heap_caps_calloc(1,sizeof(watch_calendar_week_t),MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT));
+    bool clear_calendar=false;
+    const bool calendar_ready=calendar_week && watch_ble_calendar_take(calendar_week,&clear_calendar);
+    if (clear_calendar) watch_ui_clear_calendar();
+    if (calendar_ready) watch_ui_set_calendar_week(calendar_week);
     if (!watch_power_is_active()) {
         return;
     }
@@ -861,7 +866,11 @@ extern "C" void app_main(void)
         watch_ui_set_motion(true,sample.acceleration_x_mps2,sample.acceleration_y_mps2,sample.acceleration_z_mps2);
     },40,nullptr);
     watch_ui_set_notification_dismiss_callback(dismiss_notification);
-    watch_ui_set_security_callbacks(watch_ble_security_confirm, watch_ble_security_forget);
+    watch_ui_set_security_callbacks(watch_ble_security_confirm, []() {
+        if (!watch_ble_security_forget()) return false;
+        watch_ble_calendar_clear(); watch_ui_clear_calendar(); return true;
+    });
+    watch_ui_set_calendar_request_callback(watch_ble_calendar_request);
     watch_ui_set_media_callback(watch_ble_media_command);
     watch_ui_configure_2048(watch_2048_store_load(), esp_random(), watch_2048_store_best);
     watch_ui_set_wifi_control_callback(ui_wifi_request);
