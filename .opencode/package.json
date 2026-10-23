@@ -1,0 +1,6 @@
+{
+  "name": "portable-orchestration",
+  "private": true,
+  "type": "module",
+  "scripts": { "verify": "node scripts/verify-harness.mjs" }
+}

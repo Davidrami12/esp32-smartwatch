@@ -1,4 +1,5 @@
 {
+  "$schema": "https://opencode.ai/config.json",
   "mcp": {
     "servers": {
       "context7": {
@@ -6,5 +7,46 @@
         "url": "https://mcp.context7.com/mcp"
       }
     }
+  },
+  "default_agent": "leader",
+  "instructions": [".opencode/AGENTS.md"],
+  "permission": {
+    "read": {
+      "*": "allow",
+      "*.env": "ask",
+      "*.env.*": "ask",
+      "*.env/*": "ask",
+      "*.pem": "ask",
+      "*.key": "ask",
+      "*credentials*": "ask",
+      "*creds*": "ask",
+      "*secret*": "ask",
+      "*.env.example": "allow",
+      "*secret*/*.env.example": "ask",
+      "*credentials*/*.env.example": "ask",
+      "*creds*/*.env.example": "ask",
+      "*.env/*.env.example": "ask",
+      "docs/.git": "deny",
+      "docs/.git/*": "deny",
+      "docs/*/.git": "deny",
+      "docs/*/.git/*": "deny",
+      "docs/.agents/*": "deny",
+      "docs/.agents": "deny",
+      "docs/*/.agents": "deny",
+      "docs/*/.agents/*": "deny",
+      "docs/.opencode/*": "deny",
+      "docs/.opencode": "deny",
+      "docs/*/.opencode": "deny",
+      "docs/*/.opencode/*": "deny",
+      "docs/.vscode/*": "deny",
+      "docs/.vscode": "deny",
+      "docs/*/.vscode": "deny",
+      "docs/*/.vscode/*": "deny",
+      "docs/AGENTS.md": "deny",
+      "docs/*/AGENTS.md": "deny",
+      "docs/.mcp.json": "deny",
+      "docs/*/.mcp.json": "deny"
+    },
+    "task": { "auditor": "deny" }
   }
 }
